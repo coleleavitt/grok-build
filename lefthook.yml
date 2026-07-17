@@ -1,0 +1,22 @@
+# Local git hooks, executed via your global core.hooksPath -> lefthook.
+# Purpose: catch the cheap, high-frequency failure (formatting) before it
+# reaches CI. Heavier checks (clippy, test) are intentionally left to CI so
+# commits/pushes stay fast.
+
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      # Only runs when Rust files are staged.
+      glob: "*.rs"
+      run: cargo fmt --all --check
+      # Prefer auto-formatting instead of blocking? Swap the line above for:
+      #   run: cargo fmt --all && git add {staged_files}
+      #   stage_fixed: true
+
+# Optional heavier gate before pushing. Disabled by default because a full
+# workspace clippy takes a couple of minutes; uncomment if you want it.
+# pre-push:
+#   commands:
+#     clippy:
+#       run: cargo clippy --workspace --all-targets
