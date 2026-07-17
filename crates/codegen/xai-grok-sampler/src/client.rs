@@ -12,13 +12,18 @@
 //! headers (proxy auth, OTel context, etc.)
 //! into [`SamplerConfig::extra_headers`] before constructing the client.
 
+use std::collections::BTreeMap;
+use std::process::Stdio;
+
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 use xai_grok_sampling_types::error::{parse_error_bytes, try_parse_stream_error};
 use xai_grok_sampling_types::{
@@ -29,6 +34,7 @@ use xai_grok_sampling_types::{
 };
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
+use xai_grok_sampling_types::{ProviderCommandAdapter, ProviderRequestAdapter};
 
 // Re-export ApiBackend from the shared types crate for downstream callers.
 pub use xai_grok_sampling_types::ApiBackend;
@@ -39,6 +45,29 @@ const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 /// Product identifier baked into User-Agent strings.
 const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+const CLAUDE_CCH_PLACEHOLDER: &str = "cch=00000";
+const CLAUDE_FINGERPRINT_SALT: &str = "59cf53e54c78";
+const CLAUDE_BETAS: &[&str] = &[
+    "claude-code-20250219",
+    "oauth-2025-04-20",
+    "interleaved-thinking-2025-05-14",
+    "prompt-caching-scope-2026-01-05",
+    "extended-cache-ttl-2025-04-11",
+    "output-128k-2025-02-19",
+    "web-search-2025-03-05",
+    "structured-outputs-2025-12-15",
+    "advanced-tool-use-2025-11-20",
+    "tool-search-tool-2025-10-19",
+    "files-api-2025-04-14",
+    "cache-diagnosis-2026-04-07",
+    "effort-2025-11-24",
+    "environments-2025-11-01",
+    "context-1m-2025-08-07",
+    "fast-mode-2026-02-01",
+    "afk-mode-2026-01-31",
+    "task-budgets-2026-03-13",
+];
 
 /// Per-request `x-grok-*` headers. Optional fields are skipped when empty/`None`.
 struct GrokRequestHeaders<'a> {
@@ -226,6 +255,265 @@ fn extract_should_retry(headers: &reqwest::header::HeaderMap) -> Option<bool> {
         })
 }
 
+fn encode_provider_tool_name(name: &str, prefix: &str) -> String {
+    if name.starts_with(prefix) {
+        return name.to_owned();
+    }
+    if let Some((server, tool)) = name.split_once(':') {
+        format!("{prefix}{server}__{tool}")
+    } else {
+        format!("{prefix}grok__{name}")
+    }
+}
+
+fn decode_provider_tool_name(name: &str, prefix: &str) -> String {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return name.to_owned();
+    };
+    let Some((server, tool)) = rest.split_once("__") else {
+        return name.to_owned();
+    };
+    if server == "grok" {
+        tool.to_owned()
+    } else {
+        format!("{server}:{tool}")
+    }
+}
+
+fn strip_provider_tool_prefix_json(data: &str, prefix: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return data.to_owned();
+    };
+    strip_provider_tool_prefix_value(&mut value, prefix);
+    serde_json::to_string(&value).unwrap_or_else(|_| data.to_owned())
+}
+
+fn adapt_messages_event_json(adapter: Option<&ProviderRequestAdapter>, data: &str) -> String {
+    let Some(ProviderRequestAdapter::Anthropic {
+        tool_name_prefix, ..
+    }) = adapter
+    else {
+        return data.to_owned();
+    };
+    strip_provider_tool_prefix_json(data, tool_name_prefix)
+}
+
+fn is_anthropic_adapter(adapter: Option<&ProviderRequestAdapter>) -> bool {
+    matches!(adapter, Some(ProviderRequestAdapter::Anthropic { .. }))
+}
+
+fn sanitize_header_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !matches!(*ch, '\u{0}'..='\u{1f}' | '\u{7f}'))
+        .take(8192)
+        .collect()
+}
+
+fn claude_cli_version() -> String {
+    std::env::var("CLAUDE_CODE_VERSION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "2.1.212".to_owned())
+}
+
+fn first_user_text(request: &messages::MessagesRequest) -> String {
+    request
+        .messages
+        .iter()
+        .find(|message| matches!(&message.role, messages::MessageRole::User))
+        .map(|message| match &message.content {
+            messages::MessageContent::Text(text) => text.clone(),
+            messages::MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .find_map(|block| match block {
+                    messages::ContentBlock::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+        })
+        .unwrap_or_default()
+}
+
+fn billing_hash(first_user_message: &str, version: &str) -> String {
+    let chars: String = [4, 7, 20]
+        .into_iter()
+        .filter_map(|idx| first_user_message.chars().nth(idx))
+        .collect();
+    let digest = Sha256::digest(format!("{CLAUDE_FINGERPRINT_SALT}{chars}{version}").as_bytes());
+    format!("{digest:x}")[..3].to_owned()
+}
+
+fn billing_header_text(request: &messages::MessagesRequest) -> String {
+    let version = claude_cli_version();
+    let hash = billing_hash(&first_user_text(request), &version);
+    format!(
+        "x-anthropic-billing-header: cc_version={version}.{hash}; cc_entrypoint=cli; cch=00000;"
+    )
+}
+
+fn has_system_text(system: &Option<messages::SystemParam>, needle: &str) -> bool {
+    match system {
+        Some(messages::SystemParam::Text(text)) => text.contains(needle),
+        Some(messages::SystemParam::Blocks(blocks)) => {
+            blocks.iter().any(|block| block.text.contains(needle))
+        }
+        None => false,
+    }
+}
+
+fn text_block(text: impl Into<String>) -> messages::TextBlock {
+    messages::TextBlock {
+        r#type: "text".to_owned(),
+        text: text.into(),
+        cache_control: None,
+    }
+}
+
+fn ensure_claude_code_system_blocks(request: &mut messages::MessagesRequest) {
+    let needs_billing = !has_system_text(&request.system, "x-anthropic-billing-header:");
+    let needs_identity = !has_system_text(&request.system, CLAUDE_CODE_IDENTITY);
+    if !needs_billing && !needs_identity {
+        return;
+    }
+
+    let mut blocks = match request.system.take() {
+        Some(messages::SystemParam::Blocks(blocks)) => blocks,
+        Some(messages::SystemParam::Text(text)) => vec![text_block(text)],
+        None => Vec::new(),
+    };
+    if needs_identity {
+        blocks.insert(0, text_block(CLAUDE_CODE_IDENTITY));
+    }
+    if needs_billing {
+        blocks.insert(0, text_block(billing_header_text(request)));
+    }
+    request.system = Some(messages::SystemParam::Blocks(blocks));
+}
+
+fn hex_prefix(bytes: &[u8], len: usize) -> String {
+    let mut out = String::with_capacity(len);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+        if out.len() >= len {
+            out.truncate(len);
+            return out;
+        }
+    }
+    out
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut key_block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        key_block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+    let inner = Sha256::new()
+        .chain_update(ipad)
+        .chain_update(data)
+        .finalize();
+    let out = Sha256::new()
+        .chain_update(opad)
+        .chain_update(inner)
+        .finalize();
+    out.into()
+}
+
+fn compute_body_attestation(serialized_body: String) -> String {
+    if !serialized_body.contains(CLAUDE_CCH_PLACEHOLDER) {
+        return serialized_body;
+    }
+    let mac = hmac_sha256(
+        CLAUDE_FINGERPRINT_SALT.as_bytes(),
+        serialized_body.as_bytes(),
+    );
+    let cch = hex_prefix(&mac, 5);
+    serialized_body.replacen(CLAUDE_CCH_PLACEHOLDER, &format!("cch={cch}"), 1)
+}
+
+fn strip_provider_tool_prefix_value(value: &mut serde_json::Value, prefix: &str) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(name)) = map.get_mut("name") {
+                *name = decode_provider_tool_name(name, prefix);
+            }
+            for child in map.values_mut() {
+                strip_provider_tool_prefix_value(child, prefix);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                strip_provider_tool_prefix_value(child, prefix);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn serializable_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+async fn run_provider_command_adapter(
+    adapter: &ProviderCommandAdapter,
+    request: ProviderCommandRequest,
+) -> Result<ProviderCommandResponse> {
+    let input = serde_json::to_vec(&request).map_err(SamplingError::Serialization)?;
+    let mut command = tokio::process::Command::new(&adapter.argv[0]);
+    command
+        .args(&adapter.argv[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|e| {
+        SamplingError::serialization_message(format!("provider request adapter spawn failed: {e}"))
+    })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(&input).await.map_err(|e| {
+            SamplingError::serialization_message(format!(
+                "provider request adapter stdin write failed: {e}"
+            ))
+        })?;
+    }
+    let timeout = std::time::Duration::from_millis(adapter.timeout_ms.unwrap_or(10_000));
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| {
+            SamplingError::serialization_message("provider request adapter command timed out")
+        })?
+        .map_err(|e| {
+            SamplingError::serialization_message(format!(
+                "provider request adapter wait failed: {e}"
+            ))
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SamplingError::serialization_message(format!(
+            "provider request adapter command failed: {stderr}"
+        )));
+    }
+    serde_json::from_slice::<ProviderCommandResponse>(&output.stdout)
+        .map_err(SamplingError::Serialization)
+}
+
 fn extract_model_metadata(headers: &reqwest::header::HeaderMap) -> Option<ResponseModelMetadata> {
     let context_window = headers
         .get("x-grok-context-window")
@@ -316,6 +604,25 @@ struct ClientDefaults {
     auth_scheme: AuthScheme,
     stream_tool_calls: bool,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    provider_request_adapter: Option<ProviderRequestAdapter>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderCommandRequest {
+    endpoint: String,
+    model: String,
+    headers: BTreeMap<String, String>,
+    body: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderCommandResponse {
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    body: Option<serde_json::Value>,
 }
 
 // =============================================================================
@@ -528,6 +835,7 @@ impl SamplingClient {
             auth_scheme: config.auth_scheme,
             stream_tool_calls: config.stream_tool_calls,
             doom_loop_recovery: config.doom_loop_recovery,
+            provider_request_adapter: config.provider_request_adapter,
         };
 
         Ok(Self {
@@ -546,8 +854,8 @@ impl SamplingClient {
         self.defaults.api_backend.clone()
     }
 
-    /// POST with default headers. Overrides auth from resolver if wired.
-    fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    /// Default headers for a provider request. Overrides auth from resolver if wired.
+    fn request_headers(&self) -> HeaderMap {
         let mut headers = self.default_headers.clone();
         if let Some(resolver) = &self.bearer_resolver
             && let Some(fresh) = resolver.current_bearer()
@@ -593,7 +901,149 @@ impl SamplingClient {
         if let Some(injector) = &self.header_injector {
             injector.inject(&mut headers);
         }
-        self.http.post(url).headers(headers)
+        headers
+    }
+
+    /// POST with default headers.
+    fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+        self.http.post(url).headers(self.request_headers())
+    }
+
+    fn apply_messages_request_adapter(&self, request: &mut messages::MessagesRequest) {
+        let Some(ProviderRequestAdapter::Anthropic {
+            tool_name_prefix, ..
+        }) = self.defaults.provider_request_adapter.as_ref()
+        else {
+            return;
+        };
+        ensure_claude_code_system_blocks(request);
+        if let Some(tools) = request.tools.as_mut() {
+            for tool in tools {
+                tool.name = encode_provider_tool_name(&tool.name, tool_name_prefix);
+            }
+        }
+    }
+
+    fn apply_anthropic_cli_headers(&self, headers: &mut HeaderMap, model: &str) {
+        if !is_anthropic_adapter(self.defaults.provider_request_adapter.as_ref()) {
+            return;
+        }
+        let existing = headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        let mut betas: Vec<&str> = CLAUDE_BETAS
+            .iter()
+            .copied()
+            .filter(|beta| {
+                *beta != "context-1m-2025-08-07" || !model.to_ascii_lowercase().contains("haiku")
+            })
+            .collect();
+        for beta in existing.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if !betas.contains(&beta) {
+                betas.push(beta);
+            }
+        }
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_str(&betas.join(",")).expect("static beta header is valid"),
+        );
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(&format!(
+                "claude-cli/{} (external, cli)",
+                claude_cli_version()
+            ))
+            .expect("static user-agent is valid"),
+        );
+        headers.insert("x-app", HeaderValue::from_static("cli"));
+        headers.insert("anthropic-client-platform", HeaderValue::from_static("cli"));
+        headers.insert(
+            "anthropic-dangerous-direct-browser-access",
+            HeaderValue::from_static("true"),
+        );
+        headers
+            .entry("x-client-request-id")
+            .or_insert_with(|| HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()).unwrap());
+        let session_id = std::env::var("CLAUDE_CODE_SESSION_ID").unwrap_or_default();
+        headers
+            .entry("x-claude-code-session-id")
+            .or_insert_with(|| HeaderValue::from_str(&sanitize_header_value(&session_id)).unwrap());
+    }
+
+    fn adapt_messages_event_json(&self, data: &str) -> String {
+        adapt_messages_event_json(self.defaults.provider_request_adapter.as_ref(), data)
+    }
+
+    fn adapt_messages_response_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        let Some(ProviderRequestAdapter::Anthropic { .. }) =
+            self.defaults.provider_request_adapter.as_ref()
+        else {
+            return Ok(bytes.to_vec());
+        };
+        let body =
+            std::str::from_utf8(bytes).map_err(|e| SamplingError::serialization_message(e))?;
+        Ok(self.adapt_messages_event_json(body).into_bytes())
+    }
+
+    fn command_adapter(&self) -> Option<ProviderCommandAdapter> {
+        match self.defaults.provider_request_adapter.as_ref()? {
+            ProviderRequestAdapter::Anthropic { command, .. } => command.clone(),
+            ProviderRequestAdapter::Command { argv, timeout_ms } => Some(ProviderCommandAdapter {
+                argv: argv.clone(),
+                timeout_ms: *timeout_ms,
+            }),
+        }
+    }
+
+    async fn apply_command_adapter(
+        &self,
+        endpoint: &str,
+        model: &str,
+        headers: &mut HeaderMap,
+        body: &mut serde_json::Value,
+    ) -> Result<()> {
+        let Some(adapter) = self.command_adapter() else {
+            return Ok(());
+        };
+        if adapter.argv.is_empty() {
+            return Err(SamplingError::InvalidConfiguration(
+                "provider request adapter command argv is empty",
+            ));
+        }
+        let request = ProviderCommandRequest {
+            endpoint: endpoint.to_owned(),
+            model: model.to_owned(),
+            headers: serializable_headers(headers),
+            body: body.clone(),
+        };
+        let response = run_provider_command_adapter(&adapter, request).await?;
+        for (key, value) in response.headers {
+            let name = HeaderName::try_from(key.as_str()).map_err(|e| {
+                SamplingError::serialization_message(format!(
+                    "provider request adapter returned invalid header name `{key}`: {e}"
+                ))
+            })?;
+            let value = HeaderValue::from_str(&value).map_err(|e| {
+                SamplingError::serialization_message(format!(
+                    "provider request adapter returned invalid value for `{key}`: {e}"
+                ))
+            })?;
+            headers.insert(name, value);
+        }
+        if let Some(new_body) = response.body {
+            *body = new_body;
+        }
+        Ok(())
+    }
+
+    fn serialize_messages_body(&self, body: &serde_json::Value) -> Result<String> {
+        let serialized = serde_json::to_string(body).map_err(SamplingError::Serialization)?;
+        if is_anthropic_adapter(self.defaults.provider_request_adapter.as_ref()) {
+            Ok(compute_body_attestation(serialized))
+        } else {
+            Ok(serialized)
+        }
     }
 
     /// Bearer prefix for 401 attribution. Prefers live resolver, falls back to default_headers.
@@ -919,10 +1369,26 @@ impl SamplingClient {
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
         };
+        let mut request_body = serde_json::to_value(&streaming_request).map_err(|e| {
+            tracing::error!("Failed to serialize chat/completions request: {}", e);
+            SamplingError::Serialization(e)
+        })?;
+        let mut headers = self.request_headers();
+        self.apply_command_adapter(
+            "chat/completions",
+            &model_id,
+            &mut headers,
+            &mut request_body,
+        )
+        .await?;
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("chat/completions")))
+            .apply(
+                self.http
+                    .post(self.endpoint("chat/completions"))
+                    .headers(headers),
+            )
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
-            .json(&streaming_request);
+            .json(&request_body);
 
         let built_request = http_request.build().map_err(|e| {
             tracing::error!("Failed to build HTTP request: {}", e);
@@ -1293,8 +1759,11 @@ impl SamplingClient {
             .defaults
             .doom_loop_recovery
             .map(crate::doom_loop::DoomLoopSignalCollector::new);
+        let mut headers = self.request_headers();
+        self.apply_command_adapter("responses", &model_id, &mut headers, &mut request_body)
+            .await?;
         let mut http_request = grok_headers
-            .apply(self.post(self.endpoint("responses")))
+            .apply(self.http.post(self.endpoint("responses")).headers(headers))
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
         if doom_loop.is_some() {
             // Presence opts in; the server ignores the value.
@@ -1479,6 +1948,7 @@ impl SamplingClient {
         mut request: MessagesRequestWrapper,
     ) -> Result<messages::MessagesResponse> {
         self.apply_message_defaults(&mut request)?;
+        self.apply_messages_request_adapter(&mut request.inner);
 
         let x_grok_conv_id = request.x_grok_conv_id.as_deref().unwrap_or_default();
         let x_grok_req_id = request.x_grok_req_id.as_deref().unwrap_or_default();
@@ -1500,9 +1970,19 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
+        let mut request_body = serde_json::to_value(&request.inner).map_err(|e| {
+            tracing::error!("Failed to serialize messages request: {}", e);
+            SamplingError::Serialization(e)
+        })?;
+        let mut headers = self.request_headers();
+        self.apply_anthropic_cli_headers(&mut headers, &model_id);
+        self.apply_command_adapter("messages", &model_id, &mut headers, &mut request_body)
+            .await?;
+        let request_body = self.serialize_messages_body(&request_body)?;
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("messages")))
-            .json(&request.inner);
+            .apply(self.http.post(self.endpoint("messages")).headers(headers))
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(request_body);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1551,6 +2031,7 @@ impl SamplingClient {
             });
         }
 
+        let bytes = self.adapt_messages_response_bytes(&bytes)?;
         let response_obj =
             serde_json::from_slice::<messages::MessagesResponse>(&bytes).map_err(|e| {
                 let raw_body = String::from_utf8_lossy(&bytes);
@@ -1589,6 +2070,7 @@ impl SamplingClient {
         Option<ResponseModelMetadata>,
     )> {
         self.apply_message_defaults(&mut request)?;
+        self.apply_messages_request_adapter(&mut request.inner);
 
         // Enable streaming
         request.inner.stream = Some(true);
@@ -1616,10 +2098,20 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
+        let mut request_body = serde_json::to_value(&request.inner).map_err(|e| {
+            tracing::error!("Failed to serialize messages stream request: {}", e);
+            SamplingError::Serialization(e)
+        })?;
+        let mut headers = self.request_headers();
+        self.apply_anthropic_cli_headers(&mut headers, &model_id);
+        self.apply_command_adapter("messages", &model_id, &mut headers, &mut request_body)
+            .await?;
+        let request_body = self.serialize_messages_body(&request_body)?;
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("messages")))
+            .apply(self.http.post(self.endpoint("messages")).headers(headers))
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
-            .json(&request.inner);
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(request_body);
 
         let built_request = http_request.build().map_err(|e| {
             tracing::error!("Failed to build HTTP request: {}", e);
@@ -1709,14 +2201,18 @@ impl SamplingClient {
         // Map SSE events into MessageStreamEvent.
         // Uses `scan` so transport errors terminate the stream after the first
         // error (same pattern as `chat_completion_stream`).
+        let provider_request_adapter = self.defaults.provider_request_adapter.clone();
         let events = event_stream
-            .scan(false, |had_transport_error, event_res| {
+            .scan(false, move |had_transport_error, event_res| {
                 if *had_transport_error {
                     return std::future::ready(None);
                 }
                 let item = match event_res {
                     Ok(event) => {
-                        let data = &event.data;
+                        let data = adapt_messages_event_json(
+                            provider_request_adapter.as_ref(),
+                            &event.data,
+                        );
                         if data == "[DONE]" {
                             return std::future::ready(None);
                         }
@@ -1728,20 +2224,19 @@ impl SamplingClient {
                             data = %data,
                         );
 
-                        if let Some(stream_error) = try_parse_stream_error(data) {
+                        if let Some(stream_error) = try_parse_stream_error(&data) {
                             Some(Err(stream_error))
                         } else {
                             Some(
-                                serde_json::from_str::<messages::MessageStreamEvent>(data).map_err(
-                                    |e| {
+                                serde_json::from_str::<messages::MessageStreamEvent>(&data)
+                                    .map_err(|e| {
                                         tracing::error!(
                                             error = %e,
                                             raw_data = %data,
                                             "Failed to deserialize MessageStreamEvent from stream"
                                         );
                                         SamplingError::Serialization(e)
-                                    },
-                                ),
+                                    }),
                             )
                         }
                     }
@@ -2011,6 +2506,7 @@ impl SamplingClient {
 mod tests {
     use super::*;
     use indexmap::IndexMap;
+    use xai_grok_sampling_types::messages;
     use xai_grok_sampling_types::types::ChatRequestMessage;
 
     fn minimal_config() -> SamplerConfig {
@@ -2041,8 +2537,157 @@ mod tests {
             compactions_remaining: None,
             compaction_at_tokens: None,
             doom_loop_recovery: None,
+            provider_request_adapter: None,
             header_injector: None,
         }
+    }
+
+    #[test]
+    fn anthropic_adapter_prefixes_request_tools_and_strips_response_names() {
+        let mut cfg = minimal_config();
+        cfg.api_backend = ApiBackend::Messages;
+        cfg.provider_request_adapter = Some(ProviderRequestAdapter::Anthropic {
+            tool_name_prefix: "mcp__".to_string(),
+            command: None,
+        });
+        let client = SamplingClient::new(cfg).expect("client");
+        let mut request = messages::MessagesRequest {
+            tools: Some(vec![
+                messages::ToolParam {
+                    name: "bash".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({"type":"object"}),
+                },
+                messages::ToolParam {
+                    name: "ide:execute".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({"type":"object"}),
+                },
+            ]),
+            ..Default::default()
+        };
+
+        client.apply_messages_request_adapter(&mut request);
+        let names: Vec<_> = request
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["mcp__grok__bash", "mcp__ide__execute"]);
+
+        let data = serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "mcp__grok__bash",
+                "input": {}
+            }
+        })
+        .to_string();
+        let decoded = client.adapt_messages_event_json(&data);
+        let event: messages::MessageStreamEvent =
+            serde_json::from_str(&decoded).expect("decoded event");
+        match event {
+            messages::MessageStreamEvent::ContentBlockStart {
+                content_block: messages::ContentBlock::ToolUse { name, .. },
+                ..
+            } => assert_eq!(name, "bash"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_adapter_injects_billing_identity_and_cch() {
+        let mut cfg = minimal_config();
+        cfg.api_backend = ApiBackend::Messages;
+        cfg.provider_request_adapter = Some(ProviderRequestAdapter::Anthropic {
+            tool_name_prefix: "mcp__".to_string(),
+            command: None,
+        });
+        let client = SamplingClient::new(cfg).expect("client");
+        let mut request = messages::MessagesRequest {
+            model: "claude-sonnet-5".to_owned(),
+            messages: vec![messages::Message {
+                role: messages::MessageRole::User,
+                content: messages::MessageContent::Text("hello from test".to_owned()),
+            }],
+            max_tokens: 32,
+            ..Default::default()
+        };
+
+        client.apply_messages_request_adapter(&mut request);
+        let body = client
+            .serialize_messages_body(&serde_json::to_value(&request).unwrap())
+            .unwrap();
+
+        assert!(body.contains("x-anthropic-billing-header:"));
+        assert!(body.contains(CLAUDE_CODE_IDENTITY));
+        assert!(!body.contains(CLAUDE_CCH_PLACEHOLDER));
+        assert!(body.contains("\"system\":["));
+        assert!(body.contains("cch="));
+        let cch = body
+            .split("cch=")
+            .nth(1)
+            .unwrap()
+            .chars()
+            .take(5)
+            .collect::<String>();
+        assert_eq!(cch.len(), 5);
+        assert!(cch.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn anthropic_headers_skip_context_1m_for_haiku() {
+        let mut cfg = minimal_config();
+        cfg.api_backend = ApiBackend::Messages;
+        cfg.provider_request_adapter = Some(ProviderRequestAdapter::Anthropic {
+            tool_name_prefix: "mcp__".to_string(),
+            command: None,
+        });
+        let client = SamplingClient::new(cfg).expect("client");
+        let mut headers = HeaderMap::new();
+
+        client.apply_anthropic_cli_headers(&mut headers, "claude-haiku-4-5");
+
+        let betas = headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(betas.contains("claude-code-20250219"));
+        assert!(!betas.contains("context-1m-2025-08-07"));
+    }
+
+    #[tokio::test]
+    async fn command_adapter_mutates_headers_and_body() {
+        let mut cfg = minimal_config();
+        cfg.provider_request_adapter = Some(ProviderRequestAdapter::Command {
+            argv: vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "import json,sys; req=json.load(sys.stdin); req['body']['model']='rewritten'; print(json.dumps({'headers': {'x-adapter': 'yes'}, 'body': req['body']}))".to_string(),
+            ],
+            timeout_ms: Some(1_000),
+        });
+        let client = SamplingClient::new(cfg).expect("client");
+        let mut headers = HeaderMap::new();
+        let mut body = serde_json::json!({"model":"original"});
+
+        client
+            .apply_command_adapter("messages", "original", &mut headers, &mut body)
+            .await
+            .expect("adapter applies");
+
+        assert_eq!(
+            headers
+                .get("x-adapter")
+                .and_then(|value| value.to_str().ok()),
+            Some("yes")
+        );
+        assert_eq!(body["model"], "rewritten");
     }
 
     /// Verify the serialized shape of StreamingChatRequest matches the

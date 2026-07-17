@@ -1000,6 +1000,7 @@ enabled = false
                 "sentry": { "type": "http", "url": "https://mcp.sentry.dev/mcp" }
             }))),
             lsp_servers: None,
+            model_providers: Default::default(),
         };
         let id = PluginId::new(PluginScope::User, &plugin_root, "sentry");
         let dp = DiscoveredPlugin {
@@ -1068,6 +1069,7 @@ enabled = false
                 "sentry": { "type": "http", "url": "https://inline.example/mcp" }
             }))),
             lsp_servers: None,
+            model_providers: Default::default(),
         };
         let id = PluginId::new(PluginScope::User, &plugin_root, "sentry");
         let dp = DiscoveredPlugin {
@@ -1142,6 +1144,7 @@ enabled = false
             hooks: None,
             mcp_servers: None,
             lsp_servers: None,
+            model_providers: Default::default(),
         };
         let id = PluginId::new(PluginScope::User, &plugin_root, "slack");
         let dp = DiscoveredPlugin {

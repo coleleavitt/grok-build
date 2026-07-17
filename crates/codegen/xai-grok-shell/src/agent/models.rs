@@ -122,6 +122,8 @@ struct Inner {
     cache: ModelsCacheManager,
     /// Guard to prevent overlapping retry loops.
     retry_in_flight: AtomicBool,
+    /// Provider/model entries contributed by active trusted plugins.
+    plugin_model_providers: RwLock<IndexMap<String, config::ModelProviderConfig>>,
     /// `allowed_models` matched nothing in the fetched catalog; the prompt path
     /// blocks rather than run on the bundled default. Set in `apply_refresh_result`.
     allowlist_excludes_all: AtomicBool,
@@ -187,6 +189,7 @@ impl ModelsManager {
                 gateway: RwLock::new(None),
                 cache: ModelsCacheManager::new(),
                 retry_in_flight: AtomicBool::new(false),
+                plugin_model_providers: RwLock::new(IndexMap::new()),
                 allowlist_excludes_all: AtomicBool::new(false),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
             }),
@@ -355,6 +358,17 @@ impl ModelsManager {
 
     pub fn models(&self) -> IndexMap<String, ModelEntry> {
         self.inner.models.read().clone()
+    }
+
+    pub fn set_plugin_model_providers(
+        &self,
+        providers: IndexMap<String, config::ModelProviderConfig>,
+    ) {
+        *self.inner.plugin_model_providers.write() = providers;
+        let cfg = self.inner.cfg.read().clone();
+        let prefetched = self.inner.prefetched.read().clone();
+        self.rebuild(&cfg, prefetched);
+        self.reselect_default_model(&cfg);
     }
 
     pub fn endpoints(&self) -> config::EndpointsConfig {
@@ -556,7 +570,9 @@ impl ModelsManager {
     // ── Mutations ───────────────────────────────────────────────────
 
     fn rebuild(&self, cfg: &config::Config, prefetched: Option<IndexMap<String, ModelEntry>>) {
-        *self.inner.models.write() = resolve_model_catalog(cfg, prefetched);
+        let plugin_providers = self.inner.plugin_model_providers.read().clone();
+        *self.inner.models.write() =
+            resolve_model_catalog_with_providers(cfg, prefetched, &plugin_providers);
     }
 
     /// Refresh models when the etag changes.
@@ -1833,7 +1849,16 @@ pub fn resolve_model_catalog(
     cfg: &config::Config,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
-    let mut catalog: IndexMap<String, ModelEntry> = config::resolve_model_list(cfg, prefetched);
+    resolve_model_catalog_with_providers(cfg, prefetched, &IndexMap::new())
+}
+
+pub fn resolve_model_catalog_with_providers(
+    cfg: &config::Config,
+    prefetched: Option<IndexMap<String, ModelEntry>>,
+    plugin_providers: &IndexMap<String, config::ModelProviderConfig>,
+) -> IndexMap<String, ModelEntry> {
+    let mut catalog: IndexMap<String, ModelEntry> =
+        config::resolve_model_list_with_providers(cfg, prefetched, plugin_providers);
 
     if let Ok(Some(disabled)) = ModelGlobSet::compile(cfg.models.disabled_models.as_ref()) {
         let before = catalog.len();
@@ -3387,6 +3412,7 @@ mod tests {
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            provider_request_adapter: None,
             laziness_detector: config::LazinessDetectorPerModelConfig::default(),
         }
     }

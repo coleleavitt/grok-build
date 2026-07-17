@@ -672,6 +672,7 @@ fn collect_plugin(
                 hooks: None,
                 mcp_servers: None,
                 lsp_servers: None,
+                model_providers: Default::default(),
             }
         }
         Err(e) => {

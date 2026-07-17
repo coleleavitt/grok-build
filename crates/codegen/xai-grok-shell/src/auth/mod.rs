@@ -1,3 +1,4 @@
+mod anthropic_cli;
 pub(crate) mod attribution;
 mod config;
 pub mod credential_provider;
@@ -16,6 +17,10 @@ pub(crate) mod refresh;
 pub(crate) mod single_flight;
 mod storage;
 pub(crate) mod token_type;
+pub use anthropic_cli::{
+    AnthropicAuthArgs, AnthropicAuthCommand, AnthropicLoginArgs, AuthArgs, AuthCommand,
+    run_cli_anthropic_auth, run_cli_auth,
+};
 pub(crate) use config::LEGACY_AUTH_SCOPE;
 pub use config::{
     ForceLoginTeam, GrokComConfig, OAuth2ProviderConfig, OidcAuthConfig, PreferredAuthMethod,

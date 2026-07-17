@@ -1,0 +1,49 @@
+{
+  "name": "anthropic",
+  "version": "0.1.0",
+  "description": "Anthropic Claude models as a Grok model provider (Messages API).",
+  "homepage": "https://docs.claude.com/en/api/messages",
+  "keywords": ["anthropic", "claude", "model-provider"],
+  "modelProviders": {
+    "anthropic": {
+      "name": "Anthropic",
+      "baseUrl": "https://api.anthropic.com/v1",
+      "apiBackend": "messages",
+      "authScheme": "x_api_key",
+      "envKey": "ANTHROPIC_API_KEY",
+      "extraHeaders": {
+        "anthropic-version": "2023-06-01"
+      },
+      "models": {
+        "claude-opus-4-8": {
+          "model": "claude-opus-4-8",
+          "name": "Claude Opus 4.8",
+          "description": "Anthropic's Opus-tier flagship. 1M context, 128K max output.",
+          "contextWindow": 1000000,
+          "maxCompletionTokens": 64000
+        },
+        "claude-sonnet-5": {
+          "model": "claude-sonnet-5",
+          "name": "Claude Sonnet 5",
+          "description": "Balanced intelligence and speed. 1M context.",
+          "contextWindow": 1000000,
+          "maxCompletionTokens": 64000
+        },
+        "claude-haiku-4-5": {
+          "model": "claude-haiku-4-5",
+          "name": "Claude Haiku 4.5",
+          "description": "Fast, low-cost tier. 200K context.",
+          "contextWindow": 200000,
+          "maxCompletionTokens": 32000
+        },
+        "claude-fable-5": {
+          "model": "claude-fable-5",
+          "name": "Claude Fable 5",
+          "description": "Anthropic's most capable model. 1M context; thinking always on.",
+          "contextWindow": 1000000,
+          "maxCompletionTokens": 64000
+        }
+      }
+    }
+  }
+}

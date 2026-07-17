@@ -20,7 +20,8 @@ indexmap = { workspace = true, features = ["serde"] }
 reqwest = { workspace = true, features = ["stream"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "time", "sync", "process", "io-util"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }

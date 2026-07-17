@@ -9,7 +9,7 @@ use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 use xai_grok_agent::prompt::skills::SkillsConfig;
-use xai_grok_sampler::{AuthScheme, SamplerConfig};
+use xai_grok_sampler::{AuthScheme, ProviderRequestAdapter, SamplerConfig};
 use xai_grok_sampling_types::{
     CompactionAtTokens, CompactionsRemaining, REASONING_EFFORT_META_KEY,
     REASONING_EFFORTS_META_KEY, ReasoningEffort, ReasoningEffortOption,
@@ -1281,6 +1281,11 @@ pub struct Config {
     /// Warnings from `[model.*]` parsing; surfaced by `grok inspect`.
     #[serde(skip)]
     pub model_override_warnings: Vec<super::config_model_override_parse::ModelOverrideWarning>,
+    /// `[provider.<id>]` provider/model catalog contributions. This mirrors the
+    /// plugin manifest shape and lets provider-style plugins/config add models
+    /// before ordinary `[model.*]` overrides are applied.
+    #[serde(default)]
+    pub provider: IndexMap<String, ModelProviderConfig>,
     pub grok_com_config: GrokComConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shortcuts: Option<toml::Value>,
@@ -1707,6 +1712,7 @@ impl Default for Config {
             auto_mode: AutoModeConfig::default(),
             config_models: IndexMap::new(),
             model_override_warnings: Vec::new(),
+            provider: IndexMap::new(),
             grok_com_config: GrokComConfig::default(),
             shortcuts: None,
             hints: None,
@@ -3131,6 +3137,14 @@ pub fn resolve_model_list(
     cfg: &Config,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
+    resolve_model_list_with_providers(cfg, prefetched, &IndexMap::new())
+}
+
+pub fn resolve_model_list_with_providers(
+    cfg: &Config,
+    prefetched: Option<IndexMap<String, ModelEntry>>,
+    plugin_providers: &IndexMap<String, ModelProviderConfig>,
+) -> IndexMap<String, ModelEntry> {
     let mut resolved: IndexMap<String, ModelEntry> = IndexMap::new();
     if cfg.endpoints.has_custom_endpoint() {
         tracing::info!(
@@ -3175,6 +3189,8 @@ pub fn resolve_model_list(
         }
         resolved = prefetched;
     }
+    apply_model_providers(&mut resolved, &cfg.provider, &cfg.endpoints);
+    apply_model_providers(&mut resolved, plugin_providers, &cfg.endpoints);
     for (key, model_override) in &cfg.config_models {
         let had_base = resolved.contains_key(key);
         let base = resolved.shift_remove(key);
@@ -3304,6 +3320,188 @@ fn apply_global_scalar_defaults(
         }
     }
 }
+
+fn plugin_env_keys(keys: xai_grok_agent::plugins::PluginEnvKeys) -> EnvKeys {
+    match keys {
+        xai_grok_agent::plugins::PluginEnvKeys::One(name) => EnvKeys::One(name),
+        xai_grok_agent::plugins::PluginEnvKeys::Many(names) => EnvKeys::Many(names),
+    }
+}
+
+fn plugin_auth_scheme(value: Option<String>) -> Option<AuthScheme> {
+    match value.as_deref() {
+        Some("bearer") | Some("Bearer") => Some(AuthScheme::Bearer),
+        Some("x_api_key") | Some("x-api-key") | Some("xApiKey") | Some("XApiKey") => {
+            Some(AuthScheme::XApiKey)
+        }
+        Some(other) => {
+            tracing::warn!(auth_scheme = %other, "plugin model provider has unknown authScheme; using model default");
+            None
+        }
+        None => None,
+    }
+}
+
+fn plugin_headers(headers: std::collections::BTreeMap<String, String>) -> IndexMap<String, String> {
+    headers.into_iter().collect()
+}
+
+fn plugin_provider_to_config(
+    provider: xai_grok_agent::plugins::PluginModelProvider,
+) -> ModelProviderConfig {
+    ModelProviderConfig {
+        name: provider.name,
+        base_url: provider.base_url,
+        api_base_url: provider.api_base_url,
+        api_backend: provider.api_backend,
+        auth_scheme: plugin_auth_scheme(provider.auth_scheme),
+        api_key: provider.api_key,
+        env_key: provider.env_key.map(plugin_env_keys),
+        extra_headers: plugin_headers(provider.extra_headers),
+        context_window: provider.context_window,
+        agent_type: provider.agent_type,
+        provider_request_adapter: provider.provider_request_adapter,
+        models: provider
+            .models
+            .into_iter()
+            .map(|(id, model)| {
+                (
+                    id,
+                    ProviderModelConfig {
+                        model: model.model,
+                        name: model.name,
+                        description: model.description,
+                        base_url: model.base_url,
+                        api_base_url: model.api_base_url,
+                        api_backend: model.api_backend,
+                        auth_scheme: plugin_auth_scheme(model.auth_scheme),
+                        api_key: model.api_key,
+                        env_key: model.env_key.map(plugin_env_keys),
+                        extra_headers: plugin_headers(model.extra_headers),
+                        context_window: model.context_window,
+                        max_completion_tokens: model.max_completion_tokens,
+                        temperature: model.temperature,
+                        top_p: model.top_p,
+                        use_concise: None,
+                        agent_type: model.agent_type,
+                        inference_idle_timeout_secs: model.inference_idle_timeout_secs,
+                        max_retries: model.max_retries,
+                        hidden: model.hidden,
+                        supported_in_api: model.supported_in_api,
+                        reasoning_effort: model.reasoning_effort,
+                        supports_reasoning_effort: model.supports_reasoning_effort,
+                        reasoning_efforts: model.reasoning_efforts,
+                        supports_backend_search: model.supports_backend_search,
+                        stream_tool_calls: model.stream_tool_calls,
+                        provider_request_adapter: model.provider_request_adapter,
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+pub fn plugin_model_providers_from_registry(
+    registry: Option<&xai_grok_agent::plugins::PluginRegistry>,
+) -> IndexMap<String, ModelProviderConfig> {
+    let mut out = IndexMap::new();
+    let Some(registry) = registry else {
+        return out;
+    };
+    for (plugin, provider_id, provider) in registry.model_providers() {
+        if out.contains_key(&provider_id) {
+            tracing::warn!(
+                plugin = %plugin,
+                provider = %provider_id,
+                "plugin model provider ignored because an earlier active plugin already contributed it"
+            );
+            continue;
+        }
+        out.insert(provider_id, plugin_provider_to_config(provider));
+    }
+    out
+}
+
+fn apply_model_providers(
+    resolved: &mut IndexMap<String, ModelEntry>,
+    providers: &IndexMap<String, ModelProviderConfig>,
+    endpoints: &EndpointsConfig,
+) {
+    for (provider_id, provider) in providers {
+        for (model_key, model) in &provider.models {
+            let model_slug = model.model.clone().unwrap_or_else(|| model_key.clone());
+            let api_backend = model
+                .api_backend
+                .clone()
+                .or_else(|| provider.api_backend.clone())
+                .unwrap_or_default();
+            let context_window = model
+                .context_window
+                .or(provider.context_window)
+                .and_then(NonZeroU64::new)
+                .unwrap_or_else(|| {
+                    NonZeroU64::new(DEFAULT_CONTEXT_WINDOW).expect("default context is non-zero")
+                });
+            let mut extra_headers = provider.extra_headers.clone();
+            extra_headers.extend(model.extra_headers.clone());
+            let supports_reasoning_effort = model
+                .supports_reasoning_effort
+                .unwrap_or(matches!(api_backend, ApiBackend::Messages));
+            let entry = ModelEntryConfig {
+                id: Some(model_key.clone()),
+                model: model_slug,
+                base_url: model
+                    .base_url
+                    .clone()
+                    .or_else(|| provider.base_url.clone())
+                    .unwrap_or_else(|| endpoints.resolve_inference_base_url()),
+                api_base_url: model
+                    .api_base_url
+                    .clone()
+                    .or_else(|| provider.api_base_url.clone()),
+                name: model.name.clone(),
+                description: model.description.clone().or_else(|| provider.name.clone()),
+                context_window,
+                max_completion_tokens: model.max_completion_tokens,
+                temperature: model.temperature,
+                top_p: model.top_p,
+                api_backend,
+                auth_scheme: model.auth_scheme.or(provider.auth_scheme),
+                api_key: model.api_key.clone().or_else(|| provider.api_key.clone()),
+                env_key: model.env_key.clone().or_else(|| provider.env_key.clone()),
+                extra_headers,
+                auto_compact_threshold_percent: None,
+                system_prompt_label: None,
+                use_concise: model.use_concise.unwrap_or(false),
+                agent_type: model
+                    .agent_type
+                    .clone()
+                    .or_else(|| provider.agent_type.clone())
+                    .unwrap_or_else(default_agent_type),
+                inference_idle_timeout_secs: model.inference_idle_timeout_secs,
+                max_retries: model.max_retries,
+                hidden: model.hidden.unwrap_or(false),
+                supported_in_api: model.supported_in_api.unwrap_or(true),
+                reasoning_effort: model.reasoning_effort,
+                supports_reasoning_effort,
+                reasoning_efforts: model.reasoning_efforts.clone(),
+                supports_backend_search: model.supports_backend_search.unwrap_or(false),
+                compactions_remaining: None,
+                compaction_at_tokens: None,
+                show_model_fingerprint: false,
+                stream_tool_calls: model.stream_tool_calls,
+                provider_request_adapter: model
+                    .provider_request_adapter
+                    .clone()
+                    .or_else(|| provider.provider_request_adapter.clone()),
+                laziness_detector: LazinessDetectorPerModelConfig::default(),
+            };
+            resolved.insert(model_key.clone(), ModelEntry::from_config_entry(&entry));
+            tracing::debug!(provider = %provider_id, model_key = %model_key, "model provider entry applied");
+        }
+    }
+}
+
 /// Built-in default models. Prefer `resolve_model_list()`.
 pub fn default_model_entries(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntry> {
     default_models(endpoints)
@@ -3426,6 +3624,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 compaction_at_tokens: m.compaction_at_tokens,
                 show_model_fingerprint: m.show_model_fingerprint,
                 stream_tool_calls: None,
+                provider_request_adapter: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             };
             (key, config)
@@ -3546,6 +3745,10 @@ pub struct ModelEntryConfig {
     /// flag should leave this unset to avoid request errors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    /// Provider-specific request/response adapter, e.g. Anthropic tool-name
+    /// namespacing for OAuth/Claude-compatible routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_adapter: Option<ProviderRequestAdapter>,
     /// Per-model Layer-3 LazinessDetector configuration. Defaults to
     /// the all-disabled state via `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "is_default_laziness_detector")]
@@ -3608,7 +3811,62 @@ pub struct ConfigModelOverride {
     pub compaction_at_tokens: Option<CompactionAtTokens>,
     pub show_model_fingerprint: Option<bool>,
     pub stream_tool_calls: Option<bool>,
+    pub provider_request_adapter: Option<ProviderRequestAdapter>,
 }
+
+/// Provider-level defaults plus model entries, similar to opencode's
+/// `[provider.<id>]` shape. Config and plugin manifests both flow into this
+/// type before being flattened into the existing `ModelEntry` catalog.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct ModelProviderConfig {
+    pub name: Option<String>,
+    pub base_url: Option<String>,
+    pub api_base_url: Option<String>,
+    pub api_backend: Option<ApiBackend>,
+    pub auth_scheme: Option<AuthScheme>,
+    pub api_key: Option<String>,
+    pub env_key: Option<EnvKeys>,
+    pub extra_headers: IndexMap<String, String>,
+    pub context_window: Option<u64>,
+    pub agent_type: Option<String>,
+    pub provider_request_adapter: Option<ProviderRequestAdapter>,
+    pub models: IndexMap<String, ProviderModelConfig>,
+}
+
+/// One provider-owned model. Missing fields inherit from the provider, then the
+/// normal model defaults.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct ProviderModelConfig {
+    pub model: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub base_url: Option<String>,
+    pub api_base_url: Option<String>,
+    pub api_backend: Option<ApiBackend>,
+    pub auth_scheme: Option<AuthScheme>,
+    pub api_key: Option<String>,
+    pub env_key: Option<EnvKeys>,
+    pub extra_headers: IndexMap<String, String>,
+    pub context_window: Option<u64>,
+    pub max_completion_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub use_concise: Option<bool>,
+    pub agent_type: Option<String>,
+    pub inference_idle_timeout_secs: Option<u64>,
+    pub max_retries: Option<u32>,
+    pub hidden: Option<bool>,
+    pub supported_in_api: Option<bool>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub supports_reasoning_effort: Option<bool>,
+    pub reasoning_efforts: Vec<ReasoningEffortOption>,
+    pub supports_backend_search: Option<bool>,
+    pub stream_tool_calls: Option<bool>,
+    pub provider_request_adapter: Option<ProviderRequestAdapter>,
+}
+
 impl ConfigModelOverride {
     pub(crate) fn apply(
         &self,
@@ -3696,6 +3954,9 @@ impl ConfigModelOverride {
         if self.stream_tool_calls.is_some() {
             entry.info.stream_tool_calls = self.stream_tool_calls;
         }
+        if self.provider_request_adapter.is_some() {
+            entry.info.provider_request_adapter = self.provider_request_adapter.clone();
+        }
         if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);
         }
@@ -3774,6 +4035,7 @@ pub struct ModelInfo {
     pub show_model_fingerprint: bool,
     /// When `Some(true)`, the sampler injects `stream_tool_calls: true`
     pub stream_tool_calls: Option<bool>,
+    pub provider_request_adapter: Option<ProviderRequestAdapter>,
     /// Per-model Layer-3 LazinessDetector configuration. Defaults to
     /// the all-disabled state — the feature is per-model opt-in with a
     /// second-step `max_nudges_per_session > 0` opt-in for actually
@@ -3815,6 +4077,7 @@ impl ModelInfo {
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            provider_request_adapter: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }
     }
@@ -3850,6 +4113,7 @@ impl ModelInfo {
             compaction_at_tokens: entry.compaction_at_tokens,
             show_model_fingerprint: entry.show_model_fingerprint,
             stream_tool_calls: entry.stream_tool_calls,
+            provider_request_adapter: entry.provider_request_adapter.clone(),
             laziness_detector: entry.laziness_detector.clone(),
         }
     }
@@ -4533,6 +4797,7 @@ pub fn resolve_aux_model_sampling_config(
                 compaction_at_tokens: None,
                 show_model_fingerprint: false,
                 stream_tool_calls: None,
+                provider_request_adapter: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             },
             api_key: Some(bearer),
@@ -4661,6 +4926,7 @@ pub fn sampling_config_for_model(
         compactions_remaining: info.compactions_remaining,
         compaction_at_tokens: info.compaction_at_tokens,
         doom_loop_recovery: None,
+        provider_request_adapter: info.provider_request_adapter.clone(),
         header_injector: None,
     }
 }
@@ -4756,6 +5022,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            provider_request_adapter: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         },
         api_key: None,
@@ -5411,6 +5678,7 @@ reasoning_effort = "low"
                 compaction_at_tokens: None,
                 show_model_fingerprint: false,
                 stream_tool_calls: None,
+                provider_request_adapter: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             },
             api_key: api_key.map(|s| s.to_string()),
@@ -6247,6 +6515,127 @@ reasoning_effort = "low"
             .expect("model should exist");
         assert_eq!(model.info.api_backend, ApiBackend::Responses);
     }
+
+    #[test]
+    fn provider_config_adds_models_with_provider_defaults() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [provider.anthropic]
+            base_url = "https://api.anthropic.com/v1"
+            api_backend = "messages"
+            auth_scheme = "x_api_key"
+            env_key = "ANTHROPIC_API_KEY"
+            context_window = 200000
+            agent_type = "grok-build-plan"
+
+            [provider.anthropic.extra_headers]
+            anthropic-version = "2023-06-01"
+
+            [provider.anthropic.models.claude-sonnet]
+            model = "claude-sonnet-4-5"
+            name = "Claude Sonnet"
+
+            [provider.anthropic.models.claude-sonnet.provider_request_adapter]
+            type = "anthropic"
+            tool_name_prefix = "mcp__"
+            command = { argv = ["node", "adapter.js"], timeout_ms = 1000 }
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved
+            .get("claude-sonnet")
+            .expect("provider model exists");
+        assert_eq!(model.info.model, "claude-sonnet-4-5");
+        assert_eq!(model.info.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(model.info.api_backend, ApiBackend::Messages);
+        assert_eq!(model.info.context_window.get(), 200000);
+        assert_eq!(model.info.auth_scheme, AuthScheme::XApiKey);
+        assert_eq!(model.env_key, Some(EnvKeys::single("ANTHROPIC_API_KEY")));
+        assert_eq!(
+            model
+                .info
+                .extra_headers
+                .get("anthropic-version")
+                .map(String::as_str),
+            Some("2023-06-01")
+        );
+        assert_eq!(
+            model.info.provider_request_adapter,
+            Some(ProviderRequestAdapter::Anthropic {
+                tool_name_prefix: "mcp__".to_string(),
+                command: Some(xai_grok_sampling_types::ProviderCommandAdapter {
+                    argv: vec!["node".to_string(), "adapter.js".to_string()],
+                    timeout_ms: Some(1000),
+                }),
+            })
+        );
+    }
+
+    /// End-to-end for the bundled Anthropic provider plugin: the shipped
+    /// `plugins/anthropic/plugin.json` must parse as a plugin manifest and
+    /// flatten into the model catalog with the Messages-API wire settings.
+    #[test]
+    fn bundled_anthropic_plugin_contributes_claude_models() {
+        use xai_grok_agent::plugins::manifest::{ManifestLoadResult, load_manifest};
+
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("repo root");
+        let plugin_root = repo_root.join("plugins/anthropic");
+        let manifest = match load_manifest(&plugin_root).expect("manifest loads") {
+            ManifestLoadResult::Found(m) => *m,
+            ManifestLoadResult::NotFound => panic!("plugins/anthropic/plugin.json missing"),
+        };
+        assert_eq!(manifest.name, "anthropic");
+
+        let mut providers = IndexMap::new();
+        for (provider_id, provider) in manifest.model_providers {
+            providers.insert(provider_id, plugin_provider_to_config(provider));
+        }
+        let empty: toml::Value = toml::from_str("").unwrap();
+        let cfg = Config::new_from_toml_cfg(&empty).expect("empty config parses");
+        let resolved = resolve_model_list_with_providers(&cfg, None, &providers);
+
+        for key in [
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+            "claude-fable-5",
+        ] {
+            let model = resolved
+                .get(key)
+                .unwrap_or_else(|| panic!("plugin model `{key}` missing from catalog"));
+            assert_eq!(model.info.model, key);
+            assert_eq!(model.info.base_url, "https://api.anthropic.com/v1");
+            assert_eq!(model.info.api_backend, ApiBackend::Messages);
+            assert_eq!(model.info.auth_scheme, AuthScheme::XApiKey);
+            assert_eq!(model.env_key, Some(EnvKeys::single("ANTHROPIC_API_KEY")));
+            assert_eq!(
+                model
+                    .info
+                    .extra_headers
+                    .get("anthropic-version")
+                    .map(String::as_str),
+                Some("2023-06-01")
+            );
+        }
+        assert_eq!(
+            resolved["claude-opus-4-8"].info.context_window.get(),
+            1_000_000
+        );
+        assert_eq!(
+            resolved["claude-haiku-4-5"].info.context_window.get(),
+            200_000
+        );
+        assert_eq!(
+            resolved["claude-opus-4-8"].info.max_completion_tokens,
+            Some(64_000)
+        );
+    }
+
     #[test]
     fn parses_model_api_backend_chat_completions() {
         let raw_config: toml::Value = toml::from_str(
@@ -6432,6 +6821,7 @@ reasoning_effort = "low"
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            provider_request_adapter: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         };
         let info = ModelInfo::from_config(&entry);
@@ -6591,6 +6981,7 @@ reasoning_effort = "low"
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            provider_request_adapter: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         };
         let info = ModelInfo::from_config(&entry);
@@ -7042,6 +7433,7 @@ reasoning_effort = "low"
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            provider_request_adapter: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         };
         let info = ModelInfo::from_config(&entry);
@@ -10603,6 +10995,7 @@ default = "grok-4.5"
                 compaction_at_tokens: None,
                 show_model_fingerprint: false,
                 stream_tool_calls: None,
+                provider_request_adapter: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
                 auto_compact_threshold_percent: None,
                 system_prompt_label: None,

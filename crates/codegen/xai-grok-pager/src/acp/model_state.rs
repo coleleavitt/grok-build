@@ -155,6 +155,7 @@ impl ModelState {
         // not this session's choice; only re-derive when the model changed so a
         // catalog refresh can't clobber a user-set effort.
         if self.current != previous_current_model {
+            self.context_window_override = None;
             self.reasoning_effort = self
                 .current
                 .as_ref()
@@ -169,6 +170,9 @@ impl ModelState {
         model_id: acp::ModelId,
         effort_override: Option<ReasoningEffort>,
     ) {
+        if self.current.as_ref() != Some(&model_id) {
+            self.context_window_override = None;
+        }
         self.current = Some(model_id.clone());
         self.reasoning_effort = effort_override.or_else(|| {
             self.available
@@ -436,6 +440,35 @@ mod tests {
 
         assert_eq!(state.current, Some(id_b));
         assert_eq!(state.reasoning_effort, Some(ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn model_switch_clears_stale_context_window_override() {
+        let id_a = acp::ModelId::new(Arc::from("grok-4.5"));
+        let id_b = acp::ModelId::new(Arc::from("claude-opus"));
+        let mut state = ModelState::default();
+        state.available.insert(
+            id_a.clone(),
+            acp::ModelInfo::new(id_a.clone(), "Grok".to_string()).meta(
+                serde_json::json!({ "totalContextTokens": 500000 })
+                    .as_object()
+                    .cloned(),
+            ),
+        );
+        state.available.insert(
+            id_b.clone(),
+            acp::ModelInfo::new(id_b.clone(), "Claude Opus".to_string()).meta(
+                serde_json::json!({ "totalContextTokens": 1000000 })
+                    .as_object()
+                    .cloned(),
+            ),
+        );
+        state.set_current(id_a, None);
+        state.override_context_window(500_000);
+
+        state.set_current(id_b, None);
+
+        assert_eq!(state.get_context_window(), Some(1_000_000));
     }
 
     fn state_with_meta(meta: Option<serde_json::Value>) -> ModelState {

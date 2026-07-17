@@ -200,6 +200,7 @@ impl acp::Agent for MvpAgent {
                 None,
             );
         }
+        self.ensure_plugin_registry();
         let disable_api_key_auth = self
             .cfg
             .borrow()

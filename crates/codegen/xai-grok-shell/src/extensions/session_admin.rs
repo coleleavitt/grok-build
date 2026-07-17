@@ -646,6 +646,7 @@ async fn handle_plugins_reload(agent: &MvpAgent) -> ExtResult {
     agent
         .plugin_registry_handle()
         .reload(session_cwd.as_deref(), &disk_cfg, project_trusted, true);
+    agent.sync_plugin_model_providers();
 
     // Eagerly fan out the new registry to every live session: each adopts a
     // cwd-correct snapshot (hooks + MCP + skills + client slash-command

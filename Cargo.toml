@@ -17,6 +17,7 @@ members = [
     "crates/codegen/xai-gix-status",
     "crates/codegen/xai-grok-agent",
     "crates/codegen/xai-grok-announcements",
+    "crates/codegen/xai-grok-anthropic-auth",
     "crates/codegen/xai-grok-auth",
     "crates/codegen/xai-grok-config",
     "crates/codegen/xai-grok-config-types",

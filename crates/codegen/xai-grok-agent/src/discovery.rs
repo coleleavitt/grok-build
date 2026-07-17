@@ -724,6 +724,7 @@ mod tests {
             inline_hooks: None,
             inline_mcp_servers: None,
             inline_lsp_servers: None,
+            model_providers: Default::default(),
             conflict: None,
         };
 
@@ -744,6 +745,7 @@ mod tests {
                 hooks: None,
                 mcp_servers: None,
                 lsp_servers: None,
+                model_providers: Default::default(),
             },
             id: PluginId::new(scope, &root, plugin_name),
             root: root.clone(),

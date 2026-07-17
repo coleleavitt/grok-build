@@ -12,6 +12,7 @@
 //! The parser is forward-compatible: unknown fields are silently ignored
 //! so that manifests authored for newer upstream versions still load.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -39,6 +40,63 @@ pub struct Author {
     pub email: Option<String>,
     #[serde(default)]
     pub url: Option<String>,
+}
+
+/// One or more environment variable names that may hold a provider key.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PluginEnvKeys {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// Model contribution inside a plugin-provided model provider.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PluginModelEntry {
+    pub model: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub base_url: Option<String>,
+    pub api_base_url: Option<String>,
+    pub api_backend: Option<xai_grok_sampling_types::ApiBackend>,
+    pub auth_scheme: Option<String>,
+    pub api_key: Option<String>,
+    pub env_key: Option<PluginEnvKeys>,
+    pub extra_headers: BTreeMap<String, String>,
+    pub context_window: Option<u64>,
+    pub max_completion_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub agent_type: Option<String>,
+    pub inference_idle_timeout_secs: Option<u64>,
+    pub max_retries: Option<u32>,
+    pub hidden: Option<bool>,
+    pub supported_in_api: Option<bool>,
+    pub supports_reasoning_effort: Option<bool>,
+    pub reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
+    pub reasoning_efforts: Vec<xai_grok_sampling_types::ReasoningEffortOption>,
+    pub supports_backend_search: Option<bool>,
+    pub stream_tool_calls: Option<bool>,
+    pub provider_request_adapter: Option<xai_grok_sampling_types::ProviderRequestAdapter>,
+}
+
+/// Plugin-provided provider defaults plus its models.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PluginModelProvider {
+    pub name: Option<String>,
+    pub base_url: Option<String>,
+    pub api_base_url: Option<String>,
+    pub api_backend: Option<xai_grok_sampling_types::ApiBackend>,
+    pub auth_scheme: Option<String>,
+    pub api_key: Option<String>,
+    pub env_key: Option<PluginEnvKeys>,
+    pub extra_headers: BTreeMap<String, String>,
+    pub context_window: Option<u64>,
+    pub agent_type: Option<String>,
+    pub provider_request_adapter: Option<xai_grok_sampling_types::ProviderRequestAdapter>,
+    pub models: BTreeMap<String, PluginModelEntry>,
 }
 
 /// A path reference that can be either a single path or multiple paths.
@@ -167,6 +225,10 @@ pub struct PluginManifest {
     pub mcp_servers: Option<PathOrInline>,
     #[serde(default)]
     pub lsp_servers: Option<PathOrInline>,
+    /// Provider/model catalog contributions. A plugin can add e.g. an
+    /// Anthropic provider without touching user config.toml.
+    #[serde(default, alias = "providers")]
+    pub model_providers: BTreeMap<String, PluginModelProvider>,
 }
 
 impl PluginManifest {
@@ -640,6 +702,7 @@ mod tests {
             hooks: None,
             mcp_servers: None,
             lsp_servers: None,
+            model_providers: Default::default(),
         };
         let dirs = manifest.skill_dirs(&root);
         assert_eq!(dirs.len(), 1);
@@ -667,6 +730,7 @@ mod tests {
             hooks: None,
             mcp_servers: None,
             lsp_servers: None,
+            model_providers: Default::default(),
         };
         let dirs = manifest.skill_dirs(&root);
         assert!(dirs.is_empty());
@@ -696,6 +760,7 @@ mod tests {
             hooks: None,
             mcp_servers: None,
             lsp_servers: None,
+            model_providers: Default::default(),
         };
         let dirs = manifest.skill_dirs(&root);
         assert!(
@@ -725,6 +790,7 @@ mod tests {
             hooks: None,
             mcp_servers: None,
             lsp_servers: None,
+            model_providers: Default::default(),
         };
         let dirs = manifest.skill_dirs(&root);
         assert_eq!(dirs.len(), 1, "path within plugin root should be accepted");
@@ -754,6 +820,7 @@ mod tests {
             hooks: Some(PathOrInline::Path("../outside-hooks.json".to_string())),
             mcp_servers: None,
             lsp_servers: None,
+            model_providers: Default::default(),
         };
         assert!(
             manifest.hooks_path(&root).is_none(),
@@ -784,6 +851,7 @@ mod tests {
             hooks: None,
             mcp_servers: Some(PathOrInline::Path("../outside-mcp.json".to_string())),
             lsp_servers: None,
+            model_providers: Default::default(),
         };
         assert!(
             manifest.mcp_config_path(&root).is_none(),
@@ -807,6 +875,7 @@ mod tests {
             hooks: None,
             mcp_servers: Some(PathOrInline::Inline(servers)),
             lsp_servers: None,
+            model_providers: Default::default(),
         }
     }
 
@@ -865,5 +934,57 @@ mod tests {
             "foo": { "command": "./server" }
         }));
         assert!(manifest.mcp_config_path(&root).is_none());
+    }
+
+    #[test]
+    fn manifest_parses_model_providers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("anthropic-plugin");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("plugin.json"),
+            r#"{
+              "name": "anthropic-plugin",
+              "modelProviders": {
+                "anthropic": {
+                  "baseUrl": "https://api.anthropic.com/v1",
+                  "apiBackend": "messages",
+                  "authScheme": "x_api_key",
+                  "envKey": "ANTHROPIC_API_KEY",
+                  "extraHeaders": { "anthropic-version": "2023-06-01" },
+                  "providerRequestAdapter": {
+                    "type": "anthropic",
+                    "toolNamePrefix": "mcp__"
+                  },
+                  "models": {
+                    "claude-sonnet": {
+                      "model": "claude-sonnet-4-5",
+                      "name": "Claude Sonnet",
+                      "contextWindow": 200000
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let manifest = match load_manifest(&root).unwrap() {
+            ManifestLoadResult::Found(m) => *m,
+            ManifestLoadResult::NotFound => panic!("manifest should exist"),
+        };
+        let provider = manifest.model_providers.get("anthropic").unwrap();
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://api.anthropic.com/v1")
+        );
+        assert_eq!(
+            provider.models["claude-sonnet"].model.as_deref(),
+            Some("claude-sonnet-4-5")
+        );
+        assert!(matches!(
+            provider.provider_request_adapter,
+            Some(xai_grok_sampling_types::ProviderRequestAdapter::Anthropic { .. })
+        ));
     }
 }

@@ -714,6 +714,41 @@ async fn reconstruct_full_config_no_bearer_resolver_for_api_key_method() {
         .await;
 }
 
+/// Regression: `prepare_sampler_for_turn` rebuilds the sampler config from the
+/// slim chat-state `SamplingConfig` on every turn, so a provider request
+/// adapter that isn't carried through here is silently dropped in live
+/// sessions even when the model catalog configured one.
+#[tokio::test(flavor = "current_thread")]
+async fn reconstruct_full_config_carries_provider_request_adapter() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                None,
+                "xai.api_key",
+                xai_chat_state::AuthType::ApiKey,
+                "xai-static-key".to_string(),
+            )
+            .await;
+            let adapter = xai_grok_sampling_types::ProviderRequestAdapter::Anthropic {
+                tool_name_prefix: "mcp__".to_string(),
+                command: None,
+            };
+            let mut slim = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor has a sampling config");
+            slim.provider_request_adapter = Some(adapter.clone());
+            actor.chat_state_handle.update_sampling_config(slim);
+
+            let cfg = actor.reconstruct_full_config().await;
+
+            assert_eq!(cfg.provider_request_adapter, Some(adapter));
+        })
+        .await;
+}
+
 /// The pre-flight refresh heals a transiently-`ApiKey` session by writing the
 /// fresh session token back into `creds.api_key`.
 #[tokio::test(flavor = "current_thread")]
@@ -952,6 +987,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 compactions_remaining: None,
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
+                provider_request_adapter: None,
                 header_injector: None,
             };
             let _ = actor

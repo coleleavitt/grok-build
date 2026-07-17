@@ -1893,6 +1893,12 @@ async fn async_main() -> Result<()> {
                 println!();
                 xai_grok_shell::instrumentation::finalize_and_exit(0);
             }
+            Command::Auth(auth_args) => {
+                init_tracing_simple("cli");
+                let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
+                xai_grok_shell::auth::run_cli_auth(auth_args).await?;
+                xai_grok_shell::instrumentation::finalize_and_exit(0);
+            }
             Command::Logout => {
                 init_tracing_simple("cli");
                 let config = xai_grok_shell::config::load_effective_config_disk_only()

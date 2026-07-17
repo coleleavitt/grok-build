@@ -65,6 +65,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 compactions_remaining: None,
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
+                provider_request_adapter: None,
                 header_injector: None,
             })
             .expect("sampling client should build for persistence actor");
@@ -97,6 +98,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     context_window: std::num::NonZeroU64::new(100_000).unwrap(),
                     reasoning_effort: None,
                     stream_tool_calls: None,
+                    provider_request_adapter: None,
                 },
                 Box::new(
                     crate::session::chat_persistence::ChannelChatPersistence::new(
@@ -362,6 +364,7 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                 compactions_remaining: None,
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
+                provider_request_adapter: None,
                 header_injector: None,
             })
             .expect("sampling client should build for persistence actor");
@@ -395,6 +398,7 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                     context_window: std::num::NonZeroU64::new(100_000).unwrap(),
                     reasoning_effort: None,
                     stream_tool_calls: None,
+                    provider_request_adapter: None,
                 },
                 Box::new(
                     crate::session::chat_persistence::ChannelChatPersistence::new(
@@ -496,6 +500,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 compactions_remaining: None,
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
+                provider_request_adapter: None,
                 header_injector: None,
             })
             .expect("sampling client should build for persistence actor");
@@ -533,6 +538,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     context_window: std::num::NonZeroU64::new(100_000).unwrap(),
                     reasoning_effort: None,
                     stream_tool_calls: None,
+                    provider_request_adapter: None,
                 },
                 Box::new(
                     crate::session::chat_persistence::ChannelChatPersistence::new(
@@ -1814,6 +1820,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 compactions_remaining: None,
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
+                provider_request_adapter: None,
                 header_injector: None,
             };
             let (sampler_event_tx, _sampler_event_rx) = tokio::sync::mpsc::unbounded_channel::<
