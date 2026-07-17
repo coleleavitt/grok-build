@@ -28,6 +28,16 @@ jobs:
       # Caches ~/.cargo and target/ so runs after the first are fast.
       - uses: Swatinem/rust-cache@v2
 
+      # The proto crates need protoc. This repo vendors it via dotslash, which
+      # isn't present on CI runners, so install protoc directly and point the
+      # build scripts at it through the PROTOC env var (build.rs checks it first).
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Export PROTOC path
+        run: echo "PROTOC=$(command -v protoc)" >> "$GITHUB_ENV"
+
       - name: Format
         run: cargo fmt --all --check
 
