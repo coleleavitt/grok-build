@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::discovery::{DiscoveredPlugin, PluginId, PluginOrigin, PluginScope};
+use super::manifest::PluginModelProvider;
 
 /// A loaded plugin with resolved components, ready for use by the session.
 #[derive(Debug, Clone)]
@@ -73,6 +74,8 @@ pub struct LoadedPlugin {
     pub inline_mcp_servers: Option<serde_json::Value>,
     /// Inline LSP servers JSON from manifest (when defined inline, not file-based).
     pub inline_lsp_servers: Option<serde_json::Value>,
+    /// Model providers contributed by the plugin manifest.
+    pub model_providers: std::collections::BTreeMap<String, PluginModelProvider>,
     /// Warning if this plugin won a name collision with another plugin.
     pub conflict: Option<String>,
 }
@@ -214,6 +217,7 @@ impl PluginRegistry {
                 inline_hooks,
                 inline_mcp_servers,
                 inline_lsp_servers,
+                model_providers: dp.manifest.model_providers,
                 conflict: dp.conflict,
             };
 
@@ -276,6 +280,22 @@ impl PluginRegistry {
         self.list()
             .into_iter()
             .filter(|p| p.enabled && p.trusted)
+            .collect()
+    }
+
+    /// Model provider contributions from active trusted plugins.
+    pub fn model_providers(&self) -> Vec<(String, String, PluginModelProvider)> {
+        self.active_plugins()
+            .into_iter()
+            .flat_map(|plugin| {
+                plugin
+                    .model_providers
+                    .iter()
+                    .map(|(provider_id, provider)| {
+                        (plugin.name.clone(), provider_id.clone(), provider.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
@@ -647,6 +667,7 @@ mod tests {
                 hooks: None,
                 mcp_servers: None,
                 lsp_servers: None,
+                model_providers: Default::default(),
             },
             id: PluginId::new(scope, &root, name),
             root: root.clone(),

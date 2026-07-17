@@ -726,6 +726,12 @@ mod tests {
             compaction_at_tokens: Some(CompactionAtTokens::Fixed(100_000)),
             show_model_fingerprint: Some(true),
             stream_tool_calls: Some(false),
+            provider_request_adapter: Some(
+                xai_grok_sampling_types::ProviderRequestAdapter::Anthropic {
+                    tool_name_prefix: "mcp__".into(),
+                    command: None,
+                },
+            ),
         }
     }
 

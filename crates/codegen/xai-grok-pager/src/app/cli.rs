@@ -9,6 +9,8 @@ use std::path::PathBuf;
 pub enum Command {
     /// Run Grok without the interactive UI
     Agent(Box<AgentArgs>),
+    /// Manage provider authentication
+    Auth(xai_grok_shell::auth::AuthArgs),
     /// Show the configuration Grok discovers for this directory
     Inspect {
         /// Emit machine-readable JSON output.
@@ -1384,6 +1386,42 @@ mod tests {
         let args = PagerArgs::try_parse_from(["grok", "logout"]).expect("subcommand parses");
         assert!(matches!(args.command, Some(Command::Logout)));
         assert!(args.prompt.is_none());
+    }
+    #[test]
+    fn anthropic_auth_login_subcommand_parses() {
+        let args = PagerArgs::try_parse_from([
+            "grok",
+            "auth",
+            "anthropic",
+            "login",
+            "--name",
+            "work",
+            "--redirect",
+            "code#state",
+        ])
+        .expect("subcommand parses");
+        let Some(Command::Auth(auth)) = args.command else {
+            panic!("expected auth command");
+        };
+        let xai_grok_shell::auth::AuthCommand::Anthropic(anthropic) = auth.command;
+        let xai_grok_shell::auth::AnthropicAuthCommand::Login(login) = anthropic.command else {
+            panic!("expected anthropic login command");
+        };
+        assert_eq!(login.name.as_deref(), Some("work"));
+        assert_eq!(login.redirect.as_deref(), Some("code#state"));
+    }
+    #[test]
+    fn anthropic_auth_use_subcommand_parses() {
+        let args = PagerArgs::try_parse_from(["grok", "auth", "anthropic", "use", "work"])
+            .expect("subcommand parses");
+        let Some(Command::Auth(auth)) = args.command else {
+            panic!("expected auth command");
+        };
+        let xai_grok_shell::auth::AuthCommand::Anthropic(anthropic) = auth.command;
+        assert!(matches!(
+            anthropic.command,
+            xai_grok_shell::auth::AnthropicAuthCommand::Use { ref name } if name == "work"
+        ));
     }
     #[test]
     fn positional_prompt_conflicts_with_headless_single() {

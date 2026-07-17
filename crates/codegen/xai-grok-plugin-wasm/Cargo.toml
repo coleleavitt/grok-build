@@ -1,0 +1,20 @@
+[package]
+license = "Apache-2.0"
+name = "xai-grok-plugin-wasm"
+version = "0.1.0"
+edition.workspace = true
+description = "WASM plugin runtime: loads sandboxed guest plugins over a stable ABI with host bindings"
+authors = ["xAI"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+wasmi = "0.40"
+
+[dev-dependencies]
+wat = "1"
+
+[lints]
+workspace = true

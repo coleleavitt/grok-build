@@ -491,10 +491,18 @@ impl MvpAgent {
         let count = self
             .plugin_registry_handle
             .reload(Some(cwd), &disk_config, trusted, false);
+        self.sync_plugin_model_providers();
         tracing::debug!(
             plugin_count = count,
             "lazily populated plugin registry snapshot"
         );
+    }
+
+    pub(crate) fn sync_plugin_model_providers(&self) {
+        let providers = config::plugin_model_providers_from_registry(
+            self.plugin_registry_handle.snapshot().as_deref(),
+        );
+        self.models_manager.set_plugin_model_providers(providers);
     }
     /// Fetch managed configs, merge with client servers, return merged list + earliest expiry.
     pub(super) async fn resolve_mcp_servers(

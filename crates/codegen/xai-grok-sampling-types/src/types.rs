@@ -1020,6 +1020,36 @@ pub enum ApiBackend {
     Messages,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderCommandAdapter {
+    /// Executable and arguments. The sampler sends one JSON request on stdin and
+    /// expects one JSON response on stdout.
+    pub argv: Vec<String>,
+    #[serde(default, alias = "timeoutMs")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// Provider-specific request/response adapter. This is metadata shared by
+/// config, plugin manifests, and the sampler runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderRequestAdapter {
+    /// Anthropic OAuth/Claude-compatible wire quirks. The first supported
+    /// operation is Claude Code-style MCP tool name namespacing.
+    Anthropic {
+        #[serde(alias = "toolNamePrefix")]
+        tool_name_prefix: String,
+        #[serde(default)]
+        command: Option<ProviderCommandAdapter>,
+    },
+    /// Generic command-backed provider request hook.
+    Command {
+        argv: Vec<String>,
+        #[serde(default, alias = "timeoutMs")]
+        timeout_ms: Option<u64>,
+    },
+}
+
 impl ApiBackend {
     /// Whether the backend enforces a response JSON schema natively alongside
     /// tool calls. The Messages API does not (a schema there blocks tool use),
@@ -1059,6 +1089,12 @@ pub struct SamplingConfig {
     /// API request body so the upstream emits per-chunk argument deltas.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    /// Provider-specific request/response adapter. Must round-trip through
+    /// chat state: `reconstruct_full_config` rebuilds the sampler config from
+    /// this struct on every turn, so an adapter absent here is an adapter
+    /// silently dropped in live sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_adapter: Option<ProviderRequestAdapter>,
 }
 
 // ============ Responses API wrapper ============

@@ -60,6 +60,20 @@ impl SessionTokenAuthGate {
         )
     }
 }
+
+fn anthropic_live_credential() -> &'static xai_grok_anthropic_auth::LiveCredential {
+    static LIVE: std::sync::OnceLock<xai_grok_anthropic_auth::LiveCredential> =
+        std::sync::OnceLock::new();
+    LIVE.get_or_init(xai_grok_anthropic_auth::LiveCredential::from_env)
+}
+
+fn is_anthropic_adapter(adapter: &Option<xai_grok_sampling_types::ProviderRequestAdapter>) -> bool {
+    matches!(
+        adapter,
+        Some(xai_grok_sampling_types::ProviderRequestAdapter::Anthropic { .. })
+    )
+}
+
 /// Run a tool call; on an auth-shaped failure, attempt recovery via
 /// `AuthManager` and one retry. When `shared_recovery` is `Some`, concurrent
 /// 401s in the same batch deduplicate via `OnceCell::get_or_init`.
@@ -408,6 +422,31 @@ impl SessionActor {
                 }
             }
         }
+        #[allow(clippy::items_after_statements)]
+        struct AuthManagerBearerResolver(std::sync::Arc<crate::auth::AuthManager>);
+        impl std::fmt::Debug for AuthManagerBearerResolver {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("AuthManagerBearerResolver").finish()
+            }
+        }
+        impl xai_grok_sampler::BearerResolver for AuthManagerBearerResolver {
+            fn current_bearer(&self) -> Option<String> {
+                self.0.current_or_expired().map(|a| a.key)
+            }
+        }
+        #[allow(clippy::items_after_statements)]
+        #[derive(Clone)]
+        struct AnthropicBearerResolver(xai_grok_anthropic_auth::LiveCredential);
+        impl std::fmt::Debug for AnthropicBearerResolver {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("AnthropicBearerResolver").finish()
+            }
+        }
+        impl xai_grok_sampler::BearerResolver for AnthropicBearerResolver {
+            fn current_bearer(&self) -> Option<String> {
+                self.0.current_bearer()
+            }
+        }
         let cfg = self
             .chat_state_handle
             .get_sampling_config()
@@ -425,31 +464,62 @@ impl SessionActor {
                 context_window: std::num::NonZeroU64::new(256_000).unwrap(),
                 reasoning_effort: None,
                 stream_tool_calls: None,
+                provider_request_adapter: None,
             });
         let creds = self.chat_state_handle.get_credentials().await;
+        let uses_anthropic_adapter = is_anthropic_adapter(&cfg.provider_request_adapter);
         let model_facts = self.model_auth_facts(cfg.model.as_str());
         let auth_method = self.auth_method_id.load();
         let gate =
             SessionTokenAuthGate::new(auth_method.as_deref(), model_facts.byok, &cfg.base_url);
         let use_bearer_resolver = gate.active();
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
-        if use_bearer_resolver && let Some(am) = self.auth_manager.as_ref() {
-            let _ = am.auth().await;
-        }
-        let api_key = if use_bearer_resolver {
+        let mut auth_scheme = model_facts.auth_scheme;
+        let mut api_key = creds.api_key;
+        let mut bearer_resolver = if use_bearer_resolver {
             self.auth_manager
                 .as_ref()
-                .and_then(|am| am.current_wire_valid().map(|a| a.key))
+                .map(|am| -> xai_grok_sampler::SharedBearerResolver {
+                    std::sync::Arc::new(AuthManagerBearerResolver(am.clone()))
+                })
         } else {
-            creds.api_key
+            None
         };
-        let auth_scheme = model_facts.auth_scheme;
         let mut extra_headers = cfg.extra_headers;
         crate::agent::config::inject_url_derived_headers(
             &mut extra_headers,
             creds.alpha_test_key.as_deref(),
             &cfg.base_url,
         );
+        if uses_anthropic_adapter {
+            let live = anthropic_live_credential();
+            if let Some(mutation) = live.current_mutation() {
+                for name in &mutation.remove {
+                    if let Some(existing) = extra_headers
+                        .keys()
+                        .find(|key| key.eq_ignore_ascii_case(name))
+                        .cloned()
+                    {
+                        extra_headers.shift_remove(&existing);
+                    }
+                }
+                let existing_beta = extra_headers
+                    .get("anthropic-beta")
+                    .map(String::as_str)
+                    .unwrap_or("");
+                for (key, value) in mutation.non_auth_headers(existing_beta) {
+                    extra_headers.insert(key, value);
+                }
+            }
+            if let Some(static_key) = live.current_api_key() {
+                api_key = Some(static_key);
+                auth_scheme = xai_grok_sampler::AuthScheme::XApiKey;
+                bearer_resolver = None;
+            } else if live.current_bearer().is_some() {
+                auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+                bearer_resolver = Some(std::sync::Arc::new(AnthropicBearerResolver(live.clone())));
+            }
+        }
         let compaction_at_tokens = self.compaction_at_tokens.get();
         let compactions_remaining = self.compactions_remaining.get();
         if compactions_remaining.is_some() || compaction_at_tokens.is_some() {
@@ -505,17 +575,12 @@ impl SessionActor {
                 .map(|a| a.user_id),
             origin_client: self.origin_client.clone(),
             attribution_callback: self.attribution_callback.clone(),
-            bearer_resolver: if use_bearer_resolver {
-                self.auth_manager.as_ref().map(|am| {
-                    crate::auth::credential_provider::WireValidBearerResolver::shared(am.clone())
-                })
-            } else {
-                None
-            },
+            bearer_resolver,
             supports_backend_search: self.supports_backend_search.get(),
             compactions_remaining: self.compactions_remaining.get(),
             compaction_at_tokens: self.compaction_at_tokens.get(),
             doom_loop_recovery: self.doom_loop_recovery,
+            provider_request_adapter: cfg.provider_request_adapter,
             header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
         }
     }
@@ -711,6 +776,7 @@ impl SessionActor {
         force_http1: bool,
     ) -> Result<xai_grok_sampler::SamplingClient, acp::Error> {
         self.refresh_token_if_expired().await;
+        self.refresh_anthropic_credential_if_needed().await;
         let mut full_config = self.reconstruct_full_config().await;
         full_config.force_http1 = force_http1;
         let sampling_client =
@@ -730,6 +796,7 @@ impl SessionActor {
     /// `update_config`.
     pub(crate) async fn prepare_sampler_for_turn(&self) {
         self.refresh_token_if_expired().await;
+        self.refresh_anthropic_credential_if_needed().await;
         let mut sampler_config = self.reconstruct_full_config().await;
         if self.tool_context.task_output_token_budget.is_some()
             || self.tool_context.sampler_retry_only_before_output
@@ -739,6 +806,23 @@ impl SessionActor {
         sampler_config.idle_timeout_secs = Some(self.inference_idle_timeout.as_secs());
         self.sampler_handle.update_config(sampler_config);
     }
+
+    async fn refresh_anthropic_credential_if_needed(&self) {
+        let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
+            return;
+        };
+        if !is_anthropic_adapter(&cfg.provider_request_adapter) {
+            return;
+        }
+        let live = anthropic_live_credential();
+        if !live.has_usable_accounts() {
+            return;
+        }
+        if let Err(err) = live.ensure_fresh().await {
+            tracing::warn!(error = %err, "anthropic oauth refresh failed before sampler turn");
+        }
+    }
+
     fn log_terminal_failure(&self, error_type: &str, status_code: Option<u16>, message: &str) {
         let auth = self
             .auth_manager

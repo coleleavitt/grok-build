@@ -13313,6 +13313,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-grok-anthropic-auth"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "mockito",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "xai-grok-auth"
 version = "0.1.0"
 dependencies = [
@@ -13825,6 +13843,7 @@ dependencies = [
  "reqwest 0.12.24",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-util",
  "tracing",
@@ -14021,6 +14040,7 @@ dependencies = [
  "xai-fsnotify",
  "xai-grok-agent",
  "xai-grok-announcements",
+ "xai-grok-anthropic-auth",
  "xai-grok-auth",
  "xai-grok-compaction",
  "xai-grok-config",

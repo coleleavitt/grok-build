@@ -9,7 +9,8 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use xai_grok_sampling_types::{
-    ApiBackend, CompactionAtTokens, CompactionsRemaining, DoomLoopRecoveryPolicy, ReasoningEffort,
+    ApiBackend, CompactionAtTokens, CompactionsRemaining, DoomLoopRecoveryPolicy,
+    ProviderRequestAdapter, ReasoningEffort,
 };
 
 use crate::attribution::SharedAttributionCallback;
@@ -128,6 +129,9 @@ pub struct SamplerConfig {
     #[serde(default)]
     pub doom_loop_recovery: Option<DoomLoopRecoveryPolicy>,
 
+    #[serde(default)]
+    pub provider_request_adapter: Option<ProviderRequestAdapter>,
+
     /// Per-request header injector (e.g. OTel traceparent). Called in `post()`.
     #[serde(skip)]
     pub header_injector: Option<SharedHeaderInjector>,
@@ -166,6 +170,7 @@ impl Default for SamplerConfig {
             compactions_remaining: None,
             compaction_at_tokens: None,
             doom_loop_recovery: None,
+            provider_request_adapter: None,
             header_injector: None,
         }
     }

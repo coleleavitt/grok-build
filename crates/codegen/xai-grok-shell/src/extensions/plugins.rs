@@ -226,6 +226,7 @@ mod tests {
             inline_hooks: None,
             inline_mcp_servers: None,
             inline_lsp_servers: None,
+            model_providers: Default::default(),
             conflict: None,
         }
     }
