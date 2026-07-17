@@ -1960,6 +1960,7 @@ fn model_offers_reasoning_effort(info: &config::ModelInfo, effort: ReasoningEffo
                 | ReasoningEffort::Medium
                 | ReasoningEffort::High
                 | ReasoningEffort::Xhigh
+                | ReasoningEffort::Max
         )
     } else {
         info.reasoning_efforts.iter().any(|opt| opt.value == effort)

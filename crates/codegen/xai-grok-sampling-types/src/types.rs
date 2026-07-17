@@ -782,7 +782,16 @@ impl ReasoningEffort {
             Self::Medium => crate::rs::ReasoningEffort::Medium,
             Self::High => crate::rs::ReasoningEffort::High,
             Self::Xhigh => crate::rs::ReasoningEffort::Xhigh,
-            Self::Max => crate::rs::ReasoningEffort::Max,
+            Self::Max => crate::rs::ReasoningEffort::Xhigh,
+        }
+    }
+
+    /// OpenAI/xAI-compatible backends currently cap at `xhigh`; Anthropic
+    /// Messages supports the separate `max` value via [`Self::to_messages_api`].
+    pub fn to_chat_completions_api(self) -> Self {
+        match self {
+            Self::Max => Self::Xhigh,
+            other => other,
         }
     }
 
@@ -815,7 +824,11 @@ impl ReasoningEffort {
     pub fn to_messages_api(self) -> Option<&'static str> {
         match self {
             Self::None | Self::Minimal => None,
-            _ => Some(self.as_str()),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::Xhigh => Some("xhigh"),
+            Self::Max => Some("max"),
         }
     }
 }
@@ -845,6 +858,7 @@ impl std::str::FromStr for ReasoningEffort {
     }
 }
 
+/// Canonical wire parse only; remapped menu ids need a model catalog.
 pub fn parse_canonical_effort_token(token: &str) -> Option<ReasoningEffort> {
     token.parse().ok()
 }
@@ -1261,15 +1275,21 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_from_str_parses_max_and_xhigh_as_distinct_tiers() {
+    fn reasoning_effort_from_str_accepts_max_as_distinct_level() {
         assert_eq!(
             "max".parse::<ReasoningEffort>().unwrap(),
+            ReasoningEffort::Max
+        );
+        assert_eq!(
+            "MAX".parse::<ReasoningEffort>().unwrap(),
             ReasoningEffort::Max
         );
         assert_eq!(
             "xhigh".parse::<ReasoningEffort>().unwrap(),
             ReasoningEffort::Xhigh
         );
+        assert_eq!(ReasoningEffort::Xhigh.as_str(), "xhigh");
+        assert_eq!(ReasoningEffort::Max.as_str(), "max");
     }
 
     #[test]
@@ -1309,6 +1329,20 @@ mod tests {
         assert_eq!(opt.label, "High");
         assert_eq!(opt.value, ReasoningEffort::High);
         assert!(!opt.default);
+    }
+
+    #[test]
+    fn reasoning_effort_option_table_accepts_max_value() {
+        let opt: ReasoningEffortOption = serde_json::from_value(json!({
+            "id": "max",
+            "value": "max",
+            "label": "max",
+            "description": "Maximum capability with deepest reasoning",
+        }))
+        .unwrap();
+        assert_eq!(opt.id, "max");
+        assert_eq!(opt.value, ReasoningEffort::Max);
+        assert_eq!(opt.label, "max");
     }
 
     #[test]
