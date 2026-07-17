@@ -1,0 +1,49 @@
+[
+  {
+    "body": {
+      "accounts": [
+        {
+          "id": "acc_0",
+          "ready": true
+        },
+        {
+          "id": "acc_1",
+          "ready": true
+        }
+      ],
+      "provider": "anthropic",
+      "scenario": "rate_limit_then_recover"
+    },
+    "expect_json": {
+      "session_id": "${SESSION_ID}"
+    },
+    "expect_status": 200,
+    "headers": {
+      "Authorization": "Bearer ${TEST_USER_TOKEN}",
+      "Content-Type": "application/json"
+    },
+    "method": "POST",
+    "path": "/test/sampler/session/start",
+    "save": {
+      "SESSION_ID": "$.session_id"
+    }
+  },
+  {
+    "body": {
+      "prompt": "hello",
+      "session_id": "${SESSION_ID}"
+    },
+    "expect_json": {
+      "final_status": "ok",
+      "recovery_path": "resubmit",
+      "rotated": true
+    },
+    "expect_status": 200,
+    "headers": {
+      "Authorization": "Bearer ${TEST_USER_TOKEN}",
+      "Content-Type": "application/json"
+    },
+    "method": "POST",
+    "path": "/v1/sampler/turn"
+  }
+]

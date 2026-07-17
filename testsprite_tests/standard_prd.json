@@ -1,0 +1,61 @@
+{
+  "core_goals": [
+    "Ensure missing active account index does not implicitly pin selection to account 0.",
+    "Preserve explicit sticky selection when an active account index is manually set and healthy.",
+    "On Anthropic rate limits, mark the selected account as cooled down/rejected with retry-after semantics and rotate to the next usable account.",
+    "Clear process-local cached bearer credentials when rate limits are recorded to prevent reuse of exhausted tokens.",
+    "Route Anthropic sampler rate-limit failures through rotation and existing resubmit recovery instead of immediate terminal exhaustion."
+  ],
+  "features": [
+    {
+      "description": "Account selection logic distinguishes between absent and explicit active index. Sticky behavior applies only when active_index is explicitly set; otherwise, normal ordering (health/tier/name) determines selection.",
+      "name": "Correct Account Selection Stickiness",
+      "user_flows": [
+        "With multiple ready accounts and active_index=None, user request resolves account via standard ranking, not forced index 0.",
+        "With active_index=Some(i) and account healthy, user request stays pinned to account i."
+      ]
+    },
+    {
+      "description": "When selected Anthropic account is rate-limited, manager marks it rejected, applies retry-after cooldown (or 5-minute fallback if header absent), and resolves the next ready credential without network dependency for selection.",
+      "name": "Rate-Limit Marking and Credential Rotation",
+      "user_flows": [
+        "User request hits Anthropic rate limit; system records rate limit on currently selected account.",
+        "Account unified_status becomes Rejected and rate_limit_reset_time is set to a future timestamp.",
+        "Next credential resolution skips cooled-down account and uses another ready account."
+      ]
+    },
+    {
+      "description": "Live credential layer clears cached process-local bearer token immediately after recording account rate limit, ensuring subsequent sampler configs cannot reuse exhausted bearer values.",
+      "name": "Live Bearer Cache Invalidation on Rate Limit",
+      "user_flows": [
+        "User request uses cached bearer token.",
+        "Rate limit is recorded for selected account.",
+        "Cached bearer is invalidated before next sampling attempt."
+      ]
+    },
+    {
+      "description": "Sampler handling for Anthropic `RateLimited` errors triggers credential mark/rotate/refresh logic, then returns existing resubmit recovery behavior rather than immediate exhausted failure; exhaustion is returned only if no replacement account remains.",
+      "name": "Sampler Rate-Limit Recovery via Existing Resubmit Path",
+      "user_flows": [
+        "Sampler returns RateLimited for Anthropic adapter during a turn.",
+        "Session invokes Anthropic live credential rotation workflow.",
+        "Session retries using existing resubmit mechanism with refreshed/rotated credentials.",
+        "If no usable account is available, session returns exhausted outcome."
+      ]
+    },
+    {
+      "description": "Implementation avoids introducing new balancing infrastructure, keeps unit tests offline from live Anthropic APIs, and prevents token/refresh-secret leakage in logs and artifacts.",
+      "name": "Security and Test Constraints",
+      "user_flows": [
+        "Developer runs auth package tests without live API calls.",
+        "Developer runs shell package checks for integration safety.",
+        "Generated artifacts and logs omit secrets."
+      ]
+    }
+  ],
+  "meta": {
+    "prepared_by": "TestSprite PRD Normalizer",
+    "project": "Anthropic OAuth Account Rotation After Fable Rate Limits"
+  },
+  "product_overview": "Improve Anthropic provider reliability by fixing account selection and rate-limit recovery so that rate-limited requests rotate to another usable OAuth account instead of repeatedly using an exhausted credential or failing terminally. The system should mark affected accounts as temporarily rejected, clear cached bearer tokens, refresh sampler configuration, and retry via the existing resubmit path without introducing new scheduling systems."
+}

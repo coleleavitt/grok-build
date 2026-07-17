@@ -85,6 +85,25 @@ impl LiveCredential {
         Ok(credential)
     }
 
+    /// Mark the currently selected account rate-limited and drop the cached
+    /// bearer so the next resolve can rotate to another account.
+    pub fn record_rate_limit(
+        &self,
+        retry_after_secs: Option<u64>,
+        message: &str,
+    ) -> Result<Option<String>> {
+        let marked = self
+            .inner
+            .manager
+            .record_selected_rate_limit(retry_after_secs, message)?;
+        if marked.is_some()
+            && let Ok(mut guard) = self.inner.cache.lock()
+        {
+            *guard = None;
+        }
+        Ok(marked)
+    }
+
     /// Last cached credential, if any. Does not hit the network.
     pub fn current(&self) -> Option<Credential> {
         self.inner.cache.lock().ok().and_then(|g| g.clone())
@@ -171,6 +190,37 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "authorization" && v == &format!("Bearer {VALID_ACCESS}"))
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn record_rate_limit_clears_cached_bearer() {
+        let (store, dir) = temp_store("rate-limit-cache");
+        let mut data = AccountData::default();
+        let mut account = Account::new("primary", RefreshToken::new(VALID_REFRESH));
+        account.access_token = Some(AccessToken::new(VALID_ACCESS));
+        account.expires_at = Some(Utc.timestamp_opt(Utc::now().timestamp() + 3600, 0).unwrap());
+        data.accounts.push(account);
+        store.save(&data).unwrap();
+
+        let endpoints = OAuthEndpoints {
+            token_url: "http://127.0.0.1:1/v1/oauth/token".into(),
+            ..OAuthEndpoints::prod()
+        };
+        let live = LiveCredential::new(AnthropicAuthManager::new(
+            store,
+            OAuthClient::new(endpoints),
+        ));
+        live.ensure_fresh().await.unwrap();
+        assert_eq!(live.current_bearer().as_deref(), Some(VALID_ACCESS));
+
+        assert_eq!(
+            live.record_rate_limit(Some(60), "usage exhausted")
+                .unwrap()
+                .as_deref(),
+            Some("primary")
+        );
+        assert!(live.current_bearer().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

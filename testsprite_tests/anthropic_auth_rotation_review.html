@@ -1,0 +1,61 @@
+<!doctype html><meta charset=utf-8><title>TestSprite PRD Review</title><style>body{font-family:system-ui;margin:2rem;background:#101512;color:#edf7ef}.card{background:#17231b;border:1px solid #2e5c3a;border-radius:14px;padding:18px;margin:12px 0}pre{white-space:pre-wrap;background:#0b100d;padding:1rem;border-radius:10px}li{margin:.4rem 0}code{color:#9ee6ad}</style><h1>PRD Review</h1><p><code>5df09319-15a2-4730-b8c0-439a23fd1015</code></p><p>source: doc:testsprite_tests/anthropic_auth_rotation_prd.md · approval: not approved</p><div class=card><h2>Requirements</h2><pre>{
+  &quot;core_goals&quot;: [
+    &quot;Ensure missing active account index does not implicitly pin selection to account 0.&quot;,
+    &quot;Preserve explicit sticky selection when an active account index is manually set and healthy.&quot;,
+    &quot;On Anthropic rate limits, mark the selected account as cooled down/rejected with retry-after semantics and rotate to the next usable account.&quot;,
+    &quot;Clear process-local cached bearer credentials when rate limits are recorded to prevent reuse of exhausted tokens.&quot;,
+    &quot;Route Anthropic sampler rate-limit failures through rotation and existing resubmit recovery instead of immediate terminal exhaustion.&quot;
+  ],
+  &quot;features&quot;: [
+    {
+      &quot;description&quot;: &quot;Account selection logic distinguishes between absent and explicit active index. Sticky behavior applies only when active_index is explicitly set; otherwise, normal ordering (health/tier/name) determines selection.&quot;,
+      &quot;name&quot;: &quot;Correct Account Selection Stickiness&quot;,
+      &quot;user_flows&quot;: [
+        &quot;With multiple ready accounts and active_index=None, user request resolves account via standard ranking, not forced index 0.&quot;,
+        &quot;With active_index=Some(i) and account healthy, user request stays pinned to account i.&quot;
+      ]
+    },
+    {
+      &quot;description&quot;: &quot;When selected Anthropic account is rate-limited, manager marks it rejected, applies retry-after cooldown (or 5-minute fallback if header absent), and resolves the next ready credential without network dependency for selection.&quot;,
+      &quot;name&quot;: &quot;Rate-Limit Marking and Credential Rotation&quot;,
+      &quot;user_flows&quot;: [
+        &quot;User request hits Anthropic rate limit; system records rate limit on currently selected account.&quot;,
+        &quot;Account unified_status becomes Rejected and rate_limit_reset_time is set to a future timestamp.&quot;,
+        &quot;Next credential resolution skips cooled-down account and uses another ready account.&quot;
+      ]
+    },
+    {
+      &quot;description&quot;: &quot;Live credential layer clears cached process-local bearer token immediately after recording account rate limit, ensuring subsequent sampler configs cannot reuse exhausted bearer values.&quot;,
+      &quot;name&quot;: &quot;Live Bearer Cache Invalidation on Rate Limit&quot;,
+      &quot;user_flows&quot;: [
+        &quot;User request uses cached bearer token.&quot;,
+        &quot;Rate limit is recorded for selected account.&quot;,
+        &quot;Cached bearer is invalidated before next sampling attempt.&quot;
+      ]
+    },
+    {
+      &quot;description&quot;: &quot;Sampler handling for Anthropic `RateLimited` errors triggers credential mark/rotate/refresh logic, then returns existing resubmit recovery behavior rather than immediate exhausted failure; exhaustion is returned only if no replacement account remains.&quot;,
+      &quot;name&quot;: &quot;Sampler Rate-Limit Recovery via Existing Resubmit Path&quot;,
+      &quot;user_flows&quot;: [
+        &quot;Sampler returns RateLimited for Anthropic adapter during a turn.&quot;,
+        &quot;Session invokes Anthropic live credential rotation workflow.&quot;,
+        &quot;Session retries using existing resubmit mechanism with refreshed/rotated credentials.&quot;,
+        &quot;If no usable account is available, session returns exhausted outcome.&quot;
+      ]
+    },
+    {
+      &quot;description&quot;: &quot;Implementation avoids introducing new balancing infrastructure, keeps unit tests offline from live Anthropic APIs, and prevents token/refresh-secret leakage in logs and artifacts.&quot;,
+      &quot;name&quot;: &quot;Security and Test Constraints&quot;,
+      &quot;user_flows&quot;: [
+        &quot;Developer runs auth package tests without live API calls.&quot;,
+        &quot;Developer runs shell package checks for integration safety.&quot;,
+        &quot;Generated artifacts and logs omit secrets.&quot;
+      ]
+    }
+  ],
+  &quot;meta&quot;: {
+    &quot;prepared_by&quot;: &quot;TestSprite PRD Normalizer&quot;,
+    &quot;project&quot;: &quot;Anthropic OAuth Account Rotation After Fable Rate Limits&quot;
+  },
+  &quot;product_overview&quot;: &quot;Improve Anthropic provider reliability by fixing account selection and rate-limit recovery so that rate-limited requests rotate to another usable OAuth account instead of repeatedly using an exhausted credential or failing terminally. The system should mark affected accounts as temporarily rejected, clear cached bearer tokens, refresh sampler configuration, and retry via the existing resubmit path without introducing new scheduling systems.&quot;
+}</pre></div><div class=card><h2>Generated test plan</h2><ol><li><b>Select account by ranking when active_index is absent</b><br>Verify credential resolution does not implicitly pin to index 0 when active_index is null/absent; selection should follow normal ordering rules (health/tier/name).</li><li><b>Preserve sticky selection when explicit active_index is healthy</b><br>Verify explicit active_index pins selection to that account when it is healthy/ready.</li><li><b>Mark selected account rejected with retry-after and rotate</b><br>On Anthropic rate limit with Retry-After header, selected account is marked rejected/cooled down and next resolve rotates to another ready account.</li><li><b>Apply 5-minute cooldown fallback when retry-after missing</b><br>If rate limit response has no Retry-After metadata, system applies default cooldown window (300 seconds) and marks account rejected.</li><li><b>Invalidate process-local bearer cache on rate limit record</b><br>After recording rate limit for selected account, cached bearer credential is cleared so next credential fetch cannot reuse exhausted token.</li><li><b>Sampler Anthropic RateLimited error follows rotate+resubmit recovery</b><br>Sampler RateLimited outcome should trigger credential mark/rotate/refresh workflow and then use existing resubmit path to continue successfully.</li><li><b>Sampler returns exhausted only when no replacement account remains</b><br>If all Anthropic accounts are rejected/unavailable after RateLimited handling, session should return exhausted outcome.</li><li><b>No secret leakage in auth/log artifacts during offline test runs</b><br>Validate security constraint that test/log endpoints and artifacts do not expose bearer tokens or refresh secrets; intended for CI safety checks without live API dependency.</li></ol></div><p>Approve after review: <code>testsprite-rs prd approve 5df09319-15a2-4730-b8c0-439a23fd1015</code></p>

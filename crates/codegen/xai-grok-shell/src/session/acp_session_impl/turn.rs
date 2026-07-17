@@ -2198,14 +2198,30 @@ impl SessionActor {
                     auth_retry_schedule.reset_on_success();
                     continue;
                 }
-                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit { credential, store }) => {
-                    if auth_retry_schedule.reset_if_incident_spans_suspend() {
-                        tracing::info!("auth 401 retry: incident spanned a suspend; budget reset");
-                        xai_grok_telemetry::unified_log::info(
-                            "shell.turn.auth_retry_reset_after_suspend",
+                SamplerTurnOutcome::RefreshAuthAndResubmit => {
+                    if let Some((attempt, delay)) = auth_retry_schedule.next_delay() {
+                        let delay_ms = delay.as_millis() as u64;
+                        tracing::warn!(
+                            attempt,
+                            delay_ms,
+                            "auth recovery retry: backing off before resubmit"
+                        );
+                        xai_grok_telemetry::unified_log::warn(
+                            "shell.turn.auth_retry_backoff",
                             Some(self.session_info.id.0.as_ref()),
                             Some(serde_json::json!({ "loop_index": loop_index })),
                         );
+                        self.send_xai_notification(XaiSessionUpdate::RetryState(
+                            crate::extensions::notification::RetryState::Retrying {
+                                attempt,
+                                max_retries: AuthRetrySchedule::MAX_RETRIES,
+                                reason: "Credentials refreshed or rotated; retrying request"
+                                    .to_string(),
+                            },
+                        ))
+                        .await;
+                        sleep(delay).await;
+                        continue;
                     }
                     match auth_retry_schedule.on_recovered_401(credential) {
                         AuthRetryDecision::UnchargedResubmit { resubmit } => {
