@@ -11,6 +11,7 @@ fn model_with_support(id: &str, supports: bool) -> (acp::ModelId, acp::ModelInfo
             "supportsReasoningEffort": true,
             "reasoningEffort": "medium",
             "reasoningEfforts": [
+                { "id": "max", "value": "max", "label": "Max" },
                 { "id": "deep", "value": "xhigh", "label": "Deep" },
                 { "id": "high", "value": "high", "label": "High" },
             ],
@@ -183,16 +184,13 @@ fn stashed_model_keeps_model_when_unsupported() {
 }
 
 #[test]
-fn effort_only_accepts_max_as_xhigh() {
+fn effort_only_accepts_max_as_distinct_level() {
     let models = models_with_current(true);
     let out = take_deferred_model_switch(None, &models, Some("max"));
     assert_eq!(
         out,
         DeferredSwitchOutcome {
-            switch: Some((
-                models.current.clone().unwrap(),
-                Some(ReasoningEffort::Xhigh)
-            )),
+            switch: Some((models.current.clone().unwrap(), Some(ReasoningEffort::Max))),
             effort_error: None,
         }
     );

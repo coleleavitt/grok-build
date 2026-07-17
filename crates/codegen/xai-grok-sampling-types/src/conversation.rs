@@ -2084,7 +2084,7 @@ impl From<ConversationRequest> for ChatCompletionRequest {
             tool_choice,
             search_parameters: None,
             response_format,
-            reasoning_effort: req.reasoning_effort,
+            reasoning_effort: req.reasoning_effort.map(|e| e.to_chat_completions_api()),
             x_grok_conv_id: req.x_grok_conv_id,
             x_grok_req_id: req.x_grok_req_id,
             x_grok_session_id: req.x_grok_session_id,
@@ -5077,7 +5077,8 @@ mod tests {
             (crate::ReasoningEffort::Low, "low"),
             (crate::ReasoningEffort::Medium, "medium"),
             (crate::ReasoningEffort::High, "high"),
-            (crate::ReasoningEffort::Xhigh, "max"),
+            (crate::ReasoningEffort::Xhigh, "xhigh"),
+            (crate::ReasoningEffort::Max, "max"),
         ] {
             let req = messages_test_request(Some(variant));
             let msgs = build_messages_request(&req);
@@ -5126,6 +5127,7 @@ mod tests {
             (crate::ReasoningEffort::Medium, "medium"),
             (crate::ReasoningEffort::High, "high"),
             (crate::ReasoningEffort::Xhigh, "xhigh"),
+            (crate::ReasoningEffort::Max, "xhigh"),
         ] {
             let req = ConversationRequest::from_items(vec![ConversationItem::user("hi")])
                 .with_model("test");
