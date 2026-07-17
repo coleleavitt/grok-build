@@ -636,6 +636,54 @@ impl SessionActor {
         }
     }
 
+    async fn rotate_anthropic_after_rate_limit(
+        self: &Arc<Self>,
+        error: &xai_grok_sampler::SamplingErrorInfo,
+    ) -> bool {
+        let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
+            return false;
+        };
+        if !is_anthropic_adapter(&cfg.provider_request_adapter) {
+            return false;
+        }
+        let live = anthropic_live_credential();
+        match live.record_rate_limit(error.retry_after_secs, &error.message) {
+            Ok(Some(account)) => {
+                tracing::warn!(
+                    account = %account,
+                    retry_after_secs = ?error.retry_after_secs,
+                    "anthropic oauth account rate-limited; rotating"
+                );
+                xai_grok_telemetry::unified_log::warn(
+                    "anthropic oauth account rate-limited; rotating",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "account": account,
+                        "retry_after_secs": error.retry_after_secs,
+                    })),
+                );
+            }
+            Ok(None) => return false,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to mark anthropic oauth rate limit");
+                return false;
+            }
+        }
+        if !live.has_usable_accounts() {
+            return false;
+        }
+        match live.ensure_fresh().await {
+            Ok(_) => {
+                self.prepare_sampler_for_turn().await;
+                true
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "anthropic oauth rotation failed after rate limit");
+                false
+            }
+        }
+    }
+
     fn log_terminal_failure(&self, error_type: &str, status_code: Option<u16>, message: &str) {
         let auth = self
             .auth_manager
@@ -706,6 +754,9 @@ impl SessionActor {
             return Err(acp::Error::invalid_params().data(friendly));
         }
         if matches!(error.kind, SamplingErrorKind::RateLimited) {
+            if self.rotate_anthropic_after_rate_limit(&error).await {
+                return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit);
+            }
             self.log_terminal_failure("rate_limited", error.status_code, &detailed_message);
             self.send_xai_notification(XaiSessionUpdate::RetryState(
                 crate::extensions::notification::RetryState::Exhausted {

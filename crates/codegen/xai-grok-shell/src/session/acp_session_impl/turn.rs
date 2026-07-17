@@ -1924,7 +1924,7 @@ impl SessionActor {
                         tracing::warn!(
                             attempt,
                             delay_ms,
-                            "auth 401 retry: backing off before resubmit"
+                            "auth recovery retry: backing off before resubmit"
                         );
                         xai_grok_telemetry::unified_log::warn(
                             "shell.turn.auth_retry_backoff",
@@ -1939,7 +1939,8 @@ impl SessionActor {
                             crate::extensions::notification::RetryState::Retrying {
                                 attempt,
                                 max_retries: AuthRetrySchedule::MAX_RETRIES,
-                                reason: "Re-authenticated after 401; retrying request".to_string(),
+                                reason: "Credentials refreshed or rotated; retrying request"
+                                    .to_string(),
                             },
                         ))
                         .await;

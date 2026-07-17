@@ -80,7 +80,7 @@ impl AccountData {
         if pool.is_empty() {
             return None;
         }
-        if let Some(active) = self.active() {
+        if let Some(active) = self.active_index.and_then(|_| self.active()) {
             if active.health_score() >= STICKY_HEALTH_THRESHOLD
                 && pool.iter().any(|a| a.name == active.name)
             {
@@ -302,6 +302,18 @@ mod tests {
         data.active_index = Some(1); // "b" active, healthy (Allowed → score 4+2)
         let chosen = data.select(now()).unwrap();
         assert_eq!(chosen.name, "b", "healthy active account is sticky");
+    }
+
+    #[test]
+    fn select_missing_active_index_does_not_stick_to_first_account() {
+        let mut data = AccountData::default();
+        data.accounts.push(ready_account("b"));
+        data.accounts.push(ready_account("a"));
+        let chosen = data.select(now()).unwrap();
+        assert_eq!(
+            chosen.name, "a",
+            "implicit index 0 is a display fallback, not a rotation pin"
+        );
     }
 
     #[test]

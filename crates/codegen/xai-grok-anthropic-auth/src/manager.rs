@@ -3,14 +3,18 @@
 //! together into "give me a credential ready to sign a request", refreshing and
 //! persisting when the selected account's access token is missing or stale.
 
-use crate::account::Account;
+use crate::account::{Account, RoutingStatus};
 use crate::endpoints::OAuthEndpoints;
 use crate::error::{AnthropicAuthError, Result};
 use crate::oauth::OAuthClient;
 use crate::request::HeaderMutation;
 use crate::store::AccountStore;
 use crate::token::{Credential, OAuthTokens};
-use chrono::Utc;
+use chrono::{Duration, Utc};
+
+// ponytail: fallback only when Anthropic omits Retry-After; replace with
+// provider reset metadata if Anthropic exposes a stable per-account reset.
+const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: i64 = 5 * 60;
 
 /// Composes credential storage and the OAuth client into the high-level
 /// operations a plugin transport needs.
@@ -91,6 +95,35 @@ impl AnthropicAuthManager {
     pub async fn resolve_headers(&self) -> Result<HeaderMutation> {
         let credential = self.resolve_credential().await?;
         Ok(HeaderMutation::for_credential(&credential))
+    }
+
+    /// Mark the account selected by current rotation as rate-limited so the
+    /// next resolve can pick another usable account.
+    pub fn record_selected_rate_limit(
+        &self,
+        retry_after_secs: Option<u64>,
+        message: &str,
+    ) -> Result<Option<String>> {
+        let now = Utc::now();
+        let reset_at = now
+            + Duration::seconds(
+                retry_after_secs
+                    .and_then(|s| i64::try_from(s).ok())
+                    .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN_SECS),
+            );
+        let mut marked = None;
+        self.store.read_modify_write(|data| {
+            let Some(name) = data.select(now).map(|a| a.name.clone()) else {
+                return;
+            };
+            if let Some(account) = data.find_mut(&name) {
+                account.unified_status = Some(RoutingStatus::Rejected);
+                account.rate_limit_reset_time = Some(reset_at.timestamp_millis());
+                account.last_auth_error = Some(message.to_owned());
+                marked = Some(name);
+            }
+        })?;
+        Ok(marked)
     }
 }
 
@@ -236,6 +269,50 @@ mod tests {
         let account = reloaded.find("primary").unwrap();
         assert_eq!(account.enabled, Some(false));
         assert_eq!(account.disabled_reason.as_deref(), Some("invalid_grant"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_mark_rotates_to_next_ready_account() {
+        let (store, dir) = temp_store("rate-limit-rotate");
+        let mut data = AccountData::default();
+        let mut first = Account::new("a", RefreshToken::new(VALID_REFRESH));
+        first.access_token = Some(AccessToken::new(VALID_ACCESS));
+        first.expires_at = Some(Utc.timestamp_opt(Utc::now().timestamp() + 3600, 0).unwrap());
+        let mut second = Account::new("b", RefreshToken::new(VALID_REFRESH));
+        second.access_token = Some(AccessToken::new("sk-ant-oat01-secondtokenvalue000001"));
+        second.expires_at = Some(Utc.timestamp_opt(Utc::now().timestamp() + 3600, 0).unwrap());
+        data.accounts.push(first);
+        data.accounts.push(second);
+        store.save(&data).unwrap();
+
+        let endpoints = OAuthEndpoints {
+            token_url: "http://127.0.0.1:1/v1/oauth/token".into(),
+            ..OAuthEndpoints::prod()
+        };
+        let manager = AnthropicAuthManager::new(store.clone(), OAuthClient::new(endpoints));
+
+        assert_eq!(
+            manager
+                .record_selected_rate_limit(Some(60), "Claude Fable usage exhausted")
+                .unwrap()
+                .as_deref(),
+            Some("a")
+        );
+        let credential = manager.resolve_credential().await.unwrap();
+        match credential {
+            Credential::Oauth(tokens) => {
+                assert_eq!(
+                    tokens.access.expose(),
+                    "sk-ant-oat01-secondtokenvalue000001"
+                );
+            }
+            _ => panic!("expected oauth credential"),
+        }
+        let reloaded = store.load().unwrap();
+        let first = reloaded.find("a").unwrap();
+        assert_eq!(first.unified_status, Some(RoutingStatus::Rejected));
+        assert!(first.rate_limit_reset_time.unwrap() > Utc::now().timestamp_millis());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

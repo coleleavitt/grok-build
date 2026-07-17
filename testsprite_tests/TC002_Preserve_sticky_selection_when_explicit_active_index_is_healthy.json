@@ -1,0 +1,45 @@
+[
+  {
+    "body": {
+      "accounts": [
+        {
+          "healthy": true,
+          "id": "acc_0",
+          "name": "alpha",
+          "tier": 1
+        },
+        {
+          "healthy": true,
+          "id": "acc_1",
+          "name": "beta",
+          "tier": 2
+        }
+      ],
+      "active_index": 1,
+      "provider": "anthropic"
+    },
+    "expect_status": 200,
+    "headers": {
+      "Authorization": "Bearer ${TEST_ADMIN_TOKEN}",
+      "Content-Type": "application/json"
+    },
+    "method": "POST",
+    "path": "/test/accounts/seed"
+  },
+  {
+    "body": {
+      "provider": "anthropic"
+    },
+    "expect_json": {
+      "selected_account_id": "acc_1",
+      "selection_reason": "sticky_active_index"
+    },
+    "expect_status": 200,
+    "headers": {
+      "Authorization": "Bearer ${TEST_USER_TOKEN}",
+      "Content-Type": "application/json"
+    },
+    "method": "POST",
+    "path": "/v1/credentials/resolve"
+  }
+]
