@@ -1,0 +1,53 @@
+<!doctype html><meta charset=utf-8><title>TestSprite PRD Review</title><style>body{font-family:system-ui;margin:2rem;background:#101512;color:#edf7ef}.card{background:#17231b;border:1px solid #2e5c3a;border-radius:14px;padding:18px;margin:12px 0}pre{white-space:pre-wrap;background:#0b100d;padding:1rem;border-radius:10px}li{margin:.4rem 0}code{color:#9ee6ad}</style><h1>PRD Review</h1><p><code>9dc9982a-d063-43f5-9d0f-0119a955e5fe</code></p><p>source: ingest-prd:testsprite_tests/brain_standard_prd.json · approval: not approved</p><div class=card><h2>Requirements</h2><pre>{
+  &quot;core_goals&quot;: [
+    &quot;Durable page store: CRUD with derived titles, persistence across store close/reopen.&quot;,
+    &quot;Graph parity: undirected relations deduped via ordered pairs, self-edges rejected, related pages grouped by category, graph query with per-node degree including degree-0 nodes.&quot;,
+    &quot;Provenance parity: typed source citations (chat_session, document, connector, file, manual) with drift-tolerant source-ref normalization ([s1]/S1/[D3]/d4).&quot;,
+    &quot;Settings parity: enabled/use-connectors flags, clearable focus instructions, last-run timestamp with run-completion stamping.&quot;,
+    &quot;Engine parity: self-improvement run gated on the enabled flag, transcript built with [S#]/[D#] refs (documents only when use_connectors), focus instructions passed to the provider, pages auto-categorized with update-over-duplicate title matching, sources attached via normalized refs, related pages linked, last_run_at stamped.&quot;
+  ],
+  &quot;features&quot;: [
+    {
+      &quot;description&quot;: &quot;Create, read, list (newest-updated first), update, and delete memory pages with title derivation from the first sentence when absent; data persists across closing and reopening the store file.&quot;,
+      &quot;name&quot;: &quot;Memory page store&quot;,
+      &quot;user_flows&quot;: []
+    },
+    {
+      &quot;description&quot;: &quot;Undirected page-to-page edges stored once per ordered pair (dedup in either direction), self-edge and unknown-page rejection, edge removal, related-pages query grouped by category, and a graph query returning all nodes with degrees (degree-0 nodes included) plus edges.&quot;,
+      &quot;name&quot;: &quot;Relations and memory graph&quot;,
+      &quot;user_flows&quot;: []
+    },
+    {
+      &quot;description&quot;: &quot;Typed citations (chat_session, document, connector, file, manual) attach to and list for a page with label capping, and source-ref normalization tolerates bracket/case drift without silently dropping citations.&quot;,
+      &quot;name&quot;: &quot;Source citations&quot;,
+      &quot;user_flows&quot;: []
+    },
+    {
+      &quot;description&quot;: &quot;Enabled flag, use-connectors flag, optional focus-instructions text (whitespace clears), and last-run timestamp round-trip through get/update; a run-completion operation stamps the timestamp; settings persist across reopen.&quot;,
+      &quot;name&quot;: &quot;Brain settings&quot;,
+      &quot;user_flows&quot;: []
+    },
+    {
+      &quot;description&quot;: &quot;run_self_improvement builds an [S#]/[D#]-tagged transcript from session/document context (documents only when use_connectors), passes focus instructions and existing titles to a pluggable ExtractionProvider, applies extracted pages into the four categories with update-over-duplicate title matching, attaches per-page sources via normalized refs, links related pages, skips entirely when disabled, and stamps last_run_at on completed runs.&quot;,
+      &quot;name&quot;: &quot;Self-improvement run engine&quot;,
+      &quot;user_flows&quot;: []
+    },
+    {
+      &quot;description&quot;: &quot;The ported Onyx test suite (test_memory_recall_and_graph.py, the suite behind the Onyx testsprite brain-graph script) passes against the Rust crate with the same seed data, topology, and assertions.&quot;,
+      &quot;name&quot;: &quot;Onyx behavioral parity&quot;,
+      &quot;user_flows&quot;: []
+    }
+  ],
+  &quot;meta&quot;: {
+    &quot;prepared_by&quot;: &quot;TestSprite (local)&quot;,
+    &quot;project&quot;: &quot;xai-grok-brain&quot;
+  },
+  &quot;product_overview&quot;: &quot;xai-grok-brain is a Rust library crate in the grok-build workspace providing a durable, single-user 'Brain': a SQLite-backed graph of memory pages with four categories (notes, concepts, entities, workstreams), undirected page-to-page relations, typed source citations, per-store brain settings, and a self-improvement run engine behind a pluggable extraction provider. It ports the Onyx/Perplexity Brain domain layer with parity semantics; HTTP endpoints, UI, and scheduling are out of scope.&quot;,
+  &quot;requirements&quot;: [
+    &quot;cargo build -p xai-grok-brain compiles with no errors and cargo clippy -p xai-grok-brain reports no warnings.&quot;,
+    &quot;The crate's full cargo test suite (unit + consumer + onyx_parity integration tests) passes deterministically on repeated runs.&quot;,
+    &quot;Graph invariants hold: duplicate edges collapse, self-edges error, degree-0 nodes appear in the graph query output.&quot;,
+    &quot;Drifted source refs [s1], S1, [D3], d4 all resolve to their canonical S#/D# keys.&quot;,
+    &quot;A disabled store never invokes the extraction provider and never stamps last_run_at; an enabled run stamps it even when no pages are produced.&quot;
+  ]
+}</pre></div><div class=card><h2>Generated test plan</h2><ol></ol></div><p>Approve after review: <code>testsprite-rs prd approve 9dc9982a-d063-43f5-9d0f-0119a955e5fe</code></p>

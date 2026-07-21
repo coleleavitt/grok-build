@@ -1,0 +1,1 @@
+cargo test -p xai-grok-brain --lib -- tests::source_attach_and_list tests::source_ref_normalization_tolerates_drift --exact

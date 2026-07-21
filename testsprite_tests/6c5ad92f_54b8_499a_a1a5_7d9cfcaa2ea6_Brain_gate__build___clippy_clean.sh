@@ -1,0 +1,1 @@
+cargo build -p xai-grok-brain && cargo clippy -p xai-grok-brain -- -D warnings

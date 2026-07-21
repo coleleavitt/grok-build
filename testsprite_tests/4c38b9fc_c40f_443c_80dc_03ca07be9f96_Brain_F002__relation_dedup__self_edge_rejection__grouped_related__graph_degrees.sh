@@ -1,0 +1,1 @@
+cargo test -p xai-grok-brain --lib -- tests::relation_dedup_both_directions tests::self_edge_rejected tests::relation_to_unknown_page_rejected tests::relation_removal tests::related_pages_grouped_by_category tests::graph_includes_degree_zero_nodes --exact

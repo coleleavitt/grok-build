@@ -1,0 +1,59 @@
+{
+  "meta": {
+    "project": "xai-grok-brain",
+    "date": "2026-07-21",
+    "prepared_by": "TestSprite (local)",
+    "source": "Port of the Onyx 'Brain' self-improving memory-graph feature (backend/onyx/db/brain.py + brain/tasks.py) into a Rust workspace crate."
+  },
+  "product_overview": "xai-grok-brain is a Rust library crate in the grok-build workspace providing a durable, single-user 'Brain': a SQLite-backed graph of memory pages with four categories (notes, concepts, entities, workstreams), undirected page-to-page relations, typed source citations, per-store brain settings, and a self-improvement run engine behind a pluggable extraction provider. It ports the Onyx/Perplexity Brain domain layer with parity semantics; HTTP endpoints, UI, and scheduling are out of scope.",
+  "core_goals": [
+    "Durable page store: CRUD with derived titles, persistence across store close/reopen.",
+    "Graph parity: undirected relations deduped via ordered pairs, self-edges rejected, related pages grouped by category, graph query with per-node degree including degree-0 nodes.",
+    "Provenance parity: typed source citations (chat_session, document, connector, file, manual) with drift-tolerant source-ref normalization ([s1]/S1/[D3]/d4).",
+    "Settings parity: enabled/use-connectors flags, clearable focus instructions, last-run timestamp with run-completion stamping.",
+    "Engine parity: self-improvement run gated on the enabled flag, transcript built with [S#]/[D#] refs (documents only when use_connectors), focus instructions passed to the provider, pages auto-categorized with update-over-duplicate title matching, sources attached via normalized refs, related pages linked, last_run_at stamped."
+  ],
+  "key_features": [
+    {
+      "id": "F001",
+      "name": "Memory page store",
+      "description": "Create, read, list (newest-updated first), update, and delete memory pages with title derivation from the first sentence when absent; data persists across closing and reopening the store file."
+    },
+    {
+      "id": "F002",
+      "name": "Relations and memory graph",
+      "description": "Undirected page-to-page edges stored once per ordered pair (dedup in either direction), self-edge and unknown-page rejection, edge removal, related-pages query grouped by category, and a graph query returning all nodes with degrees (degree-0 nodes included) plus edges."
+    },
+    {
+      "id": "F003",
+      "name": "Source citations",
+      "description": "Typed citations (chat_session, document, connector, file, manual) attach to and list for a page with label capping, and source-ref normalization tolerates bracket/case drift without silently dropping citations."
+    },
+    {
+      "id": "F004",
+      "name": "Brain settings",
+      "description": "Enabled flag, use-connectors flag, optional focus-instructions text (whitespace clears), and last-run timestamp round-trip through get/update; a run-completion operation stamps the timestamp; settings persist across reopen."
+    },
+    {
+      "id": "F005",
+      "name": "Self-improvement run engine",
+      "description": "run_self_improvement builds an [S#]/[D#]-tagged transcript from session/document context (documents only when use_connectors), passes focus instructions and existing titles to a pluggable ExtractionProvider, applies extracted pages into the four categories with update-over-duplicate title matching, attaches per-page sources via normalized refs, links related pages, skips entirely when disabled, and stamps last_run_at on completed runs."
+    },
+    {
+      "id": "F006",
+      "name": "Onyx behavioral parity",
+      "description": "The ported Onyx test suite (test_memory_recall_and_graph.py, the suite behind the Onyx testsprite brain-graph script) passes against the Rust crate with the same seed data, topology, and assertions."
+    }
+  ],
+  "validation_criteria": [
+    "cargo build -p xai-grok-brain compiles with no errors and cargo clippy -p xai-grok-brain reports no warnings.",
+    "The crate's full cargo test suite (unit + consumer + onyx_parity integration tests) passes deterministically on repeated runs.",
+    "Graph invariants hold: duplicate edges collapse, self-edges error, degree-0 nodes appear in the graph query output.",
+    "Drifted source refs [s1], S1, [D3], d4 all resolve to their canonical S#/D# keys.",
+    "A disabled store never invokes the extraction provider and never stamps last_run_at; an enabled run stamps it even when no pages are produced."
+  ],
+  "test_environment": {
+    "backend_api": "local://cargo",
+    "notes": "Library crate; all validation runs through cargo from the workspace root. No live server."
+  }
+}

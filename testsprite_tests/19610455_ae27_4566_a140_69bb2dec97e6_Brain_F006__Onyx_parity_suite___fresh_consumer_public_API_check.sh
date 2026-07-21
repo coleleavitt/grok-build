@@ -1,0 +1,1 @@
+cargo test -p xai-grok-brain --test onyx_parity --test consumer

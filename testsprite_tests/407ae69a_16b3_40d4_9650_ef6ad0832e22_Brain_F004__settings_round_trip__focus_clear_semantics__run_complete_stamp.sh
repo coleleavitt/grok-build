@@ -1,0 +1,1 @@
+cargo test -p xai-grok-brain --lib -- tests::settings_defaults_and_roundtrip tests::mark_run_complete_updates_timestamp --exact
