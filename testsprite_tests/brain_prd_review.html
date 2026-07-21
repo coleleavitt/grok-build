@@ -1,11 +1,12 @@
-<!doctype html><meta charset=utf-8><title>TestSprite PRD Review</title><style>body{font-family:system-ui;margin:2rem;background:#101512;color:#edf7ef}.card{background:#17231b;border:1px solid #2e5c3a;border-radius:14px;padding:18px;margin:12px 0}pre{white-space:pre-wrap;background:#0b100d;padding:1rem;border-radius:10px}li{margin:.4rem 0}code{color:#9ee6ad}</style><h1>PRD Review</h1><p><code>38a75df9-18f0-46bf-84f2-f04dc39aed44</code></p><p>source: ingest-prd:testsprite_tests/brain_standard_prd.json · approval: not approved</p><div class=card><h2>Requirements</h2><pre>{
+<!doctype html><meta charset=utf-8><title>TestSprite PRD Review</title><style>body{font-family:system-ui;margin:2rem;background:#101512;color:#edf7ef}.card{background:#17231b;border:1px solid #2e5c3a;border-radius:14px;padding:18px;margin:12px 0}pre{white-space:pre-wrap;background:#0b100d;padding:1rem;border-radius:10px}li{margin:.4rem 0}code{color:#9ee6ad}</style><h1>PRD Review</h1><p><code>7f241280-3f43-4ccb-a6dd-c8e3b8fecdf3</code></p><p>source: ingest-prd:testsprite_tests/brain_standard_prd.json · approval: not approved</p><div class=card><h2>Requirements</h2><pre>{
   &quot;core_goals&quot;: [
     &quot;Durable page store: CRUD with derived titles, persistence across store close/reopen.&quot;,
     &quot;Graph parity: undirected relations deduped via ordered pairs, self-edges rejected, related pages grouped by category, graph query with per-node degree including degree-0 nodes.&quot;,
     &quot;Provenance parity: typed source citations (chat_session, document, connector, file, manual) with drift-tolerant source-ref normalization ([s1]/S1/[D3]/d4).&quot;,
     &quot;Settings parity: enabled/use-connectors flags, clearable focus instructions, last-run timestamp with run-completion stamping.&quot;,
     &quot;Engine parity: self-improvement run gated on the enabled flag, transcript built with [S#]/[D#] refs (documents only when use_connectors), focus instructions passed to the provider, pages auto-categorized with update-over-duplicate title matching, sources attached via normalized refs, related pages linked, last_run_at stamped.&quot;,
-    &quot;Expose Onyx /memory list-shape parity helpers for category_counts and category-filtered listing so portable integration tests can assert the same list semantics as the Onyx stack.&quot;
+    &quot;Expose Onyx /memory list-shape parity helpers for category_counts and category-filtered listing so portable integration tests can assert the same list semantics as the Onyx stack.&quot;,
+    &quot;Wire Brain into Grok Build’s real prompt/request path so normal user requests can create durable Brain records and later requests receive recalled context through the shipped request builder.&quot;
   ],
   &quot;features&quot;: [
     {
@@ -42,6 +43,16 @@
       &quot;description&quot;: &quot;Library equivalent of Onyx's testsprite memory_demo_populate.py: populate memories across all four categories, report total and per-category counts, expose all nodes in the graph as degree-0 before linking, run the self-improvement pipeline to refresh/recall the codename page without duplicating it, attach a chat-session citation via normalized refs, link related pages, then clean up and verify the store is empty.&quot;,
       &quot;name&quot;: &quot;Portable live-demo lifecycle parity&quot;,
       &quot;user_flows&quot;: []
+    },
+    {
+      &quot;description&quot;: &quot;The xai-grok-shell prompt path opens the durable Grok Brain store, processes user-originated remember requests before model sampling, persists a Brain page with title/category/source citation, and injects recalled Brain context into the real ChatStateActor request-building memory reminder path for later fresh requests.&quot;,
+      &quot;name&quot;: &quot;Grok Build request-path Brain wiring&quot;,
+      &quot;user_flows&quot;: []
+    },
+    {
+      &quot;description&quot;: &quot;The wired service respects disabled settings (no create/no recall), initializes a normal Grok store enabled only when unconfigured, and exposes deterministic-provider self-improvement through the Grok Build service boundary for tests without network LLM calls.&quot;,
+      &quot;name&quot;: &quot;Brain integration settings and deterministic self-improvement&quot;,
+      &quot;user_flows&quot;: []
     }
   ],
   &quot;meta&quot;: {
@@ -55,6 +66,8 @@
     &quot;Graph invariants hold: duplicate edges collapse, self-edges error, degree-0 nodes appear in the graph query output.&quot;,
     &quot;Drifted source refs [s1], S1, [D3], d4 all resolve to their canonical S#/D# keys.&quot;,
     &quot;A disabled store never invokes the extraction provider and never stamps last_run_at; an enabled run stamps it even when no pages are produced.&quot;,
-    &quot;The portable live-demo lifecycle test passes: category counts match the populated all-category seed set, graph nodes appear before linking, the self-improvement run updates rather than duplicates the codename page, sources and relations are attached, and cleanup leaves an empty store.&quot;
+    &quot;The portable live-demo lifecycle test passes: category counts match the populated all-category seed set, graph nodes appear before linking, the self-improvement run updates rather than duplicates the codename page, sources and relations are attached, and cleanup leaves an empty store.&quot;,
+    &quot;Shell integration tests pass: process_brain_request_at_path creates a page/source for a remember request, reopens the store, recalls the value for a later fresh request, and the recalled context is injected via ChatStateActor::build_request.&quot;,
+    &quot;Integration settings tests pass: disabled Brain blocks create/recall, and deterministic-provider self-improvement through BrainService creates/updates categorized pages, sources, relations, and last-run timestamp.&quot;
   ]
-}</pre></div><div class=card><h2>Generated test plan</h2><ol></ol></div><p>Approve after review: <code>testsprite-rs prd approve 38a75df9-18f0-46bf-84f2-f04dc39aed44</code></p>
+}</pre></div><div class=card><h2>Generated test plan</h2><ol></ol></div><p>Approve after review: <code>testsprite-rs prd approve 7f241280-3f43-4ccb-a6dd-c8e3b8fecdf3</code></p>

@@ -1,54 +1,56 @@
-# TestSprite Summary — xai-grok-brain (Onyx "Brain" port)
+# TestSprite Summary — xai-grok-brain + Grok Build request-path wiring
 
 - **Date:** 2026-07-21
-- **Current PRD:** `brain_standard_prd.json` (stored + approved, id `38a75df9-18f0-46bf-84f2-f04dc39aed44`; review page: `brain_prd_review.html`)
-- **Scope:** `crates/codegen/xai-grok-brain`, the Rust library port of Onyx's Brain/memory domain (`backend/onyx/db/brain.py` + `brain/tasks.py`) plus the portable parts of Onyx's memory testsprite suite.
-- **Modality:** deterministic TestSprite `command` tests driving the crate's real cargo suite. No live server, no UI, no network LLM.
+- **Current PRD:** `brain_standard_prd.json` (stored + approved, id `7f241280-3f43-4ccb-a6dd-c8e3b8fecdf3`; review page: `brain_prd_review.html`)
+- **Scope:** `crates/codegen/xai-grok-brain` plus the `xai-grok-shell` prompt-path integration seam that calls it from normal user-originated turns.
+- **Modality:** deterministic TestSprite `command` tests driving real cargo tests. No live server, no network LLM; the shell tests drive the same `process_brain_request_at_path` helper that `handle_prompt` calls before request construction, and verify ChatStateActor request injection.
 
-## Requirement Validation Summary — all 8 passed (8/8, 100%)
+## Requirement Validation Summary — Brain group all passed (10/10, 100%)
 
-| # | Requirement | TestSprite test | Cargo tests driven | Verdict |
+| # | Requirement | TestSprite test | Real path exercised | Verdict |
 |---|---|---|---|---|
-| F001 | Memory page store (CRUD, derived titles, reopen persistence) | Brain F001 | `page_crud_persists_across_reopen`, `title_derived_from_first_sentence_when_absent`, `update_missing_page_is_page_not_found` | ✅ Passed |
-| F002 | Relations + graph (dedup, self-edge/unknown rejection, removal, grouped related, degree-0 nodes) | Brain F002 | `relation_dedup_both_directions`, `self_edge_rejected`, `relation_to_unknown_page_rejected`, `relation_removal`, `related_pages_grouped_by_category`, `graph_includes_degree_zero_nodes` | ✅ Passed |
-| F003 | Typed citations + drift-tolerant ref normalization (`[s1]`/`S1`/`[D3]`/`d4`) | Brain F003 | `source_attach_and_list`, `source_ref_normalization_tolerates_drift` | ✅ Passed |
-| F004 | Settings round-trip, focus-clear semantics, run-complete stamp | Brain F004 | `settings_defaults_and_roundtrip`, `mark_run_complete_updates_timestamp` | ✅ Passed |
-| F005 | Self-improvement run engine (gating, categorization, sources, links, stamp) | Brain F005 | `run_skipped_when_disabled`, `run_applies_categorized_linked_cited_pages`, `run_updates_existing_page_instead_of_duplicating`, `run_without_connectors_excludes_documents`, `empty_context_stamps_run_without_calling_provider` | ✅ Passed |
-| F006 | Onyx DB-layer behavioral parity + fresh-consumer public API | Brain F006 | `tests/onyx_parity.rs` (direct port of Onyx `test_memory_recall_and_graph.py`) + `tests/consumer.rs` | ✅ Passed |
-| F007 | Portable live-demo lifecycle parity (populate all categories, counts, graph, engine refresh/recall analog, cleanup) | Brain F007 | `list_category_counts_and_category_filter_match_onyx_memory_list_shape` + `tests/live_demo_parity.rs` | ✅ Passed |
-| Gate | Build compiles, clippy clean (`-D warnings`) | Brain gate | `cargo build` + `cargo clippy -- -D warnings` | ✅ Passed |
+| F001 | Memory page store (CRUD, derived titles, reopen persistence) | Brain F001 | `xai-grok-brain` store tests | ✅ Passed |
+| F002 | Relations + graph (dedup, self-edge/unknown rejection, removal, grouped related, degree-0 nodes) | Brain F002 | `xai-grok-brain` graph tests | ✅ Passed |
+| F003 | Typed citations + drift-tolerant ref normalization (`[s1]`/`S1`/`[D3]`/`d4`) | Brain F003 | `xai-grok-brain` source/ref tests | ✅ Passed |
+| F004 | Settings round-trip, focus-clear semantics, run-complete stamp | Brain F004 | `xai-grok-brain` settings tests | ✅ Passed |
+| F005 | Self-improvement run engine (gating, categorization, sources, links, stamp) | Brain F005 | `run_self_improvement` pipeline tests | ✅ Passed |
+| F006 | Onyx DB-layer behavioral parity + fresh-consumer public API | Brain F006 | `tests/onyx_parity.rs` + `tests/consumer.rs` | ✅ Passed |
+| F007 | Portable live-demo lifecycle parity (populate all categories, counts, graph, engine refresh/recall analog, cleanup) | Brain F007 | `tests/live_demo_parity.rs` + category-count tests | ✅ Passed |
+| F008 | Grok Build request-path Brain wiring | Brain F008 | `xai-grok-shell` helper used by `handle_prompt`: remember request → durable page/source; reopen → fresh request recall; ChatStateActor `build_request` injection | ✅ Passed |
+| F009 | Integration settings gate + deterministic self-improvement | Brain F009 | shell disabled-setting integration + `BrainService` deterministic-provider run | ✅ Passed |
+| Gate | Build/clippy gate | Brain gate | `cargo build`/`cargo clippy` for Brain crate command test | ✅ Passed |
 
-## What was missing from the first pass and is now covered
+## Wired behavior now proven
 
-Onyx had four memory/brain TestSprite tests:
+- **Create-on-request:** a normal user-originated prompt like “Please remember that my project codename is Zephyr-Shell” is processed by the shell Brain seam before model sampling. It creates a durable Brain page (`Project Codename`, `entities`) and a `chat_session` source pointing to the Grok session/prompt.
+- **Recall-on-later-request:** a later fresh request against a reopened store gets a `<brain_context>` block containing the stored fact. The shell test verifies this block enters the shipped `ChatStateActor::build_request` memory-reminder injection path.
+- **Settings gate:** an explicit disabled setting blocks both create and recall, even when the shell helper is called with normal initialization.
+- **Self-improvement:** `BrainService::run_self_improvement` accepts a deterministic provider in tests, creates/updates categorized pages, attaches normalized session/document sources, links related pages, and stamps `last_run_at`.
 
-| Onyx TestSprite test | Onyx behavior | Port status |
-|---|---|---|
-| `047535cd...Memory_recall_context___brain_graph__DB_layer.sh` | DB-layer brain graph, sources, recall context ordering | ✅ `tests/onyx_parity.rs` |
-| `6ef8253f...Memory_live_demo__populate___recall_on_running_stack.sh` | Populate all categories, list totals/counts, graph, chat recall, cleanup | ✅ portable parts in `tests/live_demo_parity.rs` (chat recall replaced by deterministic engine refresh/recall analog because this crate has no chat server) |
-| `944ae2c2...Memory_populate___recall__integration__real_stack.sh` | Manual populate + category counts + category filter; real LLM chat recall; memory tool persistence | ✅ portable list/count/filter part added to `BrainStore`; ✅ engine provider covers memory-tool persistence analog; ⛔ real LLM chat recall is out-of-scope for a local library crate |
-| `a4235a99...Memory_UI_lifecycle__Playwright.sh` | Add/reload/edit/delete through Onyx web UI | ⛔ out-of-scope (the crate has no UI; original plan explicitly excluded frontend) |
+## Parity with Onyx TestSprite artifacts
 
-## Parity evidence
+Onyx’s portable Brain/memory tests are represented as follows:
 
-- The original Onyx DB-layer suite behind `047535cd...` was run against Onyx's real Postgres in this session: **4 passed**.
-- The crate now has three parity integration files:
-  - `tests/onyx_parity.rs` — direct port of Onyx graph/source/recency assertions.
-  - `tests/consumer.rs` — fresh public API consumer: two pages, one relation, one source, graph return value asserted.
-  - `tests/live_demo_parity.rs` — portable version of Onyx `memory_demo_populate.py`: all categories seeded, category counts checked, graph checked before/after engine linking, provider input/focus checked, session citation attached, cleanup verified empty.
+| Onyx artifact | Port status |
+|---|---|
+| `047535cd...Memory_recall_context___brain_graph__DB_layer.sh` | ✅ `tests/onyx_parity.rs` |
+| `6ef8253f...Memory_live_demo__populate___recall_on_running_stack.sh` | ✅ portable parts in `tests/live_demo_parity.rs` |
+| `944ae2c2...Memory_populate___recall__integration__real_stack.sh` | ✅ list/count/filter and deterministic engine analog covered; ⛔ live LLM chat recall remains out-of-scope for tests |
+| `a4235a99...Memory_UI_lifecycle__Playwright.sh` | ⛔ out-of-scope (no Brain UI in this crate/goal) |
 
-## Remaining non-gaps / explicit non-goals
+## Verification evidence
 
-- No HTTP endpoints, FastAPI routes, or frontend Playwright flow in this crate.
-- No scheduled daemon/celery parity; callers invoke `run_self_improvement` directly.
-- No live LLM provider; `ExtractionProvider` is intentionally pluggable and deterministic tests prove the real pipeline around it.
-- No multi-user ownership model; invalid endpoint/self-edge guards cover the local single-user store's equivalent invariant.
+Scratch logs for the goal are under `/tmp/grok-goal-9d924f6d31fa/implementer/`:
 
-## Artifacts
+- `test.log` — `cargo test -p xai-grok-brain` + `cargo test -p xai-grok-shell brain::tests`
+- `launch.log` — shell launch/request-path check (create/reopen/recall + ChatState injection)
+- `settings_engine.log` — disabled setting + deterministic-provider self-improvement checks
+- `testsprite.log` — official JSON report plus appended Brain-only 10/10 MCP run summary
+- `build_clippy.log` — `cargo build -p xai-grok-brain -p xai-grok-shell` succeeded; `cargo clippy` completed with pre-existing shell warnings unrelated to Brain wiring (documented in the log)
 
-- `brain_standard_prd.json` — PRD (ingested + approved)
-- `brain_prd_review.html` — PRD/plan review
-- `brain_testsprite_report.md` — official TestSprite report (whole project DB; includes older unrelated anthropic-auth tests)
-- `brain_dashboard.html` — dashboard
-- `brain_testsprite_summary.md` — this scoped summary
-- `0c04e6c1...Brain_F007...sh` plus F001–F006/gate `.sh` files — materialized runnable TestSprite command tests
+## Remaining explicit non-goals
+
+- No web UI or force-directed graph visualization.
+- No real network LLM extraction in tests; the provider boundary is production-ready and deterministic in tests.
+- No scheduler daemon; callers invoke the self-improvement service entry point.
+- No multi-user authorization layer beyond the local/session model.

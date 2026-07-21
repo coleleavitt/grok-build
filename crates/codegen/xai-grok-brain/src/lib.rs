@@ -12,11 +12,13 @@
 //! invoke [`engine::run_self_improvement`] themselves.
 
 mod engine_impl;
+mod service;
 mod store;
 #[cfg(test)]
 mod tests;
 mod types;
 
+pub use service::{BrainRequest, BrainRequestOutcome, BrainService, default_store_path};
 pub use store::BrainStore;
 pub use types::{
     BrainSettings, BrainSettingsUpdate, MemoryCategory, MemoryGraph, MemoryGraphEdge,

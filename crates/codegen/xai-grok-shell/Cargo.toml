@@ -142,6 +142,7 @@ xai-chat-state = { path = "../xai-chat-state" }
 xai-grok-compaction = { path = "../../common/xai-grok-compaction" }
 xai-grok-extra-ca = { workspace = true }
 xai-grok-sampler = { path = "../xai-grok-sampler" }
+linkscope = { workspace = true }
 xai-sqlite-journal = { workspace = true }
 xai-token-estimation = { workspace = true }
 xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
@@ -152,6 +153,7 @@ xai-system-power = { workspace = true }
 xai-grok-workspace = { workspace = true }
 xai-grok-subagent-resolution = { path = "../xai-grok-subagent-resolution" }
 xai-grok-agent = { path = "../xai-grok-agent" }
+xai-grok-brain = { workspace = true }
 xai-grok-config = { workspace = true }
 xai-grok-config-types = { workspace = true }
 xai-grok-memory = { workspace = true }

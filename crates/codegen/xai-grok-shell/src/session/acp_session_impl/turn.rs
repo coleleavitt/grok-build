@@ -595,6 +595,7 @@ impl SessionActor {
             );
         }
         let query = crate::session::placeholder_images::strip_paths_from_image_placeholders(query);
+        let brain_query = query.clone();
         let user_images = self
             .normalize_images_with_notices(&mut context, raw_images, is_cursor)
             .await;
@@ -732,6 +733,15 @@ impl SessionActor {
                 attached_image_refs,
             ))
             .await;
+        let brain_memory_reminder = if matches!(
+            super::super::PromptOrigin::from_prompt_id(prompt_id),
+            super::super::PromptOrigin::User
+        ) {
+            self.process_brain_request_for_prompt(prompt_id, &brain_query)
+                .await
+        } else {
+            None
+        };
         let prompt_text_for_hook = user_message.clone();
         {
             if trace_gcs_config.is_some() {
@@ -852,6 +862,7 @@ impl SessionActor {
                         round_trace.take(),
                         round_artifact.take(),
                         json_schema.clone(),
+                        brain_memory_reminder.clone(),
                     )
                     .await;
                 if !matches!(round, Ok(TurnOutcome::Completed { .. })) {
@@ -1513,6 +1524,7 @@ impl SessionActor {
         trace_gcs_config: Option<crate::session::repo_changes::TraceExportConfig>,
         artifact_tracker: Option<crate::upload::manifest::ArtifactTracker>,
         json_schema: Option<serde_json::Value>,
+        brain_memory_reminder: Option<String>,
     ) -> Result<TurnOutcome, acp::Error> {
         let _ = self.compaction.auto_compact_suppressed.compare_exchange(
             crate::session::compaction_config::SUPPRESS_TURN,
@@ -1530,6 +1542,7 @@ impl SessionActor {
                         trace_gcs_config,
                         artifact_tracker.as_ref(),
                         json_schema,
+                        brain_memory_reminder.clone(),
                     )
                     .await;
             }
@@ -1543,6 +1556,7 @@ impl SessionActor {
                         trace_gcs_config,
                         artifact_tracker.as_ref(),
                         json_schema,
+                        brain_memory_reminder.clone(),
                     )
                     .await;
             }
@@ -1555,6 +1569,7 @@ impl SessionActor {
                 trace_gcs_config.clone(),
                 artifact_tracker.as_ref(),
                 json_schema.clone(),
+                brain_memory_reminder.clone(),
             )
             .await;
         if matches!(
@@ -1622,6 +1637,7 @@ impl SessionActor {
                     trace_gcs_config.clone(),
                     artifact_tracker.as_ref(),
                     None,
+                    brain_memory_reminder.clone(),
                 )
                 .await;
             if matches!(
@@ -1886,6 +1902,7 @@ impl SessionActor {
         trace_gcs_config: Option<crate::session::repo_changes::TraceExportConfig>,
         artifact_tracker: Option<&crate::upload::manifest::ArtifactTracker>,
         json_schema: Option<serde_json::Value>,
+        brain_memory_reminder: Option<String>,
     ) -> Result<TurnOutcome, acp::Error> {
         let conv_turn_start = std::time::Instant::now();
         let conv_turn_clock = DualClock::now();
@@ -2066,7 +2083,10 @@ impl SessionActor {
             self.drain_pending_interjections().await;
             self.flush_pending_skill_reminders().await;
             self.inject_pending_monitor_events().await;
-            let memory_reminder = self.first_turn_memory_reminder().await;
+            let memory_reminder = combine_memory_reminders(
+                self.first_turn_memory_reminder().await,
+                brain_memory_reminder.clone(),
+            );
             if memory_reminder.is_some() {
                 self.memory
                     .injection_count

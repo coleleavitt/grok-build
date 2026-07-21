@@ -14076,6 +14076,7 @@ dependencies = [
  "xai-grok-announcements",
  "xai-grok-anthropic-auth",
  "xai-grok-auth",
+ "xai-grok-brain",
  "xai-grok-compaction",
  "xai-grok-config",
  "xai-grok-config-types",

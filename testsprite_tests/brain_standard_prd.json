@@ -12,7 +12,8 @@
     "Provenance parity: typed source citations (chat_session, document, connector, file, manual) with drift-tolerant source-ref normalization ([s1]/S1/[D3]/d4).",
     "Settings parity: enabled/use-connectors flags, clearable focus instructions, last-run timestamp with run-completion stamping.",
     "Engine parity: self-improvement run gated on the enabled flag, transcript built with [S#]/[D#] refs (documents only when use_connectors), focus instructions passed to the provider, pages auto-categorized with update-over-duplicate title matching, sources attached via normalized refs, related pages linked, last_run_at stamped.",
-    "Expose Onyx /memory list-shape parity helpers for category_counts and category-filtered listing so portable integration tests can assert the same list semantics as the Onyx stack."
+    "Expose Onyx /memory list-shape parity helpers for category_counts and category-filtered listing so portable integration tests can assert the same list semantics as the Onyx stack.",
+    "Wire Brain into Grok Build\u2019s real prompt/request path so normal user requests can create durable Brain records and later requests receive recalled context through the shipped request builder."
   ],
   "key_features": [
     {
@@ -49,6 +50,16 @@
       "id": "F007",
       "name": "Portable live-demo lifecycle parity",
       "description": "Library equivalent of Onyx's testsprite memory_demo_populate.py: populate memories across all four categories, report total and per-category counts, expose all nodes in the graph as degree-0 before linking, run the self-improvement pipeline to refresh/recall the codename page without duplicating it, attach a chat-session citation via normalized refs, link related pages, then clean up and verify the store is empty."
+    },
+    {
+      "id": "F008",
+      "name": "Grok Build request-path Brain wiring",
+      "description": "The xai-grok-shell prompt path opens the durable Grok Brain store, processes user-originated remember requests before model sampling, persists a Brain page with title/category/source citation, and injects recalled Brain context into the real ChatStateActor request-building memory reminder path for later fresh requests."
+    },
+    {
+      "id": "F009",
+      "name": "Brain integration settings and deterministic self-improvement",
+      "description": "The wired service respects disabled settings (no create/no recall), initializes a normal Grok store enabled only when unconfigured, and exposes deterministic-provider self-improvement through the Grok Build service boundary for tests without network LLM calls."
     }
   ],
   "validation_criteria": [
@@ -57,7 +68,9 @@
     "Graph invariants hold: duplicate edges collapse, self-edges error, degree-0 nodes appear in the graph query output.",
     "Drifted source refs [s1], S1, [D3], d4 all resolve to their canonical S#/D# keys.",
     "A disabled store never invokes the extraction provider and never stamps last_run_at; an enabled run stamps it even when no pages are produced.",
-    "The portable live-demo lifecycle test passes: category counts match the populated all-category seed set, graph nodes appear before linking, the self-improvement run updates rather than duplicates the codename page, sources and relations are attached, and cleanup leaves an empty store."
+    "The portable live-demo lifecycle test passes: category counts match the populated all-category seed set, graph nodes appear before linking, the self-improvement run updates rather than duplicates the codename page, sources and relations are attached, and cleanup leaves an empty store.",
+    "Shell integration tests pass: process_brain_request_at_path creates a page/source for a remember request, reopens the store, recalls the value for a later fresh request, and the recalled context is injected via ChatStateActor::build_request.",
+    "Integration settings tests pass: disabled Brain blocks create/recall, and deterministic-provider self-improvement through BrainService creates/updates categorized pages, sources, relations, and last-run timestamp."
   ],
   "test_environment": {
     "backend_api": "local://cargo",

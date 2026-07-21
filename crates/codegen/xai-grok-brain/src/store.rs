@@ -366,6 +366,16 @@ impl BrainStore {
     // Brain settings
     // -----------------------------------------------------------------------
 
+    /// Whether the settings singleton has been persisted.
+    pub fn settings_initialized(&self) -> Result<bool> {
+        let exists: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM brain_settings WHERE id = 1)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
     /// Current settings (defaults when never written: disabled, no connectors,
     /// no focus text, never run — the Onyx column defaults).
     pub fn settings(&self) -> Result<BrainSettings> {
