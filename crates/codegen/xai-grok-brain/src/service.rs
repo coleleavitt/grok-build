@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::backfill::{BackfillSelection, read_bounded_run_context};
 use crate::engine::{ExtractionProvider, RunContext, RunOutcome, run_self_improvement};
 use crate::{
     BrainSettings, BrainSettingsUpdate, BrainStore, MemoryCategory, MemoryGraph, MemoryPage,
@@ -33,6 +34,15 @@ pub struct BrainRequestOutcome {
     pub injected_context: Option<String>,
     /// Page created from a remember-style prompt, if one was detected.
     pub remembered_page: Option<MemoryPage>,
+}
+
+/// Result of a Grok session-history backfill/self-improvement run.
+#[derive(Debug)]
+pub struct BrainBackfillOutcome {
+    /// Onyx-equivalent selected session/context metadata.
+    pub selection: BackfillSelection,
+    /// Engine outcome after applying the selected context.
+    pub outcome: RunOutcome,
 }
 
 /// High-level service wrapping the durable Brain store and engine.
@@ -117,6 +127,36 @@ impl BrainService {
         run_self_improvement(&self.store, context, provider)
     }
 
+    /// Read persisted Grok session history from a `~/.grok` root and run the
+    /// Onyx-equivalent bounded self-improvement/backfill path.
+    pub fn run_backfill_from_grok_home(
+        &self,
+        grok_home: &Path,
+        provider: &dyn ExtractionProvider,
+    ) -> Result<BrainBackfillOutcome> {
+        self.run_backfill_from_grok_home_at(grok_home, provider, chrono::Utc::now())
+    }
+
+    /// Deterministic-time variant used by adversarial tests.
+    pub fn run_backfill_from_grok_home_at(
+        &self,
+        grok_home: &Path,
+        provider: &dyn ExtractionProvider,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<BrainBackfillOutcome> {
+        let settings = self.store.settings()?;
+        if !settings.enabled {
+            let selection = read_bounded_run_context(grok_home, &settings, now)?;
+            return Ok(BrainBackfillOutcome {
+                selection,
+                outcome: RunOutcome::Disabled,
+            });
+        }
+        let selection = read_bounded_run_context(grok_home, &settings, now)?;
+        let outcome = run_self_improvement(&self.store, &selection.context, provider)?;
+        Ok(BrainBackfillOutcome { selection, outcome })
+    }
+
     /// Convenience graph accessor used by integration tests and future UI/API
     /// surfaces.
     pub fn graph(&self) -> Result<MemoryGraph> {
@@ -142,13 +182,13 @@ impl BrainService {
         let Some(fact) = extract_remembered_fact(request.user_text) else {
             return Ok(None);
         };
-        let page = self.store.create_page(NewPage {
+        let page = self.store.create_or_update_page_by_title(NewPage {
             title: Some(fact.title),
             memory_text: fact.content,
             category: fact.category,
             source: Some("request".to_owned()),
         })?;
-        self.store.add_source(
+        self.store.add_source_if_missing(
             page.id,
             MemorySourceType::ChatSession,
             &format!("Grok Build request {}", request.prompt_id),
@@ -351,6 +391,39 @@ mod tests {
         assert!(context.contains("Zephyr-Nine"));
         assert!(context.contains("Project Codename"));
         assert!(later.remembered_page.is_none());
+    }
+
+    #[test]
+    fn repeated_remember_updates_existing_page_and_dedups_same_session_source() {
+        let service = BrainService::open_in_memory_for_tests();
+        service
+            .update_settings(BrainSettingsUpdate {
+                enabled: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        let first = service
+            .process_request(BrainRequest {
+                session_id: "session-1",
+                prompt_id: "prompt-1",
+                user_text: "Remember that my project codename is Zephyr-One.",
+            })
+            .unwrap()
+            .remembered_page
+            .unwrap();
+        let second = service
+            .process_request(BrainRequest {
+                session_id: "session-1",
+                prompt_id: "prompt-1",
+                user_text: "Remember that my project codename is Zephyr-Two.",
+            })
+            .unwrap()
+            .remembered_page
+            .unwrap();
+        assert_eq!(first.id, second.id, "same title updates existing page");
+        assert_eq!(service.store.list_pages().unwrap().len(), 1);
+        assert!(second.memory_text.contains("Zephyr-Two"));
+        assert_eq!(service.sources(second.id).unwrap().len(), 1);
     }
 
     #[test]

@@ -1,0 +1,1 @@
+cargo test -p xai-grok-brain --lib -- backfill service --nocapture && cargo test -p xai-grok-brain --test backfill_launch -- --nocapture

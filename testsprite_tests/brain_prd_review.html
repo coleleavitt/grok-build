@@ -1,4 +1,4 @@
-<!doctype html><meta charset=utf-8><title>TestSprite PRD Review</title><style>body{font-family:system-ui;margin:2rem;background:#101512;color:#edf7ef}.card{background:#17231b;border:1px solid #2e5c3a;border-radius:14px;padding:18px;margin:12px 0}pre{white-space:pre-wrap;background:#0b100d;padding:1rem;border-radius:10px}li{margin:.4rem 0}code{color:#9ee6ad}</style><h1>PRD Review</h1><p><code>7f241280-3f43-4ccb-a6dd-c8e3b8fecdf3</code></p><p>source: ingest-prd:testsprite_tests/brain_standard_prd.json · approval: not approved</p><div class=card><h2>Requirements</h2><pre>{
+<!doctype html><meta charset=utf-8><title>TestSprite PRD Review</title><style>body{font-family:system-ui;margin:2rem;background:#101512;color:#edf7ef}.card{background:#17231b;border:1px solid #2e5c3a;border-radius:14px;padding:18px;margin:12px 0}pre{white-space:pre-wrap;background:#0b100d;padding:1rem;border-radius:10px}li{margin:.4rem 0}code{color:#9ee6ad}</style><h1>PRD Review</h1><p><code>757028a7-b5be-4e09-84ab-f253175df1ba</code></p><p>source: ingest-prd:testsprite_tests/brain_standard_prd.json · approval: not approved</p><div class=card><h2>Requirements</h2><pre>{
   &quot;core_goals&quot;: [
     &quot;Durable page store: CRUD with derived titles, persistence across store close/reopen.&quot;,
     &quot;Graph parity: undirected relations deduped via ordered pairs, self-edges rejected, related pages grouped by category, graph query with per-node degree including degree-0 nodes.&quot;,
@@ -6,7 +6,8 @@
     &quot;Settings parity: enabled/use-connectors flags, clearable focus instructions, last-run timestamp with run-completion stamping.&quot;,
     &quot;Engine parity: self-improvement run gated on the enabled flag, transcript built with [S#]/[D#] refs (documents only when use_connectors), focus instructions passed to the provider, pages auto-categorized with update-over-duplicate title matching, sources attached via normalized refs, related pages linked, last_run_at stamped.&quot;,
     &quot;Expose Onyx /memory list-shape parity helpers for category_counts and category-filtered listing so portable integration tests can assert the same list semantics as the Onyx stack.&quot;,
-    &quot;Wire Brain into Grok Build’s real prompt/request path so normal user requests can create durable Brain records and later requests receive recalled context through the shipped request builder.&quot;
+    &quot;Wire Brain into Grok Build’s real prompt/request path so normal user requests can create durable Brain records and later requests receive recalled context through the shipped request builder.&quot;,
+    &quot;Fully port the portable Onyx Python Brain data/run logic, not just direct remember prompts, including bounded session-history backfill from Grok JSONL sessions.&quot;
   ],
   &quot;features&quot;: [
     {
@@ -53,6 +54,11 @@
       &quot;description&quot;: &quot;The wired service respects disabled settings (no create/no recall), initializes a normal Grok store enabled only when unconfigured, and exposes deterministic-provider self-improvement through the Grok Build service boundary for tests without network LLM calls.&quot;,
       &quot;name&quot;: &quot;Brain integration settings and deterministic self-improvement&quot;,
       &quot;user_flows&quot;: []
+    },
+    {
+      &quot;description&quot;: &quot;Port the portable behavior of Onyx brain.py and brain/tasks.py into Grok Build: bounded recent-session selection with last-run cutoff, max session/message/transcript/document/page/source caps, persisted Grok session JSONL parsing, connector/document toggle, focus instructions, source-ref normalization, update-not-duplicate by title, source dedup, relation linking, and last-run stamping.&quot;,
+      &quot;name&quot;: &quot;Full Onyx Brain Python run/backfill parity&quot;,
+      &quot;user_flows&quot;: []
     }
   ],
   &quot;meta&quot;: {
@@ -68,6 +74,8 @@
     &quot;A disabled store never invokes the extraction provider and never stamps last_run_at; an enabled run stamps it even when no pages are produced.&quot;,
     &quot;The portable live-demo lifecycle test passes: category counts match the populated all-category seed set, graph nodes appear before linking, the self-improvement run updates rather than duplicates the codename page, sources and relations are attached, and cleanup leaves an empty store.&quot;,
     &quot;Shell integration tests pass: process_brain_request_at_path creates a page/source for a remember request, reopens the store, recalls the value for a later fresh request, and the recalled context is injected via ChatStateActor::build_request.&quot;,
-    &quot;Integration settings tests pass: disabled Brain blocks create/recall, and deterministic-provider self-improvement through BrainService creates/updates categorized pages, sources, relations, and last-run timestamp.&quot;
+    &quot;Integration settings tests pass: disabled Brain blocks create/recall, and deterministic-provider self-improvement through BrainService creates/updates categorized pages, sources, relations, and last-run timestamp.&quot;,
+    &quot;Backfill launch test passes: fake persisted Grok sessions are parsed, bounded, converted to [S#]/[D#] context, passed to a deterministic provider, applied to the durable store, and later recalled through the public request service.&quot;,
+    &quot;Adversarial backfill tests pass for recent-window/last-run cutoff, max sessions/messages/docs, connector toggling, source-ref drift, unknown refs, repeated run update-not-duplicate, relation/source dedup, and empty/no-session stamping.&quot;
   ]
-}</pre></div><div class=card><h2>Generated test plan</h2><ol></ol></div><p>Approve after review: <code>testsprite-rs prd approve 7f241280-3f43-4ccb-a6dd-c8e3b8fecdf3</code></p>
+}</pre></div><div class=card><h2>Generated test plan</h2><ol></ol></div><p>Approve after review: <code>testsprite-rs prd approve 757028a7-b5be-4e09-84ab-f253175df1ba</code></p>

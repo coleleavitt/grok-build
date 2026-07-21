@@ -13,7 +13,8 @@
     "Settings parity: enabled/use-connectors flags, clearable focus instructions, last-run timestamp with run-completion stamping.",
     "Engine parity: self-improvement run gated on the enabled flag, transcript built with [S#]/[D#] refs (documents only when use_connectors), focus instructions passed to the provider, pages auto-categorized with update-over-duplicate title matching, sources attached via normalized refs, related pages linked, last_run_at stamped.",
     "Expose Onyx /memory list-shape parity helpers for category_counts and category-filtered listing so portable integration tests can assert the same list semantics as the Onyx stack.",
-    "Wire Brain into Grok Build\u2019s real prompt/request path so normal user requests can create durable Brain records and later requests receive recalled context through the shipped request builder."
+    "Wire Brain into Grok Build\u2019s real prompt/request path so normal user requests can create durable Brain records and later requests receive recalled context through the shipped request builder.",
+    "Fully port the portable Onyx Python Brain data/run logic, not just direct remember prompts, including bounded session-history backfill from Grok JSONL sessions."
   ],
   "key_features": [
     {
@@ -60,6 +61,11 @@
       "id": "F009",
       "name": "Brain integration settings and deterministic self-improvement",
       "description": "The wired service respects disabled settings (no create/no recall), initializes a normal Grok store enabled only when unconfigured, and exposes deterministic-provider self-improvement through the Grok Build service boundary for tests without network LLM calls."
+    },
+    {
+      "id": "F010",
+      "name": "Full Onyx Brain Python run/backfill parity",
+      "description": "Port the portable behavior of Onyx brain.py and brain/tasks.py into Grok Build: bounded recent-session selection with last-run cutoff, max session/message/transcript/document/page/source caps, persisted Grok session JSONL parsing, connector/document toggle, focus instructions, source-ref normalization, update-not-duplicate by title, source dedup, relation linking, and last-run stamping."
     }
   ],
   "validation_criteria": [
@@ -70,7 +76,9 @@
     "A disabled store never invokes the extraction provider and never stamps last_run_at; an enabled run stamps it even when no pages are produced.",
     "The portable live-demo lifecycle test passes: category counts match the populated all-category seed set, graph nodes appear before linking, the self-improvement run updates rather than duplicates the codename page, sources and relations are attached, and cleanup leaves an empty store.",
     "Shell integration tests pass: process_brain_request_at_path creates a page/source for a remember request, reopens the store, recalls the value for a later fresh request, and the recalled context is injected via ChatStateActor::build_request.",
-    "Integration settings tests pass: disabled Brain blocks create/recall, and deterministic-provider self-improvement through BrainService creates/updates categorized pages, sources, relations, and last-run timestamp."
+    "Integration settings tests pass: disabled Brain blocks create/recall, and deterministic-provider self-improvement through BrainService creates/updates categorized pages, sources, relations, and last-run timestamp.",
+    "Backfill launch test passes: fake persisted Grok sessions are parsed, bounded, converted to [S#]/[D#] context, passed to a deterministic provider, applied to the durable store, and later recalled through the public request service.",
+    "Adversarial backfill tests pass for recent-window/last-run cutoff, max sessions/messages/docs, connector toggling, source-ref drift, unknown refs, repeated run update-not-duplicate, relation/source dedup, and empty/no-session stamping."
   ],
   "test_environment": {
     "backend_api": "local://cargo",

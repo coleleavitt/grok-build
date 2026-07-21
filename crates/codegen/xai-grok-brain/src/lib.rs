@@ -11,6 +11,7 @@
 //! HTTP endpoints, UI, and scheduling are intentionally out of scope; callers
 //! invoke [`engine::run_self_improvement`] themselves.
 
+mod backfill;
 mod engine_impl;
 mod service;
 mod store;
@@ -18,7 +19,13 @@ mod store;
 mod tests;
 mod types;
 
-pub use service::{BrainRequest, BrainRequestOutcome, BrainService, default_store_path};
+pub use backfill::{
+    BackfillSelection, PersistedBrainSession, BRAIN_LOOKBACK_DAYS, BRAIN_MAX_CHARS_PER_MESSAGE,
+    BRAIN_MAX_DOCS, BRAIN_MAX_MESSAGES_PER_SESSION, BRAIN_MAX_SESSIONS_PER_RUN,
+    BRAIN_MAX_TRANSCRIPT_CHARS, build_bounded_run_context, read_bounded_run_context,
+    read_persisted_sessions,
+};
+pub use service::{BrainBackfillOutcome, BrainRequest, BrainRequestOutcome, BrainService, default_store_path};
 pub use store::BrainStore;
 pub use types::{
     BrainSettings, BrainSettingsUpdate, MemoryCategory, MemoryGraph, MemoryGraphEdge,
@@ -46,6 +53,12 @@ pub enum BrainError {
     /// A relation endpoint is invalid (self-edge or unknown page).
     #[error("invalid relation between {0} and {1}: {2}")]
     InvalidRelation(i64, i64, &'static str),
+    /// File-system failure while reading persisted Grok sessions.
+    #[error("brain session I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// JSON parse failure while reading persisted Grok sessions.
+    #[error("brain session JSON error: {0}")]
+    Json(#[from] serde_json::Error),
     /// The extraction provider failed.
     #[error("extraction provider error: {0}")]
     Provider(#[source] anyhow::Error),

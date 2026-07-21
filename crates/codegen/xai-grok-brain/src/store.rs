@@ -83,6 +83,41 @@ impl BrainStore {
         self.get_page(id)?.ok_or(BrainError::PageNotFound(id))
     }
 
+    /// Fetch one page by exact normalized title (case-insensitive).
+    pub fn get_page_by_title(&self, title: &str) -> Result<Option<MemoryPage>> {
+        let key = title.trim().to_lowercase();
+        self.conn
+            .query_row(
+                "SELECT id, title, memory_text, category, source, created_at, updated_at
+                 FROM memory WHERE lower(trim(title)) = ?1 ORDER BY updated_at DESC, id DESC LIMIT 1",
+                params![key],
+                row_to_page,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Create a page or update the existing page with the same normalized title,
+    /// matching Onyx Brain's create-or-update-by-title run behavior.
+    pub fn create_or_update_page_by_title(&self, page: NewPage) -> Result<MemoryPage> {
+        let title = memory_title_for_content(&page.memory_text, page.title.as_deref());
+        if let Some(existing) = self.get_page_by_title(&title)? {
+            return self.update_page(
+                existing.id,
+                PageUpdate {
+                    title: Some(title),
+                    memory_text: Some(page.memory_text),
+                    category: Some(page.category),
+                    source: page.source,
+                },
+            );
+        }
+        self.create_page(NewPage {
+            title: Some(title),
+            ..page
+        })
+    }
+
     /// Fetch one page by id.
     pub fn get_page(&self, id: i64) -> Result<Option<MemoryPage>> {
         self.conn
@@ -260,6 +295,28 @@ impl BrainStore {
     // -----------------------------------------------------------------------
     // Sources (typed citations)
     // -----------------------------------------------------------------------
+
+    /// Attach a citation unless this page already has a source with the same
+    /// source_id. If `source_id` is `None`, a new row is always added.
+    pub fn add_source_if_missing(
+        &self,
+        memory_id: i64,
+        source_type: MemorySourceType,
+        label: &str,
+        source_id: Option<&str>,
+        url: Option<&str>,
+    ) -> Result<Option<MemorySource>> {
+        if let Some(source_id) = source_id
+            && self
+                .sources(memory_id)?
+                .iter()
+                .any(|source| source.source_id.as_deref() == Some(source_id))
+        {
+            return Ok(None);
+        }
+        self.add_source(memory_id, source_type, label, source_id, url)
+            .map(Some)
+    }
 
     /// Attach a citation to a page. The label is capped at 512 chars.
     pub fn add_source(

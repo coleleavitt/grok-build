@@ -1,1 +1,1 @@
-cargo test -p xai-grok-shell brain::tests -- --nocapture
+cargo test -p xai-grok-brain --lib -- service::tests --nocapture
