@@ -1,0 +1,21 @@
+[package]
+license = "Apache-2.0"
+name = "xai-grok-brain"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+# rusqlite bundled = self-contained SQLite, matching xai-grok-memory.
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
