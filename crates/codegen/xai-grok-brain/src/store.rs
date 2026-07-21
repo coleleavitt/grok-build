@@ -6,7 +6,7 @@
 //! `low < high`, sources are typed citations, and settings are a single row
 //! (the local store is single-user, standing in for Onyx's per-user columns).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -98,14 +98,52 @@ impl BrainStore {
 
     /// List every page, newest-updated first (Onyx list ordering).
     pub fn list_pages(&self) -> Result<Vec<MemoryPage>> {
-        let mut stmt = self.conn.prepare(
+        self.list_pages_inner(None)
+    }
+
+    /// List pages in one category, newest-updated first. This is the library
+    /// equivalent of Onyx `/memory?category=...`.
+    pub fn list_pages_by_category(&self, category: MemoryCategory) -> Result<Vec<MemoryPage>> {
+        self.list_pages_inner(Some(category))
+    }
+
+    fn list_pages_inner(&self, category: Option<MemoryCategory>) -> Result<Vec<MemoryPage>> {
+        let sql = if category.is_some() {
             "SELECT id, title, memory_text, category, source, created_at, updated_at
-             FROM memory ORDER BY updated_at DESC, id DESC",
-        )?;
-        let pages = stmt
-            .query_map([], row_to_page)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+             FROM memory WHERE category = ?1 ORDER BY updated_at DESC, id DESC"
+        } else {
+            "SELECT id, title, memory_text, category, source, created_at, updated_at
+             FROM memory ORDER BY updated_at DESC, id DESC"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let pages = if let Some(category) = category {
+            stmt.query_map(params![category.as_str()], row_to_page)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map([], row_to_page)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
         Ok(pages)
+    }
+
+    /// Per-category page counts (the Onyx `/memory` list `category_counts`
+    /// shape). Categories with no pages report 0.
+    pub fn category_counts(&self) -> Result<BTreeMap<MemoryCategory, usize>> {
+        let mut counts: BTreeMap<MemoryCategory, usize> =
+            MemoryCategory::all().into_iter().map(|c| (c, 0)).collect();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT category, COUNT(*) FROM memory GROUP BY category")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (raw, count) in rows {
+            let category = MemoryCategory::parse(&raw).unwrap_or(MemoryCategory::Notes);
+            *counts.entry(category).or_default() += count as usize;
+        }
+        Ok(counts)
     }
 
     /// Patch a page; `None` fields stay untouched. Bumps `updated_at`.

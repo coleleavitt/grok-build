@@ -1,11 +1,11 @@
 # TestSprite Summary — xai-grok-brain (Onyx "Brain" port)
 
 - **Date:** 2026-07-21
-- **PRD:** `brain_standard_prd.json` (stored + approved, id `9dc9982a-d063-43f5-9d0f-0119a955e5fe`; review page: `brain_prd_review.html`)
-- **Scope:** the `crates/codegen/xai-grok-brain` library crate — the Rust port of Onyx's Brain self-improving memory graph (`backend/onyx/db/brain.py` + `brain/tasks.py`).
-- **Modality:** `command` tests driving the crate's real in-repo cargo suite (22 cargo tests: 18 unit, 1 fresh-consumer integration, 3 Onyx-parity integration). Deterministic, no live server, no LLM.
+- **Current PRD:** `brain_standard_prd.json` (stored + approved, id `38a75df9-18f0-46bf-84f2-f04dc39aed44`; review page: `brain_prd_review.html`)
+- **Scope:** `crates/codegen/xai-grok-brain`, the Rust library port of Onyx's Brain/memory domain (`backend/onyx/db/brain.py` + `brain/tasks.py`) plus the portable parts of Onyx's memory testsprite suite.
+- **Modality:** deterministic TestSprite `command` tests driving the crate's real cargo suite. No live server, no UI, no network LLM.
 
-## Requirement Validation Summary — all 7 passed (7/7, 100%)
+## Requirement Validation Summary — all 8 passed (8/8, 100%)
 
 | # | Requirement | TestSprite test | Cargo tests driven | Verdict |
 |---|---|---|---|---|
@@ -14,34 +14,41 @@
 | F003 | Typed citations + drift-tolerant ref normalization (`[s1]`/`S1`/`[D3]`/`d4`) | Brain F003 | `source_attach_and_list`, `source_ref_normalization_tolerates_drift` | ✅ Passed |
 | F004 | Settings round-trip, focus-clear semantics, run-complete stamp | Brain F004 | `settings_defaults_and_roundtrip`, `mark_run_complete_updates_timestamp` | ✅ Passed |
 | F005 | Self-improvement run engine (gating, categorization, sources, links, stamp) | Brain F005 | `run_skipped_when_disabled`, `run_applies_categorized_linked_cited_pages`, `run_updates_existing_page_instead_of_duplicating`, `run_without_connectors_excludes_documents`, `empty_context_stamps_run_without_calling_provider` | ✅ Passed |
-| F006 | Onyx behavioral parity + fresh-consumer public API | Brain F006 | `tests/onyx_parity.rs` (3 tests, direct port of Onyx `test_memory_recall_and_graph.py`) + `tests/consumer.rs` | ✅ Passed |
+| F006 | Onyx DB-layer behavioral parity + fresh-consumer public API | Brain F006 | `tests/onyx_parity.rs` (direct port of Onyx `test_memory_recall_and_graph.py`) + `tests/consumer.rs` | ✅ Passed |
+| F007 | Portable live-demo lifecycle parity (populate all categories, counts, graph, engine refresh/recall analog, cleanup) | Brain F007 | `list_category_counts_and_category_filter_match_onyx_memory_list_shape` + `tests/live_demo_parity.rs` | ✅ Passed |
 | Gate | Build compiles, clippy clean (`-D warnings`) | Brain gate | `cargo build` + `cargo clippy -- -D warnings` | ✅ Passed |
+
+## What was missing from the first pass and is now covered
+
+Onyx had four memory/brain TestSprite tests:
+
+| Onyx TestSprite test | Onyx behavior | Port status |
+|---|---|---|
+| `047535cd...Memory_recall_context___brain_graph__DB_layer.sh` | DB-layer brain graph, sources, recall context ordering | ✅ `tests/onyx_parity.rs` |
+| `6ef8253f...Memory_live_demo__populate___recall_on_running_stack.sh` | Populate all categories, list totals/counts, graph, chat recall, cleanup | ✅ portable parts in `tests/live_demo_parity.rs` (chat recall replaced by deterministic engine refresh/recall analog because this crate has no chat server) |
+| `944ae2c2...Memory_populate___recall__integration__real_stack.sh` | Manual populate + category counts + category filter; real LLM chat recall; memory tool persistence | ✅ portable list/count/filter part added to `BrainStore`; ✅ engine provider covers memory-tool persistence analog; ⛔ real LLM chat recall is out-of-scope for a local library crate |
+| `a4235a99...Memory_UI_lifecycle__Playwright.sh` | Add/reload/edit/delete through Onyx web UI | ⛔ out-of-scope (the crate has no UI; original plan explicitly excluded frontend) |
 
 ## Parity evidence
 
-The reference Onyx suite behind the original testsprite brain script
-(`047535cd..._Memory_recall_context___brain_graph__DB_layer.sh` →
-`backend/tests/external_dependency_unit/tools/test_memory_recall_and_graph.py`)
-was run against Onyx's real Postgres in the same session: **4 passed**. Its
-scenarios are ported 1:1 (same seed data, topology, and assertions) in
-`crates/codegen/xai-grok-brain/tests/onyx_parity.rs`, which passes here — same
-graph (3 nodes / 2 edges / degrees 2-1-1), same citations, same guards, same
-ordering, from both implementations.
+- The original Onyx DB-layer suite behind `047535cd...` was run against Onyx's real Postgres in this session: **4 passed**.
+- The crate now has three parity integration files:
+  - `tests/onyx_parity.rs` — direct port of Onyx graph/source/recency assertions.
+  - `tests/consumer.rs` — fresh public API consumer: two pages, one relation, one source, graph return value asserted.
+  - `tests/live_demo_parity.rs` — portable version of Onyx `memory_demo_populate.py`: all categories seeded, category counts checked, graph checked before/after engine linking, provider input/focus checked, session citation attached, cleanup verified empty.
 
-## Key gaps / risks
+## Remaining non-gaps / explicit non-goals
 
-- None for the brain crate. (The combined `brain_testsprite_report.md` also
-  re-lists this repo's 30 pre-existing anthropic-auth tests, whose stale
-  `routing_404` failures come from an earlier session's suite that needs a
-  live server — unrelated to the brain feature.)
-- Out of scope by design (plan non-goals): HTTP endpoints, UI/graph view,
-  scheduling daemon, multi-user store, real LLM extraction provider.
+- No HTTP endpoints, FastAPI routes, or frontend Playwright flow in this crate.
+- No scheduled daemon/celery parity; callers invoke `run_self_improvement` directly.
+- No live LLM provider; `ExtractionProvider` is intentionally pluggable and deterministic tests prove the real pipeline around it.
+- No multi-user ownership model; invalid endpoint/self-edge guards cover the local single-user store's equivalent invariant.
 
 ## Artifacts
 
-- `brain_standard_prd.json` — the PRD (ingested + persisted + approved)
-- `brain_prd_review.html` — PRD/plan review page
-- `brain_testsprite_report.md` — official-format requirement validation report (whole project)
-- `brain_dashboard.html` — local dashboard
-- `TC/…_Brain_*.sh` code files — the materialized runnable test commands
-- Re-run anytime: the 7 brain tests via `testsprite_run`, or natively `cargo test -p xai-grok-brain`
+- `brain_standard_prd.json` — PRD (ingested + approved)
+- `brain_prd_review.html` — PRD/plan review
+- `brain_testsprite_report.md` — official TestSprite report (whole project DB; includes older unrelated anthropic-auth tests)
+- `brain_dashboard.html` — dashboard
+- `brain_testsprite_summary.md` — this scoped summary
+- `0c04e6c1...Brain_F007...sh` plus F001–F006/gate `.sh` files — materialized runnable TestSprite command tests

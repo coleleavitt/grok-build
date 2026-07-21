@@ -1,0 +1,1 @@
+cargo test -p xai-grok-brain --lib -- tests::list_category_counts_and_category_filter_match_onyx_memory_list_shape --exact && cargo test -p xai-grok-brain --test live_demo_parity

@@ -11,7 +11,8 @@
     "Graph parity: undirected relations deduped via ordered pairs, self-edges rejected, related pages grouped by category, graph query with per-node degree including degree-0 nodes.",
     "Provenance parity: typed source citations (chat_session, document, connector, file, manual) with drift-tolerant source-ref normalization ([s1]/S1/[D3]/d4).",
     "Settings parity: enabled/use-connectors flags, clearable focus instructions, last-run timestamp with run-completion stamping.",
-    "Engine parity: self-improvement run gated on the enabled flag, transcript built with [S#]/[D#] refs (documents only when use_connectors), focus instructions passed to the provider, pages auto-categorized with update-over-duplicate title matching, sources attached via normalized refs, related pages linked, last_run_at stamped."
+    "Engine parity: self-improvement run gated on the enabled flag, transcript built with [S#]/[D#] refs (documents only when use_connectors), focus instructions passed to the provider, pages auto-categorized with update-over-duplicate title matching, sources attached via normalized refs, related pages linked, last_run_at stamped.",
+    "Expose Onyx /memory list-shape parity helpers for category_counts and category-filtered listing so portable integration tests can assert the same list semantics as the Onyx stack."
   ],
   "key_features": [
     {
@@ -43,6 +44,11 @@
       "id": "F006",
       "name": "Onyx behavioral parity",
       "description": "The ported Onyx test suite (test_memory_recall_and_graph.py, the suite behind the Onyx testsprite brain-graph script) passes against the Rust crate with the same seed data, topology, and assertions."
+    },
+    {
+      "id": "F007",
+      "name": "Portable live-demo lifecycle parity",
+      "description": "Library equivalent of Onyx's testsprite memory_demo_populate.py: populate memories across all four categories, report total and per-category counts, expose all nodes in the graph as degree-0 before linking, run the self-improvement pipeline to refresh/recall the codename page without duplicating it, attach a chat-session citation via normalized refs, link related pages, then clean up and verify the store is empty."
     }
   ],
   "validation_criteria": [
@@ -50,7 +56,8 @@
     "The crate's full cargo test suite (unit + consumer + onyx_parity integration tests) passes deterministically on repeated runs.",
     "Graph invariants hold: duplicate edges collapse, self-edges error, degree-0 nodes appear in the graph query output.",
     "Drifted source refs [s1], S1, [D3], d4 all resolve to their canonical S#/D# keys.",
-    "A disabled store never invokes the extraction provider and never stamps last_run_at; an enabled run stamps it even when no pages are produced."
+    "A disabled store never invokes the extraction provider and never stamps last_run_at; an enabled run stamps it even when no pages are produced.",
+    "The portable live-demo lifecycle test passes: category counts match the populated all-category seed set, graph nodes appear before linking, the self-improvement run updates rather than duplicates the codename page, sources and relations are attached, and cleanup leaves an empty store."
   ],
   "test_environment": {
     "backend_api": "local://cargo",

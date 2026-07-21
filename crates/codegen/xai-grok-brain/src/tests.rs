@@ -100,6 +100,36 @@ fn update_missing_page_is_page_not_found() {
     assert!(matches!(err, BrainError::PageNotFound(999)));
 }
 
+#[test]
+fn list_category_counts_and_category_filter_match_onyx_memory_list_shape() {
+    let store = BrainStore::open_in_memory().unwrap();
+    let seeded = [
+        ("Favorite color", MemoryCategory::Notes),
+        ("Onyx", MemoryCategory::Entities),
+        ("Retrieval", MemoryCategory::Concepts),
+        ("Q3 launch", MemoryCategory::Workstreams),
+        ("Meeting notes", MemoryCategory::Notes),
+    ];
+    for (title, category) in seeded {
+        page(&store, title, category);
+    }
+
+    let counts = store.category_counts().unwrap();
+    assert_eq!(counts[&MemoryCategory::Notes], 2);
+    assert_eq!(counts[&MemoryCategory::Entities], 1);
+    assert_eq!(counts[&MemoryCategory::Concepts], 1);
+    assert_eq!(counts[&MemoryCategory::Workstreams], 1);
+
+    let notes_only = store.list_pages_by_category(MemoryCategory::Notes).unwrap();
+    assert_eq!(notes_only.len(), 2);
+    assert!(
+        notes_only
+            .iter()
+            .all(|page| page.category == MemoryCategory::Notes)
+    );
+    assert_eq!(store.list_pages().unwrap().len(), seeded.len());
+}
+
 // ---------------------------------------------------------------------------
 // Criterion 2: relations + graph
 // ---------------------------------------------------------------------------
