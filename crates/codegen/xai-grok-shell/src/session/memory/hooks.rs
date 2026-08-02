@@ -41,6 +41,42 @@ const MIN_USER_MESSAGES: usize = 3;
 /// mostly-ASCII inputs this gate targets, the distinction is immaterial.
 const MIN_TOTAL_QUERY_BYTES: usize = 50;
 
+fn persist_session_summary_to_brain(storage: &MemoryStorage, session_id: &str, summary: &str) {
+    let workspace = storage.workspace_path().to_string_lossy().into_owned();
+    match xai_grok_brain::BrainService::open_grok_default().and_then(|service| {
+        let page = service.store().create_or_update_page_by_title_scoped(
+            xai_grok_brain::NewPage {
+                title: Some("Session End Summary".to_owned()),
+                memory_text: summary.trim().to_owned(),
+                category: xai_grok_brain::MemoryCategory::Workstreams,
+                source: Some("session_end".to_owned()),
+            },
+            Some(&workspace),
+        )?;
+        service.store().add_source_if_missing(
+            page.id,
+            xai_grok_brain::MemorySourceType::ChatSession,
+            &format!(
+                "session-end summary for session {}",
+                &session_id[..session_id.len().min(8)]
+            ),
+            Some(session_id),
+            Some(&format!("grok://session/{session_id}")),
+        )?;
+        Ok(())
+    }) {
+        Ok(()) => tracing::info!(
+            target: xai_grok_telemetry::memory_log::TARGET,
+            "BRAIN_WRITER: persisted session-end summary to Brain"
+        ),
+        Err(error) => tracing::warn!(
+            target: xai_grok_telemetry::memory_log::TARGET,
+            error = %error,
+            "BRAIN_WRITER: failed to persist session-end summary to Brain"
+        ),
+    }
+}
+
 /// Result of the session end hook.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEndResult {
@@ -121,6 +157,7 @@ pub fn on_session_end(
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     match storage.write_daily_log(&date, slug, session_id, &summary, false) {
         Ok(path) => {
+            persist_session_summary_to_brain(storage, session_id, &summary);
             tracing::info!(
                 path = %path.display(),
                 real_user_messages = real_queries.len(),

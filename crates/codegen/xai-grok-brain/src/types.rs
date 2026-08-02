@@ -125,6 +125,34 @@ impl MemoryScopeKind {
     }
 }
 
+/// Freshness semantics for a Brain page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryFreshness {
+    /// Durable knowledge that should be treated as broadly reusable.
+    Durable,
+    /// Operational state that can become stale and should be verified before use.
+    TimeSensitive,
+}
+
+impl MemoryFreshness {
+    /// Stable lowercase DB/wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::TimeSensitive => "time_sensitive",
+        }
+    }
+
+    /// Parse a stored value. Unknown values fall back to durable for compatibility.
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "time_sensitive" | "time-sensitive" | "current_state" => Self::TimeSensitive,
+            _ => Self::Durable,
+        }
+    }
+}
+
 /// A stored Brain memory page (Onyx `Memory` row).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryPage {
@@ -142,6 +170,8 @@ pub struct MemoryPage {
     pub scope_id: Option<String>,
     /// Provenance tag (e.g. `"brain"` for engine-created pages).
     pub source: Option<String>,
+    /// Freshness semantics for recall and display.
+    pub freshness: MemoryFreshness,
     /// Creation timestamp.
     pub created_at: DateTime<Utc>,
     /// Last-update timestamp.
@@ -173,6 +203,8 @@ pub struct PageUpdate {
     pub category: Option<MemoryCategory>,
     /// New provenance tag.
     pub source: Option<String>,
+    /// New freshness semantics.
+    pub freshness: Option<MemoryFreshness>,
 }
 
 /// A typed citation attached to a page (Onyx `MemorySource` row).
@@ -296,6 +328,8 @@ pub struct MemoryRevision {
     pub scope_id: Option<String>,
     /// Snapshot provenance tag.
     pub source: Option<String>,
+    /// Snapshot freshness semantics.
+    pub freshness: MemoryFreshness,
     /// Why this revision was recorded (`create`, `update`, `restore`, etc.).
     pub revision_source: String,
     /// Revision timestamp.

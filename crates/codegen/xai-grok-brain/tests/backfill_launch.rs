@@ -125,10 +125,12 @@ fn backfill_then_request_recall_uses_public_service_path() {
     assert!(context.contains("Zephyr project codename"));
     assert!(recall.remembered_page.is_none());
 
-    // Repeat run after last_run_at should select no sessions and not duplicate.
+    // Repeat runs are no longer blocked by last_run_at; all persisted history remains
+    // eligible, but matching titles update existing pages rather than duplicating.
     let second = service
         .run_backfill_from_grok_home(&grok_home, &provider)
         .unwrap();
-    assert_eq!(second.outcome, RunOutcome::NoPages);
+    assert_eq!(second.outcome, RunOutcome::Applied { applied: 2 });
+    assert_eq!(second.selection.sessions.len(), 1);
     assert_eq!(service.store().list_pages().unwrap().len(), 2);
 }

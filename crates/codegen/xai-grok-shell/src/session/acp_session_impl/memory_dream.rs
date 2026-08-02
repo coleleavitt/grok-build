@@ -33,6 +33,53 @@ pub(super) fn build_initial_injection_backend_params(
     (injection_params, effective_min_score)
 }
 
+fn persist_brain_summary(
+    workspace: &str,
+    title: &str,
+    content: &str,
+    source: &str,
+    session_id: &str,
+) {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    match xai_grok_brain::BrainService::open_grok_default().and_then(|service| {
+        let page = service.store().create_or_update_page_by_title_scoped(
+            xai_grok_brain::NewPage {
+                title: Some(title.to_owned()),
+                memory_text: trimmed.to_owned(),
+                category: xai_grok_brain::MemoryCategory::Workstreams,
+                source: Some(source.to_owned()),
+            },
+            Some(workspace),
+        )?;
+        service.store().add_source_if_missing(
+            page.id,
+            xai_grok_brain::MemorySourceType::ChatSession,
+            &format!(
+                "{source} summary for session {}",
+                &session_id[..session_id.len().min(8)]
+            ),
+            Some(session_id),
+            Some(&format!("grok://session/{session_id}")),
+        )?;
+        Ok(())
+    }) {
+        Ok(()) => tracing::info!(
+            target: xai_grok_telemetry::memory_log::TARGET,
+            source,
+            "BRAIN_WRITER: persisted legacy memory writer output to Brain"
+        ),
+        Err(error) => tracing::warn!(
+            target: xai_grok_telemetry::memory_log::TARGET,
+            source,
+            error = %error,
+            "BRAIN_WRITER: failed to persist legacy memory writer output to Brain"
+        ),
+    }
+}
+
 impl SessionActor {
     /// Re-register `memory_search` and `memory_get` tools on the tool bridge.
     ///
@@ -279,6 +326,15 @@ impl SessionActor {
         let dream_path = if matches!(result.status, DreamStatus::Completed { .. }) {
             let path = storage.workspace_memory_file();
             self.memory.reindex_and_embed(&path, "dream").await;
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                persist_brain_summary(
+                    self.session_info.cwd.as_str(),
+                    "Brain Dream Consolidation",
+                    &content,
+                    "dream",
+                    &self.session_info.id.0,
+                );
+            }
 
             // Remove stale index chunks only for session files that
             // were actually deleted — stems skipped by the recency guard
@@ -540,6 +596,13 @@ impl SessionActor {
                                 Ok(path) => {
                                     tracing::info!("memory flush wrote session log");
                                     self.reindex_and_embed(&path, "session").await;
+                                    persist_brain_summary(
+                                        self.session_info.cwd.as_str(),
+                                        "Session Memory Flush",
+                                        &content,
+                                        "flush",
+                                        &self.session_info.id.0,
+                                    );
                                     *self.memory.last_flush_content.borrow_mut() = Some(content);
                                     (
                                         "written".to_string(),

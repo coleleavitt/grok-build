@@ -186,6 +186,8 @@ pub fn workspace_grok_build_toolset() -> ToolServerConfig {
     tools.push((&grok_build::WebFetchTool).into());
     tools.push((&memory::search_tool::MemorySearchImpl).into());
     tools.push((&memory::get_tool::MemoryGetImpl).into());
+    tools.push((&grok_build::BrainSearchTool).into());
+    tools.push((&grok_build::BrainGetTool).into());
     tools.push((&grok_build::LspTool).into());
     ToolServerConfig {
         tools,

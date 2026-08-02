@@ -729,6 +729,13 @@ impl AgentBuilder {
             )));
         }
         if definition.inject_default_tools {
+            {
+                use xai_grok_tools::implementations::grok_build;
+                tool_config
+                    .tools
+                    .push((&grok_build::BrainSearchTool).into());
+                tool_config.tools.push((&grok_build::BrainGetTool).into());
+            }
             if self.memory_backend.is_some() {
                 use xai_grok_tools::implementations::memory;
                 tool_config

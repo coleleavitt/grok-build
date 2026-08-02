@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::engine::{DocumentSource, RunContext, SessionSource};
@@ -45,6 +45,8 @@ pub struct PersistedBrainSession {
     pub lines: Vec<String>,
     /// File/document-like citations discovered in the session text.
     pub documents: Vec<DocumentSource>,
+    /// Workspace scope decoded from the persisted session directory.
+    pub workspace_scope: Option<String>,
 }
 
 /// What the bounded backfill reader selected.
@@ -63,20 +65,15 @@ pub struct BackfillSelection {
 pub fn build_bounded_run_context(
     mut sessions: Vec<PersistedBrainSession>,
     settings: &BrainSettings,
-    now: DateTime<Utc>,
+    _now: DateTime<Utc>,
 ) -> BackfillSelection {
-    let default_cutoff = now - Duration::days(BRAIN_LOOKBACK_DAYS);
-    let cutoff = settings
-        .last_run_at
-        .filter(|last_run| *last_run > default_cutoff)
-        .unwrap_or(default_cutoff);
+    // Do not time-window Brain backfill. The prompt budget still caps how much
+    // source text reaches the extractor, but selection may draw from any
+    // persisted session instead of silently ignoring older durable work.
+    let cutoff = DateTime::<Utc>::MIN_UTC;
 
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    let sessions: Vec<_> = sessions
-        .into_iter()
-        .take(BRAIN_MAX_SESSIONS_PER_RUN)
-        .filter(|session| session.updated_at >= cutoff)
-        .collect();
+    let sessions: Vec<_> = sessions.into_iter().collect();
 
     let mut total = 0usize;
     let mut docs = Vec::new();
@@ -94,12 +91,15 @@ pub fn build_bounded_run_context(
             total += clipped.len() + 1;
             lines.push(clipped);
         }
-        context_sessions.push(SessionSource {
-            id: session.id.clone(),
-            label: Some(session.label.clone()),
-            url: Some(format!("grok://session/{}", session.id)),
-            lines,
-        });
+        if !lines.is_empty() {
+            context_sessions.push(SessionSource {
+                id: session.id.clone(),
+                label: Some(session.label.clone()),
+                url: Some(format!("grok://session/{}", session.id)),
+                workspace_scope: session.workspace_scope.clone(),
+                lines,
+            });
+        }
         if settings.use_connectors {
             for doc in &session.documents {
                 if docs.len() >= BRAIN_MAX_DOCS {
@@ -149,12 +149,17 @@ pub fn read_persisted_sessions(grok_home: &Path) -> Result<Vec<PersistedBrainSes
         if !cwd_entry.file_type()?.is_dir() {
             continue;
         }
+        let workspace_scope = cwd_entry
+            .file_name()
+            .to_str()
+            .and_then(decode_workspace_scope);
         for session_entry in fs::read_dir(cwd_entry.path())? {
             let session_entry = session_entry?;
             if !session_entry.file_type()?.is_dir() {
                 continue;
             }
-            if let Some(session) = read_session_dir(&session_entry.path())? {
+            if let Some(mut session) = read_session_dir(&session_entry.path())? {
+                session.workspace_scope = workspace_scope.clone();
                 out.push(session);
             }
         }
@@ -183,8 +188,9 @@ fn read_session_dir(dir: &Path) -> Result<Option<PersistedBrainSession>> {
         .unwrap_or_else(Utc::now);
     let label = summary
         .session_summary
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| format!("Grok session {id}"));
+        .as_deref()
+        .and_then(clean_session_label)
+        .unwrap_or_else(|| format!("Grok session {}", short_session_id(&id)));
     let (mut lines, mut documents) = read_chat_history(&chat_path)?;
     let (artifact_lines, artifact_documents) = read_session_artifacts(dir)?;
     lines.extend(artifact_lines);
@@ -199,7 +205,65 @@ fn read_session_dir(dir: &Path) -> Result<Option<PersistedBrainSession>> {
         updated_at,
         lines,
         documents,
+        workspace_scope: None,
     }))
+}
+
+fn short_session_id(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
+fn clean_session_label(label: &str) -> Option<String> {
+    let collapsed = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let noisy = trimmed.starts_with('─')
+        || trimmed.starts_with('{')
+        || trimmed.starts_with('<')
+        || trimmed.starts_with("# jfc")
+        || trimmed.contains("Press Ctrl-C")
+        || trimmed.contains("[Tool Call]")
+        || trimmed.len() > 120;
+    if noisy {
+        None
+    } else {
+        Some(truncate_chars(trimmed, 96))
+    }
+}
+
+fn decode_workspace_scope(raw: &str) -> Option<String> {
+    let decoded = percent_decode(raw)?;
+    let trimmed = decoded.trim_end_matches('/');
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn percent_decode(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_value(bytes[i + 1])?;
+            let lo = hex_value(bytes[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn read_chat_history(path: &Path) -> Result<(Vec<String>, Vec<DocumentSource>)> {
@@ -675,7 +739,7 @@ struct ChatContentPart {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{Duration, TimeZone};
 
     fn session(id: &str, days_ago: i64, lines: usize) -> PersistedBrainSession {
         PersistedBrainSession {
@@ -692,11 +756,12 @@ mod tests {
                 url: Some(format!("file:///{id}.md")),
                 blurb: Some("doc".to_owned()),
             }],
+            workspace_scope: None,
         }
     }
 
     #[test]
-    fn bounded_context_applies_recent_window_last_run_and_caps() {
+    fn bounded_context_ignores_time_windows_but_keeps_prompt_caps() {
         let now = Utc.with_ymd_and_hms(2026, 7, 21, 12, 0, 0).unwrap();
         let sessions = (0..30)
             .map(|i| session(&format!("s{i}"), i as i64, 30))
@@ -708,8 +773,12 @@ mod tests {
             last_run_at: Some(now - Duration::days(5)),
         };
         let selection = build_bounded_run_context(sessions, &settings, now);
-        assert_eq!(selection.sessions.len(), 6, "days 0..5 survive cutoff");
-        assert_eq!(selection.context.sessions.len(), 6);
+        assert_eq!(
+            selection.sessions.len(),
+            30,
+            "all persisted sessions remain eligible; prompt caps bound extracted text"
+        );
+        assert_eq!(selection.context.sessions.len(), 30);
         assert!(
             selection
                 .context
@@ -717,7 +786,7 @@ mod tests {
                 .iter()
                 .all(|s| s.lines.len() == BRAIN_MAX_MESSAGES_PER_SESSION)
         );
-        assert_eq!(selection.context.documents.len(), 6);
+        assert_eq!(selection.context.documents.len(), BRAIN_MAX_DOCS);
     }
 
     #[test]

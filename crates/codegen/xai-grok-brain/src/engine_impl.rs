@@ -36,6 +36,8 @@ pub struct SessionSource {
     pub label: Option<String>,
     /// Optional deep link back to the session.
     pub url: Option<String>,
+    /// Workspace scope this session came from, when known.
+    pub workspace_scope: Option<String>,
     /// Transcript lines, oldest first (already role-labelled or raw text).
     pub lines: Vec<String>,
 }
@@ -79,6 +81,8 @@ pub struct SourceRef {
     pub source_id: String,
     /// Optional deep link.
     pub url: Option<String>,
+    /// Workspace scope for session-derived refs.
+    pub workspace_scope: Option<String>,
 }
 
 /// What the provider sees: the numbered source material plus steering
@@ -200,6 +204,7 @@ fn build_context(
                     .unwrap_or_else(|| "Chat session".to_owned()),
                 source_id: session.id.clone(),
                 url: session.url.clone(),
+                workspace_scope: session.workspace_scope.clone(),
             },
         );
         for line in &session.lines {
@@ -229,6 +234,7 @@ fn build_context(
                     label: doc.label.clone(),
                     source_id: doc.id.clone(),
                     url: doc.url.clone(),
+                    workspace_scope: None,
                 },
             );
             let blurb: String = doc
@@ -280,6 +286,21 @@ fn attach_sources(store: &BrainStore, memory_id: i64, refs: &[&SourceRef]) -> Re
     Ok(())
 }
 
+fn infer_workspace_scope<'a>(refs: &'a [&'a SourceRef]) -> Option<&'a str> {
+    let mut scope: Option<&str> = None;
+    for source_ref in refs {
+        let Some(candidate) = source_ref.workspace_scope.as_deref() else {
+            continue;
+        };
+        match scope {
+            None => scope = Some(candidate),
+            Some(existing) if existing == candidate => {}
+            Some(_) => return None,
+        }
+    }
+    scope
+}
+
 /// Apply extracted pages: create or (matching on the normalized stored title)
 /// update pages, attach per-page sources via the normalized refs, then link
 /// related pages once every page has an id (Onyx `_apply_pages`).
@@ -288,14 +309,20 @@ fn apply_pages(
     pages: &[ExtractedPage],
     source_map: &HashMap<String, SourceRef>,
 ) -> Result<usize> {
-    // title-key -> page id for the user's existing pages.
-    let mut by_title: HashMap<String, i64> = store
+    // (scope, title-key) -> page id for the user's existing pages.
+    let mut by_title: HashMap<(Option<String>, String), i64> = store
         .list_pages()?
         .into_iter()
-        .map(|page| (page.title.trim().to_lowercase(), page.id))
+        .map(|page| {
+            let scope = match page.scope_kind {
+                crate::types::MemoryScopeKind::Global => None,
+                crate::types::MemoryScopeKind::Workspace => page.scope_id,
+            };
+            ((scope, page.title.trim().to_lowercase()), page.id)
+        })
         .collect();
 
-    let mut applied: HashMap<String, i64> = HashMap::new();
+    let mut applied: HashMap<(Option<String>, String), i64> = HashMap::new();
     for page in pages.iter().take(BRAIN_MAX_PAGES_PER_RUN) {
         let title = page.title.trim();
         let content = page.content.trim();
@@ -308,12 +335,14 @@ fn apply_pages(
             .iter()
             .filter_map(|reference| source_map.get(&normalize_source_ref(reference)))
             .collect();
+        let page_scope = infer_workspace_scope(&page_refs).map(str::to_owned);
 
-        // Match the stored (normalized) title so re-runs update rather than
-        // duplicate a near-identical page.
-        let key = memory_title_for_content(content, Some(title))
+        // Match the stored (normalized) title in the inferred scope so re-runs
+        // update rather than duplicate a near-identical page.
+        let title_key = memory_title_for_content(content, Some(title))
             .trim()
             .to_lowercase();
+        let key = (page_scope.clone(), title_key);
         let memory_id = match by_title.get(&key) {
             Some(&existing_id) => {
                 store.update_page(
@@ -323,18 +352,22 @@ fn apply_pages(
                         memory_text: Some(content.to_owned()),
                         category: Some(category),
                         source: Some(BRAIN_SOURCE.to_owned()),
+                        ..PageUpdate::default()
                     },
                 )?;
                 existing_id
             }
             None => {
                 store
-                    .create_page(NewPage {
-                        title: Some(title.to_owned()),
-                        memory_text: content.to_owned(),
-                        category,
-                        source: Some(BRAIN_SOURCE.to_owned()),
-                    })?
+                    .create_or_update_page_by_title_scoped(
+                        NewPage {
+                            title: Some(title.to_owned()),
+                            memory_text: content.to_owned(),
+                            category,
+                            source: Some(BRAIN_SOURCE.to_owned()),
+                        },
+                        page_scope.as_deref(),
+                    )?
                     .id
             }
         };
@@ -345,15 +378,27 @@ fn apply_pages(
 
     // Link related pages once every page has an id.
     for page in pages.iter().take(BRAIN_MAX_PAGES_PER_RUN) {
-        let source_key = memory_title_for_content(page.content.trim(), Some(page.title.trim()))
-            .trim()
-            .to_lowercase();
+        let page_refs: Vec<&SourceRef> = page
+            .sources
+            .iter()
+            .filter_map(|reference| source_map.get(&normalize_source_ref(reference)))
+            .collect();
+        let page_scope = infer_workspace_scope(&page_refs).map(str::to_owned);
+        let source_title_key =
+            memory_title_for_content(page.content.trim(), Some(page.title.trim()))
+                .trim()
+                .to_lowercase();
+        let source_key = (page_scope.clone(), source_title_key);
         let Some(&source_id) = applied.get(&source_key) else {
             continue;
         };
         for related_title in &page.related {
-            let related_key = related_title.trim().to_lowercase();
-            if let Some(&target_id) = by_title.get(&related_key)
+            let related_title_key = related_title.trim().to_lowercase();
+            let scoped_key = (page_scope.clone(), related_title_key.clone());
+            let global_key = (None, related_title_key);
+            if let Some(&target_id) = by_title
+                .get(&scoped_key)
+                .or_else(|| by_title.get(&global_key))
                 && target_id != source_id
             {
                 store.add_relation(source_id, target_id)?;

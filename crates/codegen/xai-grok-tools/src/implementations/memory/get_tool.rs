@@ -91,9 +91,7 @@ impl xai_tool_runtime::Tool for MemoryGetImpl {
             .get::<Arc<dyn MemoryBackend>>()
             .cloned()
         else {
-            return Ok(ToolOutput::Text(
-                "Memory is not enabled. Use --experimental-memory to enable.".into(),
-            ));
+            return brain_get_fallback(&ctx, &input.path).await;
         };
         let memory = memory.clone();
         tracing::info!(target: crate::types::memory_backend::MEMORY_LOG_TARGET,"MEMORY_GET: invoked");
@@ -194,4 +192,61 @@ mod tests {
         let out = format_with_line_numbers("alpha", 1);
         assert_eq!(out, "1→alpha", "no trailing newline → no extra line");
     }
+}
+
+async fn brain_get_fallback(
+    ctx: &xai_tool_runtime::ToolCallContext,
+    path_or_title: &str,
+) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
+    let service = xai_grok_brain::BrainService::open_grok_default().map_err(|err| {
+        xai_tool_runtime::ToolError::execution(
+            xai_tool_protocol::ToolId::new("memory_get").expect("valid"),
+            format!("memory backend disabled and Brain unavailable: {err}"),
+        )
+    })?;
+    let workspace_scope = cwd_from_context(ctx).await;
+    let page = path_or_title
+        .strip_prefix("brain://")
+        .and_then(|id| id.parse::<i64>().ok())
+        .map(|id| service.store().get_page(id))
+        .unwrap_or_else(|| {
+            service.store().get_page_by_title_scoped(
+                path_or_title,
+                workspace_scope.as_deref(),
+                false,
+            )
+        })
+        .map_err(|err| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("memory_get").expect("valid"),
+                format!("Brain fallback read failed: {err}"),
+            )
+        })?;
+    let Some(page) = page else {
+        return Ok(ToolOutput::Text(
+            "Legacy memory backend is not enabled, and no Brain memory matched that path/title."
+                .into(),
+        ));
+    };
+    Ok(ToolOutput::Text(
+        format!(
+            "Legacy memory backend is not enabled; read durable Brain instead.\n\n#{} [{}] {}\n{}",
+            page.id,
+            page.category.as_str(),
+            page.title,
+            page.memory_text
+        )
+        .into(),
+    ))
+}
+
+async fn cwd_from_context(ctx: &xai_tool_runtime::ToolCallContext) -> Option<String> {
+    use crate::types::resources::Cwd;
+    use crate::types::tool_metadata::shared_resources;
+    let resources = shared_resources(ctx).ok()?;
+    resources
+        .lock()
+        .await
+        .get::<Cwd>()
+        .map(|cwd| cwd.0.to_string_lossy().into_owned())
 }

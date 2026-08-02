@@ -13,10 +13,10 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::types::{
-    BrainSettings, BrainSettingsUpdate, BrainStatus, MemoryCategory, MemoryGraph, MemoryGraphEdge,
-    MemoryGraphNode, MemoryPage, MemoryRevision, MemoryScopeKind, MemorySource, MemorySourceType,
-    NewPage, PageUpdate, RecallOptions, RecalledMemoryPage, RelatedPages, memory_title_for_content,
-    truncate_chars,
+    BrainSettings, BrainSettingsUpdate, BrainStatus, MemoryCategory, MemoryFreshness, MemoryGraph,
+    MemoryGraphEdge, MemoryGraphNode, MemoryPage, MemoryRevision, MemoryScopeKind, MemorySource,
+    MemorySourceType, NewPage, PageUpdate, RecallOptions, RecalledMemoryPage, RelatedPages,
+    memory_title_for_content, truncate_chars,
 };
 use crate::{BrainError, Result};
 
@@ -78,9 +78,10 @@ impl BrainStore {
             .filter(|scope| !scope.trim().is_empty())
             .map_or(MemoryScopeKind::Global, |_| MemoryScopeKind::Workspace);
         let scope_id = scope_id.and_then(normalize_scope_id);
+        let freshness = freshness_for_source(page.source.as_deref());
         self.conn.execute(
-            "INSERT INTO memory (title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO memory (title, memory_text, category, scope_kind, scope_id, source, freshness, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 title,
                 page.memory_text,
@@ -88,6 +89,7 @@ impl BrainStore {
                 scope_kind.as_str(),
                 scope_id,
                 page.source,
+                freshness.as_str(),
                 now.to_rfc3339(),
                 now.to_rfc3339(),
             ],
@@ -115,13 +117,13 @@ impl BrainStore {
         let scope_id = scope_id.and_then(normalize_scope_id);
         let (sql, params): (&str, Vec<Box<dyn rusqlite::ToSql>>) = match (scope_id.as_deref(), strict_scope) {
             (Some(scope), true) => (
-                "SELECT id, title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at
+                "SELECT id, title, memory_text, category, scope_kind, scope_id, source, freshness, created_at, updated_at
                  FROM memory WHERE lower(trim(title)) = ?1 AND scope_kind = 'workspace' AND scope_id = ?2
                  ORDER BY updated_at DESC, id DESC LIMIT 1",
                 vec![Box::new(key), Box::new(scope.to_owned())],
             ),
             (Some(scope), false) => (
-                "SELECT id, title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at
+                "SELECT id, title, memory_text, category, scope_kind, scope_id, source, freshness, created_at, updated_at
                  FROM memory WHERE lower(trim(title)) = ?1
                    AND ((scope_kind = 'workspace' AND scope_id = ?2) OR scope_kind = 'global')
                  ORDER BY CASE WHEN scope_kind = 'workspace' AND scope_id = ?2 THEN 0 ELSE 1 END,
@@ -129,7 +131,7 @@ impl BrainStore {
                 vec![Box::new(key), Box::new(scope.to_owned())],
             ),
             (None, _) => (
-                "SELECT id, title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at
+                "SELECT id, title, memory_text, category, scope_kind, scope_id, source, freshness, created_at, updated_at
                  FROM memory WHERE lower(trim(title)) = ?1 AND scope_kind = 'global'
                  ORDER BY updated_at DESC, id DESC LIMIT 1",
                 vec![Box::new(key)],
@@ -163,6 +165,7 @@ impl BrainStore {
                     memory_text: Some(page.memory_text),
                     category: Some(page.category),
                     source: page.source,
+                    ..PageUpdate::default()
                 },
             );
         }
@@ -179,7 +182,7 @@ impl BrainStore {
     pub fn get_page(&self, id: i64) -> Result<Option<MemoryPage>> {
         self.conn
             .query_row(
-                "SELECT id, title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at
+                "SELECT id, title, memory_text, category, scope_kind, scope_id, source, freshness, created_at, updated_at
                  FROM memory WHERE id = ?1",
                 params![id],
                 row_to_page,
@@ -205,7 +208,7 @@ impl BrainStore {
             return self.list_pages();
         };
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at
+            "SELECT id, title, memory_text, category, scope_kind, scope_id, source, freshness, created_at, updated_at
              FROM memory WHERE scope_kind = 'global' OR (scope_kind = 'workspace' AND scope_id = ?1)
              ORDER BY CASE WHEN scope_kind = 'workspace' AND scope_id = ?1 THEN 0 ELSE 1 END,
                       updated_at DESC, id DESC",
@@ -217,10 +220,10 @@ impl BrainStore {
 
     fn list_pages_inner(&self, category: Option<MemoryCategory>) -> Result<Vec<MemoryPage>> {
         let sql = if category.is_some() {
-            "SELECT id, title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at
+            "SELECT id, title, memory_text, category, scope_kind, scope_id, source, freshness, created_at, updated_at
              FROM memory WHERE category = ?1 ORDER BY updated_at DESC, id DESC"
         } else {
-            "SELECT id, title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at
+            "SELECT id, title, memory_text, category, scope_kind, scope_id, source, freshness, created_at, updated_at
              FROM memory ORDER BY updated_at DESC, id DESC"
         };
         let mut stmt = self.conn.prepare(sql)?;
@@ -264,15 +267,22 @@ impl BrainStore {
         };
         let category = update.category.unwrap_or(current.category);
         let source = update.source.or(current.source);
+        let freshness = update.freshness.unwrap_or_else(|| match source.as_deref() {
+            Some("current_state") | Some("git_state") | Some("sync_state") => {
+                MemoryFreshness::TimeSensitive
+            }
+            _ => current.freshness,
+        });
         let now = Utc::now();
         self.conn.execute(
             "UPDATE memory SET title = ?1, memory_text = ?2, category = ?3, source = ?4,
-             updated_at = ?5 WHERE id = ?6",
+             freshness = ?5, updated_at = ?6 WHERE id = ?7",
             params![
                 title,
                 memory_text,
                 category.as_str(),
                 source,
+                freshness.as_str(),
                 now.to_rfc3339(),
                 id
             ],
@@ -289,7 +299,7 @@ impl BrainStore {
             .ok_or(BrainError::PageNotFound(revision_id))?;
         self.conn.execute(
             "UPDATE memory SET title = ?1, memory_text = ?2, category = ?3,
-             scope_kind = ?4, scope_id = ?5, source = ?6, updated_at = ?7 WHERE id = ?8",
+             scope_kind = ?4, scope_id = ?5, source = ?6, freshness = ?7, updated_at = ?8 WHERE id = ?9",
             params![
                 revision.title,
                 revision.memory_text,
@@ -297,6 +307,7 @@ impl BrainStore {
                 revision.scope_kind.as_str(),
                 revision.scope_id,
                 revision.source,
+                revision.freshness.as_str(),
                 Utc::now().to_rfc3339(),
                 revision.memory_id,
             ],
@@ -481,8 +492,8 @@ impl BrainStore {
         let now = Utc::now();
         self.conn.execute(
             "INSERT INTO memory_revision
-             (memory_id, title, memory_text, category, scope_kind, scope_id, source, revision_source, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (memory_id, title, memory_text, category, scope_kind, scope_id, source, freshness, revision_source, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 page.id,
                 page.title,
@@ -491,6 +502,7 @@ impl BrainStore {
                 page.scope_kind.as_str(),
                 page.scope_id,
                 page.source,
+                page.freshness.as_str(),
                 revision_source,
                 now.to_rfc3339(),
             ],
@@ -503,7 +515,7 @@ impl BrainStore {
     pub fn revisions(&self, memory_id: i64) -> Result<Vec<MemoryRevision>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, memory_id, title, memory_text, category, scope_kind, scope_id,
-                    source, revision_source, created_at
+                    source, freshness, revision_source, created_at
              FROM memory_revision WHERE memory_id = ?1 ORDER BY created_at DESC, id DESC",
         )?;
         stmt.query_map(params![memory_id], row_to_revision)?
@@ -516,7 +528,7 @@ impl BrainStore {
         self.conn
             .query_row(
                 "SELECT id, memory_id, title, memory_text, category, scope_kind, scope_id,
-                        source, revision_source, created_at
+                        source, freshness, revision_source, created_at
                  FROM memory_revision WHERE id = ?1",
                 params![revision_id],
                 row_to_revision,
@@ -643,27 +655,46 @@ impl BrainStore {
             let title = page.title.to_ascii_lowercase();
             let body = page.memory_text.to_ascii_lowercase();
             let category = page.category.as_str();
+            let mut matched_terms = 0i64;
             for term in &query_terms {
+                let mut matched = false;
                 if title.contains(term) {
-                    score += 12;
+                    score += 80;
+                    matched = true;
                 }
                 if category.contains(term) {
-                    score += 6;
+                    score += 16;
+                    matched = true;
                 }
                 if body.contains(term) {
-                    score += 3;
+                    score += 24;
+                    matched = true;
                 }
+                if matched {
+                    matched_terms += 1;
+                }
+            }
+            if matched_terms > 1 {
+                score += matched_terms * 20;
             }
             if let Some(scope) = workspace.as_deref()
                 && page.scope_kind == MemoryScopeKind::Workspace
                 && page.scope_id.as_deref() == Some(scope)
             {
-                score += 40;
+                score += 60;
             }
-            if always_include_global_preference(&page) {
+            if page.freshness == MemoryFreshness::TimeSensitive
+                && query_mentions_current_state(&query_terms)
+            {
+                score += 35;
+            }
+            if should_include_global_preference(&query_terms, &page) {
                 score += 25;
             }
-            score += (100 - recency_rank.min(100)) as i64;
+            // Recency is only a tie-breaker-scale signal. Durable facts should
+            // not outrank a direct query match merely because they were updated
+            // yesterday.
+            score += (20 - recency_rank.min(20)) as i64;
             scored.push(RecalledMemoryPage {
                 page,
                 score,
@@ -673,7 +704,7 @@ impl BrainStore {
         sort_recalled_pages(&mut scored);
         let always_include = scored
             .iter()
-            .filter(|recalled| always_include_global_preference(&recalled.page))
+            .filter(|recalled| should_include_global_preference(&query_terms, &recalled.page))
             .cloned()
             .collect::<Vec<_>>();
         if scored.len() > limit {
@@ -685,10 +716,9 @@ impl BrainStore {
                 {
                     continue;
                 }
-                if let Some(replace_idx) = scored
-                    .iter()
-                    .rposition(|selected| !always_include_global_preference(&selected.page))
-                {
+                if let Some(replace_idx) = scored.iter().rposition(|selected| {
+                    !should_include_global_preference(&query_terms, &selected.page)
+                }) {
                     scored[replace_idx] = recalled;
                 }
             }
@@ -781,6 +811,15 @@ impl BrainStore {
     }
 }
 
+fn freshness_for_source(source: Option<&str>) -> MemoryFreshness {
+    match source {
+        Some("current_state") | Some("git_state") | Some("sync_state") => {
+            MemoryFreshness::TimeSensitive
+        }
+        _ => MemoryFreshness::Durable,
+    }
+}
+
 /// Normalize an unordered pair to `(low, high)` — the storage invariant that
 /// makes edge dedup fall out of the primary key (Onyx `_ordered_pair`).
 fn ordered_pair(a: i64, b: i64) -> (i64, i64) {
@@ -798,8 +837,9 @@ fn row_to_page(row: &Row<'_>) -> rusqlite::Result<MemoryPage> {
         scope_kind: MemoryScopeKind::parse(&scope_raw),
         scope_id: row.get(5)?,
         source: row.get(6)?,
-        created_at: parse_ts(row.get::<_, String>(7)?),
-        updated_at: parse_ts(row.get::<_, String>(8)?),
+        freshness: MemoryFreshness::parse(&row.get::<_, String>(7)?),
+        created_at: parse_ts(row.get::<_, String>(8)?),
+        updated_at: parse_ts(row.get::<_, String>(9)?),
     })
 }
 
@@ -828,8 +868,9 @@ fn row_to_revision(row: &Row<'_>) -> rusqlite::Result<MemoryRevision> {
         scope_kind: MemoryScopeKind::parse(&scope_raw),
         scope_id: row.get(6)?,
         source: row.get(7)?,
-        revision_source: row.get(8)?,
-        created_at: parse_ts(row.get::<_, String>(9)?),
+        freshness: MemoryFreshness::parse(&row.get::<_, String>(8)?),
+        revision_source: row.get(9)?,
+        created_at: parse_ts(row.get::<_, String>(10)?),
     })
 }
 
@@ -857,16 +898,60 @@ fn tokenize_query(query: &str) -> Vec<String> {
         .collect()
 }
 
-fn always_include_global_preference(page: &MemoryPage) -> bool {
+fn should_include_global_preference(query_terms: &[String], page: &MemoryPage) -> bool {
     if page.scope_kind != MemoryScopeKind::Global {
         return false;
     }
     let text = format!("{} {}", page.title, page.memory_text).to_ascii_lowercase();
-    page.category == MemoryCategory::Notes
+    let is_preference = page.category == MemoryCategory::Notes
         || text.contains("user preference")
         || text.contains("the user prefers")
         || text.contains("shell")
-        || text.contains("path preference")
+        || text.contains("path preference");
+    if !is_preference {
+        return false;
+    }
+    query_terms.is_empty()
+        || query_terms.iter().any(|term| {
+            matches!(
+                term.as_str(),
+                "preference"
+                    | "preferences"
+                    | "path"
+                    | "shell"
+                    | "safety"
+                    | "safe"
+                    | "confirm"
+                    | "confirmation"
+                    | "account"
+                    | "credentials"
+                    | "token"
+                    | "privacy"
+                    | "sensitive"
+            ) || text.contains(term)
+        })
+}
+
+fn query_mentions_current_state(query_terms: &[String]) -> bool {
+    query_terms.iter().any(|term| {
+        matches!(
+            term.as_str(),
+            "current"
+                | "state"
+                | "branch"
+                | "branches"
+                | "remote"
+                | "origin"
+                | "upstream"
+                | "deploy"
+                | "deployment"
+                | "sync"
+                | "status"
+                | "main"
+                | "dev"
+                | "pr"
+        )
+    })
 }
 
 fn migrate_schema(conn: &Connection) -> Result<()> {
@@ -877,6 +962,12 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'global'",
     )?;
     add_column_if_missing(conn, "memory", "scope_id", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "memory",
+        "freshness",
+        "TEXT NOT NULL DEFAULT 'durable'",
+    )?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS memory_revision (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -887,11 +978,18 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
             scope_kind TEXT NOT NULL DEFAULT 'global',
             scope_id TEXT,
             source TEXT,
+            freshness TEXT NOT NULL DEFAULT 'durable',
             revision_source TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS ix_memory_scope ON memory(scope_kind, scope_id);
         CREATE INDEX IF NOT EXISTS ix_memory_revision_memory ON memory_revision(memory_id);",
+    )?;
+    add_column_if_missing(
+        conn,
+        "memory_revision",
+        "freshness",
+        "TEXT NOT NULL DEFAULT 'durable'",
     )?;
     Ok(())
 }
@@ -935,6 +1033,7 @@ CREATE TABLE IF NOT EXISTS memory (
     scope_kind TEXT NOT NULL DEFAULT 'global',
     scope_id TEXT,
     source TEXT,
+    freshness TEXT NOT NULL DEFAULT 'durable',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -968,6 +1067,7 @@ CREATE TABLE IF NOT EXISTS memory_revision (
     scope_kind TEXT NOT NULL DEFAULT 'global',
     scope_id TEXT,
     source TEXT,
+    freshness TEXT NOT NULL DEFAULT 'durable',
     revision_source TEXT NOT NULL,
     created_at TEXT NOT NULL
 );

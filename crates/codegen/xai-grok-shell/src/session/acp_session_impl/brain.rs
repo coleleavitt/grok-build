@@ -67,18 +67,19 @@ pub(crate) fn process_brain_request_at_path(
     })
 }
 
-/// Merge the existing markdown/embedding memory reminder with the Brain
-/// reminder. Both flow through the same shipped prompt injection mechanism.
+/// Choose the memory reminder for prompt injection.
+///
+/// Brain is canonical; legacy markdown/index memory is fallback-only when
+/// Brain has no recalled context.
 pub(crate) fn combine_memory_reminders(
     existing: Option<String>,
     brain: Option<String>,
 ) -> Option<String> {
-    match (existing, brain) {
-        (None, None) => None,
-        (Some(existing), None) => Some(existing),
-        (None, Some(brain)) => Some(brain),
-        (Some(existing), Some(brain)) => Some(format!("{existing}\n\n{brain}")),
-    }
+    // Brain is the canonical memory product. Legacy Markdown/index memory is
+    // retained as a fallback when Brain has no recalled context, but we avoid
+    // injecting competing `<memory-context>` and `<brain_context>` blocks into
+    // the same model request.
+    brain.or(existing)
 }
 
 fn should_run_brain_backfill(settings: &xai_grok_brain::BrainSettings) -> bool {
@@ -116,6 +117,83 @@ fn brain_extraction_prompt(input: &xai_grok_brain::engine::ExtractionInput) -> S
         .replace("{existing_titles}", &existing_titles)
         .replace("{transcript}", &input.transcript)
         .replace("{max_pages}", &input.max_pages.to_string())
+}
+
+fn record_current_git_state(
+    service: &xai_grok_brain::BrainService,
+    cwd: &str,
+) -> anyhow::Result<()> {
+    let Some(root) = git_output(cwd, &["rev-parse", "--show-toplevel"]) else {
+        return Ok(());
+    };
+    let root = root.trim();
+    if root.is_empty() {
+        return Ok(());
+    }
+    let repo_name = std::path::Path::new(root)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "workspace".to_owned());
+    let branch =
+        git_output(root, &["branch", "--show-current"]).unwrap_or_else(|| "detached".to_owned());
+    let head = git_output(root, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+    let subject = git_output(root, &["log", "-1", "--format=%s"]).unwrap_or_default();
+    let tracking = git_output(
+        root,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .unwrap_or_else(|| "<none>".to_owned());
+    let status = git_output(root, &["status", "--short", "--branch"]).unwrap_or_default();
+    let remotes = git_output(root, &["remote", "-v"]).unwrap_or_default();
+
+    let status_lines = status
+        .lines()
+        .take(12)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n  ");
+    let remote_lines = remotes
+        .lines()
+        .filter(|line| line.contains("(fetch)"))
+        .take(8)
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n  ");
+
+    let content = format!(
+        "Current git state for `{repo_name}`.\n\n\
+         - Workspace: `{root}`\n\
+         - Branch: `{branch}`\n\
+         - HEAD: `{head}` {subject}\n\
+         - Tracking: `{tracking}`\n\
+         - Status:\n  {status_lines}\n\
+         - Remotes:\n  {remote_lines}",
+        branch = branch.trim(),
+        head = head.trim(),
+        subject = subject.trim(),
+        tracking = tracking.trim(),
+    );
+    service.record_current_state(xai_grok_brain::CurrentStateMemory {
+        title: format!("{repo_name} Current Git State"),
+        content,
+        workspace_scope: Some(root.to_owned()),
+        source_label: format!("Current git state for {repo_name}"),
+        source_url: Some(format!("file://{root}")),
+    })?;
+    Ok(())
+}
+
+fn git_output(cwd: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn brain_extraction_schema() -> serde_json::Value {
@@ -265,6 +343,13 @@ impl SessionActor {
                 ..Default::default()
             })?;
         }
+        if let Err(err) = record_current_git_state(&service, self.session_info.cwd.as_str()) {
+            tracing::debug!(
+                target: xai_grok_telemetry::memory_log::TARGET,
+                error = %err,
+                "BRAIN_CURRENT_STATE: skipped git state capture"
+            );
+        }
         self.run_brain_backfill_if_due(&service).await;
         Ok(service.process_request(xai_grok_brain::BrainRequest {
             session_id: self.session_info.id.0.as_ref(),
@@ -324,7 +409,7 @@ impl SessionActor {
             }
             xai_grok_brain::engine::PreparedRunOutcome::Ready(prepared) => prepared,
         };
-        let pages = self.extract_brain_pages(prepared.input()).await;
+        let pages = self.extract_brain_pages(prepared.input()).await?;
         let outcome =
             xai_grok_brain::engine::complete_self_improvement(service.store(), prepared, &pages)?;
         Ok(Some((selection.sessions.len(), outcome)))
@@ -355,7 +440,7 @@ impl SessionActor {
     async fn extract_brain_pages(
         &self,
         input: &xai_grok_brain::engine::ExtractionInput,
-    ) -> Vec<xai_grok_brain::engine::ExtractedPage> {
+    ) -> anyhow::Result<Vec<xai_grok_brain::engine::ExtractedPage>> {
         let result = async {
             let sampling_client = self.prepare_chat_completion(false).await?;
             let model = self
@@ -395,17 +480,14 @@ impl SessionActor {
         }
         .await;
 
-        match result {
-            Ok(pages) => pages,
-            Err(err) => {
-                tracing::warn!(
-                    target: xai_grok_telemetry::memory_log::TARGET,
-                    error = %err,
-                    "BRAIN_BACKFILL: extraction failed; stamping empty run"
-                );
-                Vec::new()
-            }
-        }
+        result.map_err(|err| {
+            tracing::warn!(
+                target: xai_grok_telemetry::memory_log::TARGET,
+                error = %err,
+                "BRAIN_BACKFILL: extraction failed; run timestamp left unchanged"
+            );
+            err
+        })
     }
 }
 
@@ -1376,13 +1458,20 @@ mod tests {
     }
 
     #[test]
-    fn combines_existing_memory_and_brain_reminders() {
+    fn brain_reminder_wins_over_legacy_memory_reminder() {
         let combined = combine_memory_reminders(
             Some("<memory_context>old</memory_context>".to_owned()),
             Some("<brain_context>new</brain_context>".to_owned()),
         )
         .unwrap();
-        assert!(combined.contains("<memory_context>old</memory_context>"));
+        assert!(!combined.contains("<memory_context>old</memory_context>"));
         assert!(combined.contains("<brain_context>new</brain_context>"));
+
+        let fallback = combine_memory_reminders(
+            Some("<memory_context>old</memory_context>".to_owned()),
+            None,
+        )
+        .unwrap();
+        assert!(fallback.contains("<memory_context>old</memory_context>"));
     }
 }

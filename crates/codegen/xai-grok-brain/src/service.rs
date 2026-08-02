@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use crate::backfill::{BackfillSelection, read_bounded_run_context};
 use crate::engine::{ExtractionProvider, RunContext, RunOutcome, run_self_improvement};
 use crate::{
-    BrainSettings, BrainSettingsUpdate, BrainStatus, BrainStore, MemoryCategory, MemoryGraph,
-    MemoryPage, MemoryRevision, MemorySource, MemorySourceType, NewPage, RecallOptions,
-    RecalledMemoryPage, Result,
+    BrainSettings, BrainSettingsUpdate, BrainStatus, BrainStore, MemoryCategory, MemoryFreshness,
+    MemoryGraph, MemoryPage, MemoryRevision, MemorySource, MemorySourceType, NewPage,
+    RecallOptions, RecalledMemoryPage, Result,
 };
 
 const MAX_RECALLED_PAGES: usize = 20;
@@ -46,6 +46,21 @@ pub struct BrainBackfillOutcome {
     pub selection: BackfillSelection,
     /// Engine outcome after applying the selected context.
     pub outcome: RunOutcome,
+}
+
+/// A caller-observed operational state snapshot that should be remembered immediately.
+#[derive(Debug, Clone)]
+pub struct CurrentStateMemory {
+    /// Stable title for the state page. Reusing the title updates the same page.
+    pub title: String,
+    /// Short markdown body describing the current state.
+    pub content: String,
+    /// Active workspace/repo scope id, when known.
+    pub workspace_scope: Option<String>,
+    /// Human-readable citation label for this snapshot.
+    pub source_label: String,
+    /// Optional deep link or local URI for the snapshot source.
+    pub source_url: Option<String>,
 }
 
 /// High-level service wrapping the durable Brain store and engine.
@@ -131,6 +146,46 @@ impl BrainService {
             return Ok(None);
         }
         Ok(Some(format_recalled_brain_context(pages.into_iter())))
+    }
+
+    /// Record operational state immediately, outside the daily backfill cadence.
+    ///
+    /// This is intentionally idempotent: if the page already has the same body,
+    /// source, category, and freshness, no update/revision is written.
+    pub fn record_current_state(&self, state: CurrentStateMemory) -> Result<Option<MemoryPage>> {
+        let title = state.title.trim();
+        let content = state.content.trim();
+        if title.is_empty() || content.is_empty() {
+            return Ok(None);
+        }
+        let existing =
+            self.store
+                .get_page_by_title_scoped(title, state.workspace_scope.as_deref(), true)?;
+        if let Some(existing) = existing.as_ref()
+            && existing.memory_text.trim() == content
+            && existing.category == MemoryCategory::Workstreams
+            && existing.source.as_deref() == Some("current_state")
+            && existing.freshness == MemoryFreshness::TimeSensitive
+        {
+            return Ok(None);
+        }
+        let page = self.store.create_or_update_page_by_title_scoped(
+            NewPage {
+                title: Some(title.to_owned()),
+                memory_text: content.to_owned(),
+                category: MemoryCategory::Workstreams,
+                source: Some("current_state".to_owned()),
+            },
+            state.workspace_scope.as_deref(),
+        )?;
+        self.store.add_source_if_missing(
+            page.id,
+            MemorySourceType::Manual,
+            &state.source_label,
+            Some("current_state"),
+            state.source_url.as_deref(),
+        )?;
+        Ok(Some(page))
     }
 
     /// Run deterministic-provider self-improvement through the service boundary.
@@ -420,9 +475,14 @@ fn format_recalled_brain_context(pages: impl Iterator<Item = RecalledMemoryPage>
     );
     for recalled in pages {
         let page = recalled.page;
+        let freshness_note = match page.freshness {
+            MemoryFreshness::Durable => "",
+            MemoryFreshness::TimeSensitive => " (time-sensitive; verify current state)",
+        };
         out.push_str(&format!(
-            "- [{}] {}: {}\n",
+            "- [{}{}] {}: {}\n",
             page.category.as_str(),
+            freshness_note,
             page.title,
             page.memory_text.trim()
         ));
@@ -675,6 +735,97 @@ mod tests {
     }
 
     #[test]
+    fn current_state_memory_is_time_sensitive_scoped_and_idempotent() {
+        let service = BrainService::open_in_memory_for_tests();
+        service
+            .update_settings(BrainSettingsUpdate {
+                enabled: Some(true),
+                ..BrainSettingsUpdate::default()
+            })
+            .unwrap();
+        let first = service
+            .record_current_state(CurrentStateMemory {
+                title: "grok-build Current Git State".to_owned(),
+                content: "Current branch is dev at cb0628f.".to_owned(),
+                workspace_scope: Some("/repo/grok-build/".to_owned()),
+                source_label: "Current git state for grok-build".to_owned(),
+                source_url: Some("file:///repo/grok-build".to_owned()),
+            })
+            .unwrap()
+            .expect("first snapshot writes a page");
+        assert_eq!(first.freshness, MemoryFreshness::TimeSensitive);
+        assert_eq!(first.scope_kind, crate::MemoryScopeKind::Workspace);
+        assert_eq!(first.scope_id.as_deref(), Some("/repo/grok-build"));
+
+        let second = service
+            .record_current_state(CurrentStateMemory {
+                title: "grok-build Current Git State".to_owned(),
+                content: "Current branch is dev at cb0628f.".to_owned(),
+                workspace_scope: Some("/repo/grok-build".to_owned()),
+                source_label: "Current git state for grok-build".to_owned(),
+                source_url: Some("file:///repo/grok-build".to_owned()),
+            })
+            .unwrap();
+        assert!(
+            second.is_none(),
+            "unchanged current state should not rewrite"
+        );
+        assert_eq!(service.revisions(first.id).unwrap().len(), 1);
+
+        let recalled = service
+            .recall_context_scoped("current dev branch", Some("/repo/grok-build"))
+            .unwrap()
+            .expect("current state should recall");
+        assert!(recalled.contains("time-sensitive; verify current state"));
+    }
+
+    #[test]
+    fn self_improvement_scopes_pages_when_session_refs_share_workspace() {
+        let service = BrainService::open_in_memory_for_tests();
+        service
+            .update_settings(BrainSettingsUpdate {
+                enabled: Some(true),
+                ..BrainSettingsUpdate::default()
+            })
+            .unwrap();
+        struct ScopedProvider;
+        impl ExtractionProvider for ScopedProvider {
+            fn extract(&self, _input: &ExtractionInput) -> anyhow::Result<Vec<ExtractedPage>> {
+                Ok(vec![ExtractedPage {
+                    title: "Repo Branch State".to_owned(),
+                    category: "workstreams".to_owned(),
+                    content: "The repo now uses dev for custom fork work.".to_owned(),
+                    related: vec![],
+                    sources: vec!["S1".to_owned()],
+                }])
+            }
+        }
+        let outcome = service
+            .run_self_improvement(
+                &RunContext {
+                    sessions: vec![SessionSource {
+                        id: "session-1".to_owned(),
+                        label: Some("Branch migration".to_owned()),
+                        url: None,
+                        workspace_scope: Some("/repo/grok-build".to_owned()),
+                        lines: vec!["User: switch to dev".to_owned()],
+                    }],
+                    documents: vec![],
+                },
+                &ScopedProvider,
+            )
+            .unwrap();
+        assert_eq!(outcome, RunOutcome::Applied { applied: 1 });
+        let page = service
+            .store
+            .get_page_by_title_scoped("Repo Branch State", Some("/repo/grok-build"), true)
+            .unwrap()
+            .expect("page should be workspace scoped");
+        assert_eq!(page.scope_kind, crate::MemoryScopeKind::Workspace);
+        assert_eq!(page.scope_id.as_deref(), Some("/repo/grok-build"));
+    }
+
+    #[test]
     fn disabled_settings_do_not_create_or_recall() {
         let service = BrainService::open_in_memory_for_tests();
         let outcome = service
@@ -736,6 +887,7 @@ mod tests {
                         id: "session-1".to_owned(),
                         label: Some("Launch chat".to_owned()),
                         url: None,
+                        workspace_scope: None,
                         lines: vec!["User: Acme launch details".to_owned()],
                     }],
                     documents: vec![DocumentSource {
@@ -786,6 +938,7 @@ mod tests {
             label: "Launch chat".to_owned(),
             source_id: "session-1".to_owned(),
             url: None,
+            workspace_scope: None,
         };
     }
 

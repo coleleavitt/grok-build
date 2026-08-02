@@ -27,6 +27,13 @@ impl Default for MemoryIndexConfig {
     }
 }
 
+/// Hosted Nomic embeddings OpenAI-compatible base URL.
+pub const NOMIC_EMBEDDING_BASE_URL: &str = "https://api.nomic.ai/v1";
+/// Recommended Nomic text embedding model.
+pub const NOMIC_EMBEDDING_MODEL: &str = "nomic-embed-text-v1.5";
+/// Native Nomic embedding dimensionality.
+pub const NOMIC_EMBEDDING_DIMENSIONS: usize = 768;
+
 /// Embedding provider configuration (`[memory.embedding]`).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
@@ -45,6 +52,20 @@ impl Default for MemoryEmbeddingConfig {
             provider: "api".to_string(),
             model: None,
             dimensions: 1024,
+        }
+    }
+}
+
+impl MemoryEmbeddingConfig {
+    /// Nomic hosted/OpenAI-compatible embedding profile.
+    ///
+    /// The caller still supplies endpoint credentials/base URL; this just pins
+    /// the model and native dimensions in one place.
+    pub fn nomic() -> Self {
+        Self {
+            provider: "api".to_owned(),
+            model: Some(NOMIC_EMBEDDING_MODEL.to_owned()),
+            dimensions: NOMIC_EMBEDDING_DIMENSIONS,
         }
     }
 }

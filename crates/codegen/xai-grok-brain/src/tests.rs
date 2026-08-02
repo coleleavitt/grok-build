@@ -402,6 +402,7 @@ fn sample_context() -> RunContext {
             id: "sess-1".to_owned(),
             label: Some("Brain kickoff chat".to_owned()),
             url: Some("/app?chatId=sess-1".to_owned()),
+            workspace_scope: None,
             lines: vec!["User: we are launching Q3 with Acme Corp".to_owned()],
         }],
         documents: vec![DocumentSource {
@@ -705,7 +706,7 @@ fn status_scopes_revisions_and_query_recall_work() {
 }
 
 #[test]
-fn recall_keeps_global_preferences_even_when_scope_pages_fill_limit() {
+fn recall_only_forces_global_preferences_for_preference_queries() {
     let store = BrainStore::open_in_memory().unwrap();
     let preference = store
         .create_page(NewPage {
@@ -729,17 +730,33 @@ fn recall_keeps_global_preferences_even_when_scope_pages_fill_limit() {
             .unwrap();
     }
 
-    let recalled = store
+    let implementation_recall = store
         .recall_pages(RecallOptions {
             query: "implementation detail".to_owned(),
             workspace_scope: Some("/repo/grok-build".to_owned()),
             limit: 2,
         })
         .unwrap();
-    assert_eq!(recalled.len(), 2);
+    assert_eq!(implementation_recall.len(), 2);
     assert!(
-        recalled.iter().any(|page| page.page.id == preference.id),
-        "global preference must survive even when workspace pages fill the limit: {recalled:?}",
+        implementation_recall
+            .iter()
+            .all(|page| page.page.id != preference.id),
+        "generic implementation queries should not force unrelated global notes: {implementation_recall:?}",
+    );
+
+    let preference_recall = store
+        .recall_pages(RecallOptions {
+            query: "path preference implementation detail".to_owned(),
+            workspace_scope: Some("/repo/grok-build".to_owned()),
+            limit: 2,
+        })
+        .unwrap();
+    assert!(
+        preference_recall
+            .iter()
+            .any(|page| page.page.id == preference.id),
+        "preference queries should still preserve matching global preferences: {preference_recall:?}",
     );
 }
 

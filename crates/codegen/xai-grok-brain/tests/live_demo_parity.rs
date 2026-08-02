@@ -111,6 +111,7 @@ fn live_demo_populate_graph_recall_and_cleanup() {
                 id: "demo-session".to_owned(),
                 label: Some("Memory demo chat".to_owned()),
                 url: Some("/app?chatId=demo-session".to_owned()),
+                workspace_scope: None,
                 lines: vec![
                     "User: What is my secret project codename?".to_owned(),
                     "Assistant: Zephyr-Library".to_owned(),

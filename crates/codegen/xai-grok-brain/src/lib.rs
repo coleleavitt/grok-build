@@ -26,13 +26,14 @@ pub use backfill::{
     read_persisted_sessions,
 };
 pub use service::{
-    BrainBackfillOutcome, BrainRequest, BrainRequestOutcome, BrainService, default_store_path,
+    BrainBackfillOutcome, BrainRequest, BrainRequestOutcome, BrainService, CurrentStateMemory,
+    default_store_path,
 };
 pub use store::BrainStore;
 pub use types::{
-    BrainSettings, BrainSettingsUpdate, BrainStatus, MemoryCategory, MemoryGraph, MemoryGraphEdge,
-    MemoryGraphNode, MemoryPage, MemoryRevision, MemoryScopeKind, MemorySource, MemorySourceType,
-    NewPage, PageUpdate, RecallOptions, RecalledMemoryPage, RelatedPages,
+    BrainSettings, BrainSettingsUpdate, BrainStatus, MemoryCategory, MemoryFreshness, MemoryGraph,
+    MemoryGraphEdge, MemoryGraphNode, MemoryPage, MemoryRevision, MemoryScopeKind, MemorySource,
+    MemorySourceType, NewPage, PageUpdate, RecallOptions, RecalledMemoryPage, RelatedPages,
 };
 
 pub mod engine {

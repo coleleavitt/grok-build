@@ -70,9 +70,7 @@ impl xai_tool_runtime::Tool for MemorySearchImpl {
             .get::<Arc<dyn MemoryBackend>>()
             .cloned()
         else {
-            return Ok(ToolOutput::Text(
-                "Memory is not enabled. Use --experimental-memory to enable.".into(),
-            ));
+            return brain_search_fallback(&ctx, &input.query, input.max_results).await;
         };
         let max_results = input
             .max_results
@@ -106,4 +104,63 @@ impl xai_tool_runtime::Tool for MemorySearchImpl {
         }
         Ok(ToolOutput::Text(output.into()))
     }
+}
+
+async fn brain_search_fallback(
+    ctx: &xai_tool_runtime::ToolCallContext,
+    query: &str,
+    max_results: Option<usize>,
+) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
+    let service = xai_grok_brain::BrainService::open_grok_default().map_err(|err| {
+        xai_tool_runtime::ToolError::execution(
+            xai_tool_protocol::ToolId::new("memory_search").expect("valid"),
+            format!("memory backend disabled and Brain unavailable: {err}"),
+        )
+    })?;
+    let workspace_scope = cwd_from_context(ctx).await;
+    let pages = service
+        .store()
+        .recall_pages(xai_grok_brain::RecallOptions {
+            query: query.to_owned(),
+            workspace_scope,
+            limit: max_results.unwrap_or(8).clamp(1, 20),
+        })
+        .map_err(|err| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("memory_search").expect("valid"),
+                format!("Brain fallback search failed: {err}"),
+            )
+        })?;
+    if pages.is_empty() {
+        return Ok(ToolOutput::Text(
+            "No Brain memories found for query.".into(),
+        ));
+    }
+    let mut output = format!(
+        "Legacy memory backend is not enabled; searched durable Brain instead. Found {} result(s):\n",
+        pages.len()
+    );
+    for (i, recalled) in pages.iter().enumerate() {
+        let page = &recalled.page;
+        output.push_str(&format!(
+            "\n### Result {} (Brain #{}, score: {}, category: {})\n{}\n",
+            i + 1,
+            page.id,
+            recalled.score,
+            page.category.as_str(),
+            page.memory_text.trim()
+        ));
+    }
+    Ok(ToolOutput::Text(output.into()))
+}
+
+async fn cwd_from_context(ctx: &xai_tool_runtime::ToolCallContext) -> Option<String> {
+    use crate::types::resources::Cwd;
+    use crate::types::tool_metadata::shared_resources;
+    let resources = shared_resources(ctx).ok()?;
+    resources
+        .lock()
+        .await
+        .get::<Cwd>()
+        .map(|cwd| cwd.0.to_string_lossy().into_owned())
 }
