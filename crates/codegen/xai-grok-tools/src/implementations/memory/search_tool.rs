@@ -1,9 +1,6 @@
 //! `memory_search` tool — new architecture (`Tool` trait).
 
-use std::sync::Arc;
-
 use super::types::MemorySearchInput;
-use crate::types::memory_backend::{MemoryBackend, format_staleness_note};
 use crate::types::output::ToolOutput;
 use crate::types::tool::{ToolKind, ToolNamespace};
 
@@ -63,46 +60,8 @@ impl xai_tool_runtime::Tool for MemorySearchImpl {
         input: MemorySearchInput,
     ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
         use crate::types::tool_metadata::shared_resources;
-        let resources = shared_resources(&ctx)?;
-        let Some(memory) = resources
-            .lock()
-            .await
-            .get::<Arc<dyn MemoryBackend>>()
-            .cloned()
-        else {
-            return brain_search_fallback(&ctx, &input.query, input.max_results).await;
-        };
-        let max_results = input
-            .max_results
-            .unwrap_or_else(|| memory.default_search_max_results());
-        let min_score = input
-            .min_score
-            .unwrap_or_else(|| memory.default_search_min_score());
-        tracing::info!(target: crate::types::memory_backend::MEMORY_LOG_TARGET, max_results, "MEMORY_SEARCH: invoked");
-        let results = memory
-            .search(&input.query, max_results, min_score)
-            .await
-            .map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("memory_search").expect("valid"),
-                    format!("memory search failed: {e}"),
-                )
-            })?;
-        tracing::info!(target: crate::types::memory_backend::MEMORY_LOG_TARGET, results = results.len(), "MEMORY_SEARCH: complete");
-        if results.is_empty() {
-            return Ok(ToolOutput::Text(
-                "No memory results found for query.".into(),
-            ));
-        }
-        let mut output = format!("Found {} memory result(s):\n", results.len());
-        for (i, r) in results.iter().enumerate() {
-            let staleness = format_staleness_note(&r.source, r.created_at);
-            output.push_str(&format!(
-                "\n### Result {} (score: {:.2}, source: {})\n**File:** {} (lines {}-{})\n{}```\n{}\n```\n",
-                i + 1, r.score, r.source, r.path, r.start_line, r.end_line, staleness, r.snippet,
-            ));
-        }
-        Ok(ToolOutput::Text(output.into()))
+        let _resources = shared_resources(&ctx)?;
+        brain_search_fallback(&ctx, &input.query, input.max_results).await
     }
 }
 
@@ -143,11 +102,12 @@ async fn brain_search_fallback(
     for (i, recalled) in pages.iter().enumerate() {
         let page = &recalled.page;
         output.push_str(&format!(
-            "\n### Result {} (Brain #{}, score: {}, category: {})\n{}\n",
+            "\n### Result {} (Brain #{}, score: {}, category: {}) {}\n{}\n",
             i + 1,
             page.id,
             recalled.score,
             page.category.as_str(),
+            page.title,
             page.memory_text.trim()
         ));
     }

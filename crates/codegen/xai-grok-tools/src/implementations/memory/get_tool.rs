@@ -1,9 +1,6 @@
 //! `memory_get` tool — new architecture (`Tool` trait).
 
-use std::sync::Arc;
-
 use super::types::MemoryGetInput;
-use crate::types::memory_backend::MemoryBackend;
 use crate::types::output::ToolOutput;
 use crate::types::tool::{ToolKind, ToolNamespace};
 
@@ -84,40 +81,8 @@ impl xai_tool_runtime::Tool for MemoryGetImpl {
         input: MemoryGetInput,
     ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
         use crate::types::tool_metadata::shared_resources;
-        let resources = shared_resources(&ctx)?;
-        let Some(memory) = resources
-            .lock()
-            .await
-            .get::<Arc<dyn MemoryBackend>>()
-            .cloned()
-        else {
-            return brain_get_fallback(&ctx, &input.path).await;
-        };
-        let memory = memory.clone();
-        tracing::info!(target: crate::types::memory_backend::MEMORY_LOG_TARGET,"MEMORY_GET: invoked");
-        // `from` is 1-based in the client schema (matching displayed line
-        // numbers); the backend expects a 0-based offset. 0 is treated as 1.
-        let from_zero_based = input.from.map(|f| f.saturating_sub(1));
-        let content = memory
-            .get(&input.path, from_zero_based, input.lines)
-            .map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("memory_get").expect("valid"),
-                    format!("memory get failed: {e}"),
-                )
-            })?;
-        let total_lines = content.lines().count();
-        let first_line_num = from_zero_based.unwrap_or(0) + 1;
-        let numbered = format_with_line_numbers(&content, first_line_num);
-        let output = format!(
-            "**File:** {}\n**Lines:** {} (from: {}, limit: {})\n\n{}",
-            input.path,
-            total_lines,
-            input.from.map_or("start".to_string(), |f| f.to_string()),
-            input.lines.map_or("all".to_string(), |l| l.to_string()),
-            numbered,
-        );
-        Ok(ToolOutput::Text(output.into()))
+        let _resources = shared_resources(&ctx)?;
+        brain_get_fallback(&ctx, &input.path).await
     }
 }
 

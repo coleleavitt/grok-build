@@ -101,7 +101,16 @@ pub struct SubagentRequest {
     /// The coordinator uses this to avoid double-charging while retaining its
     /// defense-in-depth gate for non-tool callers.
     pub advisor_gate_prevalidated: bool,
-    /// Oneshot channel for the coordinator to send back the result.
+    pub owner: SubagentOwner,
+    pub cancel_token: CancellationToken,
+}
+
+/// Spawn envelope sent to the coordinator. Keeps the plain request borrowable
+/// while owning the result reply channel.
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct SubagentSpawnRequest {
+    pub request: Box<SubagentRequest>,
     #[educe(Debug(ignore))]
     pub result_tx: oneshot::Sender<SubagentResult>,
 }

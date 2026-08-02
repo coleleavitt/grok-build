@@ -83,21 +83,15 @@ impl xai_tool_runtime::Tool for BrainSearchTool {
         let service = open_brain_service("brain_search")?;
         let workspace_scope = cwd_from_context(&ctx).await;
         let limit = input.limit.unwrap_or(8).clamp(1, 20);
-        let pages = match try_nomic_semantic_search(
-            &service,
-            &input.query,
-            workspace_scope.as_deref(),
-            limit,
-        )
-        .await
+        drop(service);
+        let pages = match try_nomic_semantic_search(&input.query, workspace_scope.as_deref(), limit)
+            .await
         {
             Ok(Some(pages)) => pages,
-            Ok(None) => {
-                lexical_brain_search(&service, &input.query, workspace_scope.clone(), limit)?
-            }
+            Ok(None) => lexical_brain_search(&input.query, workspace_scope.clone(), limit)?,
             Err(err) => {
                 tracing::warn!(error = %err, "brain_search Nomic embeddings failed; falling back to lexical Brain recall");
-                lexical_brain_search(&service, &input.query, workspace_scope.clone(), limit)?
+                lexical_brain_search(&input.query, workspace_scope.clone(), limit)?
             }
         };
         if pages.is_empty() {
@@ -265,11 +259,11 @@ impl xai_tool_runtime::Tool for BrainGetTool {
 }
 
 fn lexical_brain_search(
-    service: &xai_grok_brain::BrainService,
     query: &str,
     workspace_scope: Option<String>,
     limit: usize,
 ) -> Result<Vec<xai_grok_brain::RecalledMemoryPage>, xai_tool_runtime::ToolError> {
+    let service = open_brain_service("brain_search")?;
     service
         .store()
         .recall_pages(xai_grok_brain::RecallOptions {
@@ -281,7 +275,6 @@ fn lexical_brain_search(
 }
 
 async fn try_nomic_semantic_search(
-    service: &xai_grok_brain::BrainService,
     query: &str,
     workspace_scope: Option<&str>,
     limit: usize,
@@ -292,14 +285,29 @@ async fn try_nomic_semantic_search(
     else {
         return Ok(None);
     };
-    let pages = service.list_pages(workspace_scope)?;
-    if pages.is_empty() {
+    let pages_and_sources = {
+        let service = xai_grok_brain::BrainService::open_grok_default()?;
+        service
+            .list_pages(workspace_scope)?
+            .into_iter()
+            .map(|page| {
+                let sources = service
+                    .sources(page.id)?
+                    .into_iter()
+                    .map(|source| source.label)
+                    .filter(|label| !label.trim().is_empty())
+                    .collect::<Vec<_>>();
+                Ok::<_, xai_grok_brain::BrainError>((page, sources))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if pages_and_sources.is_empty() {
         return Ok(Some(Vec::new()));
     }
 
-    let mut inputs = Vec::with_capacity(pages.len() + 1);
+    let mut inputs = Vec::with_capacity(pages_and_sources.len() + 1);
     inputs.push(query.to_owned());
-    inputs.extend(pages.iter().map(|page| {
+    inputs.extend(pages_and_sources.iter().map(|(page, _)| {
         format!(
             "{}\ncategory: {}\nfreshness: {}\n{}",
             page.title,
@@ -315,14 +323,8 @@ async fn try_nomic_semantic_search(
     }
     let query_vec = &embeddings[0];
     let mut scored = Vec::new();
-    for (idx, page) in pages.into_iter().enumerate() {
+    for (idx, (page, source_labels)) in pages_and_sources.into_iter().enumerate() {
         let semantic = cosine_similarity(query_vec, &embeddings[idx + 1]);
-        let source_labels = service
-            .sources(page.id)?
-            .into_iter()
-            .map(|source| source.label)
-            .filter(|label| !label.trim().is_empty())
-            .collect::<Vec<_>>();
         scored.push(xai_grok_brain::RecalledMemoryPage {
             page,
             score: (semantic * 10_000.0).round() as i64,

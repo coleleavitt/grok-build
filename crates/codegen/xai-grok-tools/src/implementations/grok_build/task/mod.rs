@@ -28,6 +28,7 @@ use crate::types::requirements::{Expr, ToolRequirement};
 #[allow(unused_imports)]
 use crate::types::resources::SharedResources;
 use crate::types::tool::{ToolKind, ToolNamespace};
+use regex::Regex;
 use xai_tool_types::{
     ADVISOR_SUBAGENT, SubagentCompletedOutput, SubagentIsolationMode, TaskToolInput,
 };
@@ -37,6 +38,12 @@ pub const MAX_SUBAGENT_DEPTH: u32 = 1;
 
 fn is_advisor_subagent(subagent_type: &str) -> bool {
     subagent_type == ADVISOR_SUBAGENT.name
+}
+
+fn effective_max_subagent_depth(res: &crate::types::resources::Resources) -> u32 {
+    res.get::<MaxSubagentDepth>()
+        .map(|max| max.0)
+        .unwrap_or(MAX_SUBAGENT_DEPTH)
 }
 
 fn advisor_model_unavailable_message(detail: impl Into<String>) -> String {
@@ -494,9 +501,6 @@ impl xai_tool_runtime::Tool for TaskTool {
         // 5. Blocking mode (default): spawn via backend and await result
         let _foreground_wait = foreground_wait.map(|wait| wait.enter());
         let result = backend.backend().spawn(request).await;
-        if let Some(forwarder) = cancellation_forwarder {
-            forwarder.abort();
-        }
         let result = result?;
 
         // 5b. The await budget expired and the coordinator auto-backgrounded the

@@ -36,6 +36,7 @@ pub mod update_goal;
 pub mod video_gen;
 pub mod web_fetch;
 pub mod web_search;
+pub mod workflow;
 pub use advisor::AdvisorTool;
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::BashTool;

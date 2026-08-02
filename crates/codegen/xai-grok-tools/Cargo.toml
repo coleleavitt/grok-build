@@ -19,6 +19,7 @@ xai-tty-utils = { workspace = true }
 xai-grok-config = { path = "../xai-grok-config" }
 xai-grok-brain = { path = "../xai-grok-brain" }
 xai-grok-economy = { path = "../xai-grok-economy" }
+xai-grok-extra-ca = { path = "../xai-grok-extra-ca" }
 xai-grok-tools-api = { path = "../xai-grok-tools-api" }
 xai-grok-workspace-types = { path = "../xai-grok-workspace-types" }
 xai-grok-version = { workspace = true }

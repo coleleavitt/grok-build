@@ -13,10 +13,13 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use super::types::{
-    SubagentAdvisorPreflightOutcome, SubagentAdvisorPreflightRequest, SubagentCancelOutcome,
-    SubagentCancelRequest, SubagentCancelTarget, SubagentDescribeOutcome, SubagentDescribeRequest,
-    SubagentEvent, SubagentQueryRequest, SubagentRequest, SubagentResult, SubagentSnapshot,
-    SubagentValidateTypeOutcome, SubagentValidateTypeRequest,
+    SpawnedSubagentRef, SubagentAdvisorPreflightOutcome, SubagentAdvisorPreflightRequest,
+    SubagentCancelOutcome, SubagentCancelRequest, SubagentCancelTarget, SubagentDescribeOutcome,
+    SubagentDescribeRequest, SubagentEvent, SubagentInspectRequest, SubagentInspection,
+    SubagentListRunningRequest, SubagentQueryRequest, SubagentRegistryCounts,
+    SubagentRegistryCountsRequest, SubagentRequest, SubagentResult, SubagentSnapshot,
+    SubagentSpawnRequest, SubagentSpawnedRefsRequest, SubagentValidateTypeOutcome,
+    SubagentValidateTypeRequest,
 };
 use crate::register_resource;
 use xai_tool_runtime::ToolError;

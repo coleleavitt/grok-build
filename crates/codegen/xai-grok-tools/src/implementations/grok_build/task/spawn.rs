@@ -14,7 +14,8 @@
 
 use super::backend::SubagentBackendResource;
 use super::types::{
-    ModelOverrideProvenance, SubagentRequest, SubagentResult, SubagentRuntimeOverrides,
+    ModelOverrideProvenance, SubagentOwner, SubagentRequest, SubagentResult,
+    SubagentRuntimeOverrides, SubagentSpawnRequest,
 };
 use xai_tool_types::{SubagentCapabilityMode, SubagentIsolationMode};
 
@@ -49,25 +50,8 @@ pub struct SubagentSpawnParams {
 }
 
 impl SubagentSpawnParams {
-    /// Assemble the [`SubagentRequest`], generating an id when none was
-    /// supplied and wiring up the placeholder `result_tx` oneshot (the
-    /// backend replaces it with a fresh channel before dispatch — see
-    /// `ChannelBackend::spawn`).
+    /// Assemble the [`SubagentRequest`], generating an id when none was supplied.
     pub fn into_request(self) -> SubagentRequest {
-        // Placeholder; `ChannelBackend::spawn` replaces it with a fresh one.
-        let (result_tx, _) = tokio::sync::oneshot::channel();
-        self.into_request_with_result_tx(result_tx)
-    }
-
-    /// Assemble the [`SubagentRequest`] using the caller's own `result_tx`,
-    /// generating an id when none was supplied. For callers (the `/goal`
-    /// subagent spawners) that own their `(result_tx, result_rx)` pair and
-    /// await `result_rx` directly rather than relying on the backend to
-    /// replace a placeholder channel.
-    pub fn into_request_with_result_tx(
-        self,
-        result_tx: tokio::sync::oneshot::Sender<SubagentResult>,
-    ) -> SubagentRequest {
         let id = self.id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
 
         SubagentRequest {
@@ -87,11 +71,25 @@ impl SubagentSpawnParams {
                 capability_mode: self.capability_mode,
                 isolation: self.isolation,
                 harness_agent_type: self.harness_agent_type,
+                ..SubagentRuntimeOverrides::default()
             },
             run_in_background: self.run_in_background,
             surface_completion: self.surface_completion,
+            await_to_completion: !self.run_in_background,
             fork_context: self.fork_context,
             advisor_gate_prevalidated: self.advisor_gate_prevalidated,
+            owner: SubagentOwner::Task,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    /// Assemble a coordinator spawn envelope using the caller's own `result_tx`.
+    pub fn into_request_with_result_tx(
+        self,
+        result_tx: tokio::sync::oneshot::Sender<SubagentResult>,
+    ) -> SubagentSpawnRequest {
+        SubagentSpawnRequest {
+            request: Box::new(self.into_request()),
             result_tx,
         }
     }

@@ -674,6 +674,7 @@ impl SchedulerActor {
             surface_completion: true,
             await_to_completion: false,
             fork_context: false,
+            advisor_gate_prevalidated: false,
             owner: SubagentOwner::Task,
             cancel_token: CancellationToken::new(),
         };
