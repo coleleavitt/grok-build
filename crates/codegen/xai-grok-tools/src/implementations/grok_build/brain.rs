@@ -9,6 +9,10 @@ use crate::types::output::{TextOutput, ToolOutput};
 use crate::types::resources::Cwd;
 use crate::types::tool::{ToolKind, ToolNamespace};
 
+const NOMIC_EMBEDDING_BASE_URL: &str = "https://api.nomic.ai/v1";
+const NOMIC_EMBEDDING_MODEL: &str = "nomic-embed-text-v1.5";
+const NOMIC_EMBEDDING_DIMENSIONS: usize = 768;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct BrainSearchInput {
     #[schemars(description = "Natural-language query to rank Brain memories against.")]
@@ -83,17 +87,34 @@ impl xai_tool_runtime::Tool for BrainSearchTool {
         let service = open_brain_service("brain_search")?;
         let workspace_scope = cwd_from_context(&ctx).await;
         let limit = input.limit.unwrap_or(8).clamp(1, 20);
+        let prepared = xai_grok_brain::BrainSearchEngine::prepare(
+            service.store(),
+            xai_grok_brain::BrainSearchOptions {
+                query: input.query.clone(),
+                workspace_scope: workspace_scope.clone(),
+                limit,
+            },
+        )
+        .map_err(|err| tool_error("brain_search", err))?;
         drop(service);
-        let pages = match try_nomic_semantic_search(&input.query, workspace_scope.as_deref(), limit)
-            .await
-        {
-            Ok(Some(pages)) => pages,
-            Ok(None) => lexical_brain_search(&input.query, workspace_scope.clone(), limit)?,
-            Err(err) => {
-                tracing::warn!(error = %err, "brain_search Nomic embeddings failed; falling back to lexical Brain recall");
-                lexical_brain_search(&input.query, workspace_scope.clone(), limit)?
-            }
-        };
+        let provider = NomicEmbeddingProvider::from_env();
+        let outcome = xai_grok_brain::BrainSearchEngine::search_prepared(
+            prepared,
+            provider
+                .as_ref()
+                .map(|provider| provider as &dyn xai_grok_brain::BrainEmbeddingProvider),
+        )
+        .await;
+        if matches!(
+            outcome.mode,
+            xai_grok_brain::BrainSearchMode::LexicalFallback
+        ) {
+            tracing::warn!(
+                model = ?outcome.embedding_model,
+                "brain_search semantic embeddings failed; using lexical fallback"
+            );
+        }
+        let pages = outcome.pages;
         if pages.is_empty() {
             return Ok(ToolOutput::Text(TextOutput::from(
                 "No Brain memories found for query.",
@@ -258,156 +279,100 @@ impl xai_tool_runtime::Tool for BrainGetTool {
     }
 }
 
-fn lexical_brain_search(
-    query: &str,
-    workspace_scope: Option<String>,
-    limit: usize,
-) -> Result<Vec<xai_grok_brain::RecalledMemoryPage>, xai_tool_runtime::ToolError> {
-    let service = open_brain_service("brain_search")?;
-    service
-        .store()
-        .recall_pages(xai_grok_brain::RecallOptions {
-            query: query.to_owned(),
-            workspace_scope,
-            limit,
+#[derive(Debug, Clone)]
+struct NomicEmbeddingProvider {
+    api_key: String,
+    base_url: String,
+    model: String,
+    dimensions: usize,
+}
+
+impl NomicEmbeddingProvider {
+    fn from_env() -> Option<Self> {
+        let api_key = std::env::var("NOMIC_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())?;
+        Some(Self {
+            api_key,
+            base_url: std::env::var("NOMIC_API_BASE")
+                .unwrap_or_else(|_| NOMIC_EMBEDDING_BASE_URL.to_owned()),
+            model: std::env::var("NOMIC_EMBED_MODEL")
+                .unwrap_or_else(|_| NOMIC_EMBEDDING_MODEL.to_owned()),
+            dimensions: std::env::var("NOMIC_EMBED_DIMENSIONS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(NOMIC_EMBEDDING_DIMENSIONS),
         })
-        .map_err(|err| tool_error("brain_search", err))
-}
-
-async fn try_nomic_semantic_search(
-    query: &str,
-    workspace_scope: Option<&str>,
-    limit: usize,
-) -> anyhow::Result<Option<Vec<xai_grok_brain::RecalledMemoryPage>>> {
-    let Some(api_key) = std::env::var("NOMIC_API_KEY")
-        .ok()
-        .filter(|key| !key.trim().is_empty())
-    else {
-        return Ok(None);
-    };
-    let pages_and_sources = {
-        let service = xai_grok_brain::BrainService::open_grok_default()?;
-        service
-            .list_pages(workspace_scope)?
-            .into_iter()
-            .map(|page| {
-                let sources = service
-                    .sources(page.id)?
-                    .into_iter()
-                    .map(|source| source.label)
-                    .filter(|label| !label.trim().is_empty())
-                    .collect::<Vec<_>>();
-                Ok::<_, xai_grok_brain::BrainError>((page, sources))
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    if pages_and_sources.is_empty() {
-        return Ok(Some(Vec::new()));
     }
 
-    let mut inputs = Vec::with_capacity(pages_and_sources.len() + 1);
-    inputs.push(query.to_owned());
-    inputs.extend(pages_and_sources.iter().map(|(page, _)| {
-        format!(
-            "{}\ncategory: {}\nfreshness: {}\n{}",
-            page.title,
-            page.category.as_str(),
-            page.freshness.as_str(),
-            page.memory_text
-        )
-    }));
-    let input_refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
-    let embeddings = nomic_embed(&api_key, &input_refs).await?;
-    if embeddings.len() != inputs.len() || embeddings[0].is_empty() {
-        anyhow::bail!("unexpected Nomic embedding count/dimensions");
-    }
-    let query_vec = &embeddings[0];
-    let mut scored = Vec::new();
-    for (idx, (page, source_labels)) in pages_and_sources.into_iter().enumerate() {
-        let semantic = cosine_similarity(query_vec, &embeddings[idx + 1]);
-        scored.push(xai_grok_brain::RecalledMemoryPage {
-            page,
-            score: (semantic * 10_000.0).round() as i64,
-            source_labels,
+    async fn embed_inner(&self, inputs: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": inputs,
+            "dimensions": self.dimensions,
         });
-    }
-    scored.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then_with(|| b.page.updated_at.cmp(&a.page.updated_at))
-            .then_with(|| b.page.id.cmp(&a.page.id))
-    });
-    scored.truncate(limit);
-    Ok(Some(scored))
-}
-
-async fn nomic_embed(api_key: &str, inputs: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-    let base =
-        std::env::var("NOMIC_API_BASE").unwrap_or_else(|_| "https://api.nomic.ai/v1".to_owned());
-    let model =
-        std::env::var("NOMIC_EMBED_MODEL").unwrap_or_else(|_| "nomic-embed-text-v1.5".to_owned());
-    let dimensions = std::env::var("NOMIC_EMBED_DIMENSIONS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(768);
-    let body = serde_json::json!({
-        "model": model,
-        "input": inputs,
-        "dimensions": dimensions,
-    });
-    let response = reqwest::Client::new()
-        .post(format!("{}/embeddings", base.trim_end_matches('/')))
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Nomic embeddings API error {status}: {body}");
-    }
-    let json: serde_json::Value = response.json().await?;
-    let data = json
-        .get("data")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| anyhow::anyhow!("Nomic response missing data array"))?;
-    let mut out = Vec::with_capacity(data.len());
-    for item in data {
-        let embedding = item
-            .get("embedding")
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/embeddings",
+                self.base_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Nomic embeddings API error {status}: {body}");
+        }
+        let json: serde_json::Value = response.json().await?;
+        let data = json
+            .get("data")
             .and_then(|value| value.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Nomic response item missing embedding"))?
-            .iter()
-            .map(|value| {
-                value
-                    .as_f64()
-                    .map(|num| num as f32)
-                    .ok_or_else(|| anyhow::anyhow!("non-numeric embedding component"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        out.push(embedding);
+            .ok_or_else(|| anyhow::anyhow!("Nomic response missing data array"))?;
+        let mut out = Vec::with_capacity(data.len());
+        for item in data {
+            let embedding = item
+                .get("embedding")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| anyhow::anyhow!("Nomic response item missing embedding"))?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_f64()
+                        .map(|num| num as f32)
+                        .ok_or_else(|| anyhow::anyhow!("non-numeric embedding component"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if embedding.len() != self.dimensions {
+                anyhow::bail!(
+                    "Nomic embedding dimension mismatch: expected {}, got {}",
+                    self.dimensions,
+                    embedding.len()
+                );
+            }
+            out.push(embedding);
+        }
+        Ok(out)
     }
-    Ok(out)
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    if a.is_empty() || b.is_empty() || a.len() != b.len() {
-        return 0.0;
+impl xai_grok_brain::BrainEmbeddingProvider for NomicEmbeddingProvider {
+    fn embed<'a>(
+        &'a self,
+        inputs: &'a [&'a str],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<Vec<Vec<f32>>>> + Send + 'a>,
+    > {
+        Box::pin(async move { self.embed_inner(inputs).await })
     }
-    let mut dot = 0.0f64;
-    let mut an = 0.0f64;
-    let mut bn = 0.0f64;
-    for (&x, &y) in a.iter().zip(b) {
-        let x = x as f64;
-        let y = y as f64;
-        dot += x * y;
-        an += x * x;
-        bn += y * y;
+
+    fn model_name(&self) -> &str {
+        &self.model
     }
-    if an == 0.0 || bn == 0.0 {
-        0.0
-    } else {
-        dot / (an.sqrt() * bn.sqrt())
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
     }
 }
 

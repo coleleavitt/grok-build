@@ -127,6 +127,30 @@ async fn brain_search_uses_nomic_compatible_embeddings_then_brain_get_reads_page
     )
     .await
     .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "brain_search must call the Nomic-compatible embeddings endpoint exactly once"
+    );
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "Bearer test-key"
+    );
+    let body: serde_json::Value = requests[0].body_json().unwrap();
+    assert_eq!(body["model"], "nomic-embed-text-v1.5");
+    assert_eq!(body["dimensions"], 2);
+    let inputs = body["input"].as_array().expect("input array");
+    assert_eq!(inputs.len(), 3, "query plus two Brain candidate pages");
+    assert_eq!(inputs[0], "dev branch state");
+    assert!(inputs[1].as_str().unwrap().contains("Branch State"));
+    assert!(inputs[2].as_str().unwrap().contains("Install Safety"));
+
     let output = text(result);
     assert!(output.contains("[workstreams] Branch State"), "{output}");
     assert!(

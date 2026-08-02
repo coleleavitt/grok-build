@@ -13,6 +13,7 @@
 
 mod backfill;
 mod engine_impl;
+mod search;
 mod service;
 mod store;
 #[cfg(test)]
@@ -24,6 +25,10 @@ pub use backfill::{
     BRAIN_MAX_MESSAGES_PER_SESSION, BRAIN_MAX_SESSIONS_PER_RUN, BRAIN_MAX_TRANSCRIPT_CHARS,
     BackfillSelection, PersistedBrainSession, build_bounded_run_context, read_bounded_run_context,
     read_persisted_sessions,
+};
+pub use search::{
+    BrainEmbeddingProvider, BrainSearchEngine, BrainSearchMode, BrainSearchOptions,
+    BrainSearchOutcome, PreparedBrainSearch,
 };
 pub use service::{
     BrainBackfillOutcome, BrainRequest, BrainRequestOutcome, BrainService, CurrentStateMemory,
