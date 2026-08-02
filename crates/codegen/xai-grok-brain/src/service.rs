@@ -10,11 +10,12 @@ use std::path::{Path, PathBuf};
 use crate::backfill::{BackfillSelection, read_bounded_run_context};
 use crate::engine::{ExtractionProvider, RunContext, RunOutcome, run_self_improvement};
 use crate::{
-    BrainSettings, BrainSettingsUpdate, BrainStore, MemoryCategory, MemoryGraph, MemoryPage,
-    MemorySource, MemorySourceType, NewPage, Result,
+    BrainSettings, BrainSettingsUpdate, BrainStatus, BrainStore, MemoryCategory, MemoryGraph,
+    MemoryPage, MemoryRevision, MemorySource, MemorySourceType, NewPage, RecallOptions,
+    RecalledMemoryPage, Result,
 };
 
-const MAX_RECALLED_PAGES: usize = 12;
+const MAX_RECALLED_PAGES: usize = 20;
 
 /// A user prompt entering Grok Build's request path.
 #[derive(Debug, Clone)]
@@ -25,6 +26,8 @@ pub struct BrainRequest<'a> {
     pub prompt_id: &'a str,
     /// The real user query text, before model sampling.
     pub user_text: &'a str,
+    /// Active workspace/repo scope id, when known.
+    pub workspace_scope: Option<&'a str>,
 }
 
 /// Result of processing one request through the Brain integration boundary.
@@ -93,7 +96,8 @@ impl BrainService {
             });
         }
 
-        let injected_context = self.recall_context(request.user_text)?;
+        let injected_context =
+            self.recall_context_scoped(request.user_text, request.workspace_scope)?;
         let remembered_page = self.remember_from_request(request)?;
         Ok(BrainRequestOutcome {
             injected_context,
@@ -105,17 +109,28 @@ impl BrainService {
     /// The first implementation intentionally favors recall determinism over
     /// ranking sophistication: the local CLI store is small, and a complete
     /// bounded block proves the request path receives the durable fact.
-    pub fn recall_context(&self, _query: &str) -> Result<Option<String>> {
+    pub fn recall_context(&self, query: &str) -> Result<Option<String>> {
+        self.recall_context_scoped(query, None)
+    }
+
+    /// Render recalled pages for an active workspace scope.
+    pub fn recall_context_scoped(
+        &self,
+        query: &str,
+        workspace_scope: Option<&str>,
+    ) -> Result<Option<String>> {
         if !self.store.settings()?.enabled {
             return Ok(None);
         }
-        let pages = self.store.list_pages()?;
+        let pages = self.store.recall_pages(RecallOptions {
+            query: query.to_owned(),
+            workspace_scope: workspace_scope.map(str::to_owned),
+            limit: MAX_RECALLED_PAGES,
+        })?;
         if pages.is_empty() {
             return Ok(None);
         }
-        Ok(Some(format_brain_context(
-            pages.into_iter().take(MAX_RECALLED_PAGES),
-        )))
+        Ok(Some(format_recalled_brain_context(pages.into_iter())))
     }
 
     /// Run deterministic-provider self-improvement through the service boundary.
@@ -157,6 +172,26 @@ impl BrainService {
         Ok(BrainBackfillOutcome { selection, outcome })
     }
 
+    /// Aggregated status.
+    pub fn status(&self) -> Result<BrainStatus> {
+        self.store.status()
+    }
+
+    /// List pages visible in an optional workspace scope.
+    pub fn list_pages(&self, workspace_scope: Option<&str>) -> Result<Vec<MemoryPage>> {
+        self.store.list_pages_for_scope(workspace_scope)
+    }
+
+    /// Delete a page and everything hanging off it (relations, sources,
+    /// revisions cascade in the schema). Returns whether a page was removed.
+    ///
+    /// Recall injects stored pages into every request, so a wrong or junk page
+    /// is not cosmetic — without this the only remedy is editing the SQLite
+    /// file by hand.
+    pub fn forget_page(&self, id: i64) -> Result<bool> {
+        self.store.delete_page(id)
+    }
+
     /// Convenience graph accessor used by integration tests and future UI/API
     /// surfaces.
     pub fn graph(&self) -> Result<MemoryGraph> {
@@ -166,6 +201,16 @@ impl BrainService {
     /// Convenience source accessor.
     pub fn sources(&self, memory_id: i64) -> Result<Vec<MemorySource>> {
         self.store.sources(memory_id)
+    }
+
+    /// List page revisions.
+    pub fn revisions(&self, memory_id: i64) -> Result<Vec<MemoryRevision>> {
+        self.store.revisions(memory_id)
+    }
+
+    /// Restore a page from a revision.
+    pub fn restore_revision(&self, revision_id: i64) -> Result<MemoryPage> {
+        self.store.restore_revision(revision_id)
     }
 
     fn initialize_enabled_if_unconfigured(&self) -> Result<()> {
@@ -182,12 +227,18 @@ impl BrainService {
         let Some(fact) = extract_remembered_fact(request.user_text) else {
             return Ok(None);
         };
-        let page = self.store.create_or_update_page_by_title(NewPage {
-            title: Some(fact.title),
-            memory_text: fact.content,
-            category: fact.category,
-            source: Some("request".to_owned()),
-        })?;
+        let scope = (fact.category != MemoryCategory::Notes)
+            .then_some(request.workspace_scope)
+            .flatten();
+        let page = self.store.create_or_update_page_by_title_scoped(
+            NewPage {
+                title: Some(fact.title),
+                memory_text: fact.content,
+                category: fact.category,
+                source: Some("request".to_owned()),
+            },
+            scope,
+        )?;
         self.store.add_source_if_missing(
             page.id,
             MemorySourceType::ChatSession,
@@ -223,6 +274,11 @@ struct RememberedFact {
     category: MemoryCategory,
 }
 
+/// Maximum length of a remembered fact. A durable memory is a sentence, not a
+/// pasted work item; anything longer is a prompt that merely mentions the word
+/// "remember".
+const REMEMBER_MAX_FACT_CHARS: usize = 320;
+
 fn extract_remembered_fact(input: &str) -> Option<RememberedFact> {
     let text = input.trim();
     if text.is_empty() {
@@ -236,17 +292,26 @@ fn extract_remembered_fact(input: &str) -> Option<RememberedFact> {
         "remember:",
         "remember ",
     ];
+    // The trigger must open the message or a line inside it. Matching anywhere
+    // turned every prompt that merely discusses remembering into a memory page
+    // titled with the rest of that prompt.
     let mut fact = None;
     for trigger in triggers {
-        if let Some(idx) = lower.find(trigger) {
-            let start = idx + trigger.len();
-            fact = Some(text[start..].trim());
-            break;
-        }
+        let Some(idx) = lower
+            .match_indices(trigger)
+            .map(|(idx, _)| idx)
+            .find(|idx| starts_instruction(&lower, *idx))
+        else {
+            continue;
+        };
+        fact = Some(text[idx + trigger.len()..].trim());
+        break;
     }
-    let fact = fact?.trim_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
-    let fact = fact.trim_end_matches(['.', '!', '?']).trim();
-    if fact.is_empty() {
+    // A fact is a single statement: stop at the first line break, then at the
+    // first sentence end, so a trailing prompt body never lands in the page.
+    let fact = first_sentence(fact?.lines().next().unwrap_or_default().trim());
+    let fact = fact.trim_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
+    if fact.is_empty() || fact.chars().count() > REMEMBER_MAX_FACT_CHARS {
         return None;
     }
 
@@ -256,6 +321,31 @@ fn extract_remembered_fact(input: &str) -> Option<RememberedFact> {
         content,
         category,
     })
+}
+
+/// Whether `idx` opens the text or a line within it (allowing a leading
+/// bullet/quote marker), i.e. the user is issuing an instruction rather than
+/// mentioning the word mid-sentence.
+fn starts_instruction(lower: &str, idx: usize) -> bool {
+    let line_start = lower[..idx].rfind('\n').map_or(0, |newline| newline + 1);
+    lower[line_start..idx]
+        .chars()
+        .all(|ch| matches!(ch, ' ' | '\t' | '>' | '-' | '*' | '"' | '\'' | '`'))
+}
+
+/// Text up to the first sentence end. A period only ends a sentence when
+/// whitespace (or the end of the text) follows, so `https://x.ai/v1` and
+/// `v1.2.3` survive intact.
+fn first_sentence(text: &str) -> &str {
+    for (idx, ch) in text.char_indices() {
+        if matches!(ch, '.' | '!' | '?') {
+            let rest = &text[idx + ch.len_utf8()..];
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return &text[..idx];
+            }
+        }
+    }
+    text
 }
 
 fn derive_title_content_category(fact: &str) -> (String, String, MemoryCategory) {
@@ -324,17 +414,30 @@ fn title_case_subject(subject: &str) -> String {
         .join(" ")
 }
 
-fn format_brain_context(pages: impl Iterator<Item = MemoryPage>) -> String {
+fn format_recalled_brain_context(pages: impl Iterator<Item = RecalledMemoryPage>) -> String {
     let mut out = String::from(
         "<brain_context>\nThe following durable Brain memories were recalled for this request:\n",
     );
-    for page in pages {
+    for recalled in pages {
+        let page = recalled.page;
         out.push_str(&format!(
             "- [{}] {}: {}\n",
             page.category.as_str(),
             page.title,
             page.memory_text.trim()
         ));
+        if !recalled.source_labels.is_empty() {
+            let labels = recalled
+                .source_labels
+                .iter()
+                .take(2)
+                .map(|label| label.trim())
+                .filter(|label| !label.is_empty())
+                .collect::<Vec<_>>();
+            if !labels.is_empty() {
+                out.push_str(&format!("  Sources: {}\n", labels.join(", ")));
+            }
+        }
     }
     out.push_str("</brain_context>");
     out
@@ -345,6 +448,80 @@ mod tests {
     use super::*;
     use crate::engine::{DocumentSource, ExtractedPage, ExtractionInput, SessionSource, SourceRef};
     use std::sync::Mutex;
+
+    /// Real prompts that merely discuss remembering must not become pages.
+    /// These two shapes are exactly what polluted a live store: a work-item
+    /// paste quoting `Brain Updated: Remembered #12 ...`, and a long question
+    /// with "remember" buried mid-sentence.
+    #[test]
+    fn mid_sentence_mentions_do_not_create_a_fact() {
+        for prompt in [
+            "Updates: - E.g. `Brain Updated: Remembered #12 [notes] Visible Feedback.` \
+             Verification passed: rustfmt --check on the focused Brain/shell files.",
+            "how like i could like upload sharepoint documents or select folders like \
+             read our existing modals and stuff right, do you remember how sharepoint \
+             ingestion worked in the connector",
+            "Can you check whether the agent will remember this across sessions?",
+            "The tool output said: remember to rerun the gate before merging",
+        ] {
+            assert_eq!(
+                extract_remembered_fact(prompt),
+                None,
+                "must not extract a fact from: {prompt}"
+            );
+        }
+    }
+
+    /// The instruction forms still work, and only the instruction itself is
+    /// stored — not the rest of a long prompt that follows it.
+    #[test]
+    fn instruction_forms_extract_only_the_first_statement() {
+        let fact = extract_remembered_fact(
+            "Please remember that my project codename is Zephyr-Nine. Now go run the tests \
+             and report back with the full diff, then open a PR.",
+        )
+        .expect("an explicit instruction is a fact");
+        assert_eq!(fact.title, "Project Codename");
+        assert_eq!(fact.content, "The user's project codename is Zephyr-Nine.");
+
+        let bulleted = extract_remembered_fact("- remember: the deploy script lives in bin/deploy")
+            .expect("a bulleted instruction line is a fact");
+        assert!(
+            bulleted.content.contains("bin/deploy"),
+            "content: {}",
+            bulleted.content
+        );
+
+        let multiline = extract_remembered_fact(
+            "Here is the context I pasted.\nRemember that the ERS staging host is ers-stage-1\n\
+             and here is a pile of unrelated log output that must not be stored.",
+        )
+        .expect("an instruction opening a line is a fact");
+        assert!(
+            !multiline.content.contains("log output"),
+            "content must stop at the line: {}",
+            multiline.content
+        );
+    }
+
+    /// A dotted value is not a sentence boundary.
+    #[test]
+    fn dotted_values_survive_sentence_trimming() {
+        let fact = extract_remembered_fact("remember that the ERS base url is https://ers.x.ai/v1")
+            .expect("instruction is a fact");
+        assert!(
+            fact.content.contains("https://ers.x.ai/v1"),
+            "content: {}",
+            fact.content
+        );
+    }
+
+    /// An oversized "fact" is a pasted document, not a memory.
+    #[test]
+    fn oversized_statements_are_rejected() {
+        let long = format!("Remember that {}", "x".repeat(REMEMBER_MAX_FACT_CHARS + 1));
+        assert_eq!(extract_remembered_fact(&long), None);
+    }
 
     #[test]
     fn remember_request_creates_record_source_and_later_context_after_reopen() {
@@ -363,6 +540,7 @@ mod tests {
                 session_id: "session-1",
                 prompt_id: "prompt-1",
                 user_text: "Please remember that my project codename is Zephyr-Nine.",
+                workspace_scope: None,
             })
             .unwrap();
         let page = first
@@ -384,6 +562,7 @@ mod tests {
                 session_id: "session-2",
                 prompt_id: "prompt-2",
                 user_text: "What is my project codename?",
+                workspace_scope: None,
             })
             .unwrap();
         let context = later.injected_context.expect("later request recalls page");
@@ -407,6 +586,7 @@ mod tests {
                 session_id: "session-1",
                 prompt_id: "prompt-1",
                 user_text: "Remember that my project codename is Zephyr-One.",
+                workspace_scope: None,
             })
             .unwrap()
             .remembered_page
@@ -416,6 +596,7 @@ mod tests {
                 session_id: "session-1",
                 prompt_id: "prompt-1",
                 user_text: "Remember that my project codename is Zephyr-Two.",
+                workspace_scope: None,
             })
             .unwrap()
             .remembered_page
@@ -427,6 +608,73 @@ mod tests {
     }
 
     #[test]
+    fn scoped_recall_context_includes_compact_source_labels() {
+        let service = BrainService::open_in_memory_for_tests();
+        service
+            .update_settings(BrainSettingsUpdate {
+                enabled: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        let global = service
+            .store
+            .create_page(NewPage {
+                title: Some("User Shell Path Preference".to_owned()),
+                memory_text: "The user prefers relative paths.".to_owned(),
+                category: MemoryCategory::Notes,
+                source: None,
+            })
+            .unwrap();
+        let workspace = service
+            .store
+            .create_page_scoped(
+                NewPage {
+                    title: Some("ERS Deploy Script".to_owned()),
+                    memory_text: "The ERS deploy script validates signing keys before deploy."
+                        .to_owned(),
+                    category: MemoryCategory::Workstreams,
+                    source: None,
+                },
+                Some("/repo/ers-rs"),
+            )
+            .unwrap();
+        for label in [
+            "ERS API Request Signing",
+            "Deploy script preflight",
+            "Extra source label should be omitted from context",
+        ] {
+            service
+                .store
+                .add_source(
+                    workspace.id,
+                    MemorySourceType::ChatSession,
+                    label,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+
+        let context = service
+            .recall_context_scoped("deploy signing keys", Some("/repo/ers-rs"))
+            .unwrap()
+            .expect("enabled store should recall pages");
+        let workspace_pos = context.find("ERS Deploy Script").unwrap();
+        let global_pos = context.find("User Shell Path Preference").unwrap();
+        assert!(
+            workspace_pos < global_pos,
+            "query/workspace page should rank first: {context}"
+        );
+        assert!(context.contains("Sources: ERS API Request Signing, Deploy script preflight"));
+        assert!(
+            !context.contains("Extra source label should be omitted"),
+            "context should keep citations compact: {context}",
+        );
+        assert!(context.contains(&format!("[{}]", MemoryCategory::Workstreams.as_str())));
+        assert!(context.contains(&global.title));
+    }
+
+    #[test]
     fn disabled_settings_do_not_create_or_recall() {
         let service = BrainService::open_in_memory_for_tests();
         let outcome = service
@@ -434,6 +682,7 @@ mod tests {
                 session_id: "s",
                 prompt_id: "p",
                 user_text: "Remember that my favorite language is Rust.",
+                workspace_scope: None,
             })
             .unwrap();
         assert!(outcome.injected_context.is_none());

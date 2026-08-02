@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::process::Stdio;
 
+use chrono::Utc;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
@@ -69,6 +70,7 @@ const CLAUDE_BETAS: &[&str] = &[
     "fast-mode-2026-02-01",
     "afk-mode-2026-01-31",
     "task-budgets-2026-03-13",
+    "advisor-tool-2026-03-01",
 ];
 
 /// Per-request `x-grok-*` headers. Optional fields are skipped when empty/`None`.
@@ -224,6 +226,21 @@ fn extract_context_total(value: &serde_json::Value) -> Option<u32> {
     Some(i.saturating_add(o))
 }
 
+const RESPONSES_KEEPALIVE_EVENT_TYPE: &str = "keepalive";
+
+/// Returns true for liveness-only Responses API frames that should never reach
+/// async-openai's closed `ResponseStreamEvent` enum.
+fn is_responses_keepalive_event(event_name: &str, data: &str) -> bool {
+    if event_name == RESPONSES_KEEPALIVE_EVENT_TYPE {
+        return true;
+    }
+
+    data.contains(RESPONSES_KEEPALIVE_EVENT_TYPE)
+        && serde_json::from_str::<serde_json::Value>(data).is_ok_and(|value| {
+            value.get("type").and_then(|kind| kind.as_str()) == Some(RESPONSES_KEEPALIVE_EVENT_TYPE)
+        })
+}
+
 /// Record `success=false` + `error` on the active inference span when a stream
 /// request fails before any response (transport/connect/TLS errors). Without
 /// this the `#[instrument]` span closes with both fields Empty, so an outage
@@ -236,10 +253,36 @@ fn record_stream_request_failure(err: &reqwest::Error) {
 
 fn extract_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     headers
-        .get(reqwest::header::RETRY_AFTER)
+        .get("retry-after-ms")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
+        .and_then(parse_retry_after_ms)
+        .or_else(|| {
+            headers
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_retry_after_header)
+        })
         .map(|s| s.min(120))
+}
+
+fn parse_retry_after_ms(raw: &str) -> Option<u64> {
+    let ms = raw.trim().parse::<u64>().ok()?;
+    Some(ms.saturating_add(999) / 1000)
+}
+
+fn parse_retry_after_header(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if let Ok(seconds) = trimmed.parse::<u64>() {
+        return Some(seconds);
+    }
+    chrono::DateTime::parse_from_rfc2822(trimmed)
+        .ok()
+        .map(|dt| {
+            dt.with_timezone(&Utc)
+                .signed_duration_since(Utc::now())
+                .num_seconds()
+                .max(0) as u64
+        })
 }
 
 fn extract_should_retry(headers: &reqwest::header::HeaderMap) -> Option<bool> {
@@ -255,6 +298,181 @@ fn extract_should_retry(headers: &reqwest::header::HeaderMap) -> Option<bool> {
                 None // unknown value — treat as absent
             }
         })
+}
+
+/// A request field the provider rejected, removed from the body so the
+/// request can be retried once without it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StrippedRequestField {
+    /// Dotted path of the containing object (empty for the request root).
+    pub path: String,
+    /// The removed key.
+    pub key: String,
+}
+
+impl std::fmt::Display for StrippedRequestField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.path.is_empty() {
+            write!(f, "{}", self.key)
+        } else {
+            write!(f, "{}.{}", self.path, self.key)
+        }
+    }
+}
+
+/// Extract the identifier a provider named in a 400 as unsupported.
+///
+/// Anthropic reports two shapes we can act on:
+/// - `` `temperature` is deprecated for this model. `` — a root parameter.
+/// - `output_config.format.schema: For 'array' type, property 'maxItems' is
+///   not supported` — a keyword somewhere under a dotted path.
+///
+/// The named field is the last quoted identifier before the complaint, so
+/// `For 'array' type, property 'maxItems' is not supported` yields `maxItems`,
+/// not the `'array'` type name it mentions in passing.
+fn parse_rejected_request_field(server_message: &str) -> Option<StrippedRequestField> {
+    let lower = server_message.to_ascii_lowercase();
+    let complaint = ["is not supported", "unsupported", "deprecated"]
+        .iter()
+        .filter_map(|marker| lower.find(marker))
+        .min()?;
+
+    // Path-scoped keyword: `<dotted.path>: ... property 'name' is not supported`.
+    if let Some(key) = rejected_identifier(server_message, '\'', complaint) {
+        return Some(StrippedRequestField {
+            path: rejected_field_path(server_message, complaint),
+            key,
+        });
+    }
+
+    // Root parameter: `` `temperature` is deprecated for this model. ``
+    let key = rejected_identifier(server_message, '`', complaint)?;
+    Some(StrippedRequestField {
+        path: String::new(),
+        key,
+    })
+}
+
+/// Last `delim`-quoted JSON-key-shaped identifier that closes before `limit`.
+fn rejected_identifier(text: &str, delim: char, limit: usize) -> Option<String> {
+    let mut found = None;
+    let mut rest = text;
+    let mut offset = 0usize;
+    while let Some(open) = rest.find(delim) {
+        let value_start = open + delim.len_utf8();
+        let Some(close) = rest[value_start..].find(delim) else {
+            break;
+        };
+        let candidate = &rest[value_start..value_start + close];
+        let candidate_end = offset + value_start + close;
+        if candidate_end > limit {
+            break;
+        }
+        if !candidate.is_empty()
+            && candidate
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            found = Some(candidate.to_owned());
+        }
+        let consumed = value_start + close + delim.len_utf8();
+        offset += consumed;
+        rest = &rest[consumed..];
+    }
+    found
+}
+
+/// Dotted request path a provider named, e.g. `output_config.format.schema` in
+/// `invalid_request_error: output_config.format.schema: For 'array' type, ...`.
+///
+/// Only tokens that actually look like a nested path (they contain a `.`)
+/// qualify, so the leading `invalid_request_error:` error class and a trailing
+/// `this model.` are both ignored. An empty path means the request root.
+fn rejected_field_path(text: &str, limit: usize) -> String {
+    text.get(..limit)
+        .unwrap_or(text)
+        .split_whitespace()
+        .map(|token| token.trim_matches(|ch| matches!(ch, ':' | ',' | '.' | '`' | '\'')))
+        .filter(|token| {
+            token.contains('.')
+                && token
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
+        })
+        .next_back()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Remove a provider-rejected field from a serialized request body.
+///
+/// Returns the removed field when the body actually changed, so callers only
+/// retry when the retry would differ. A root field is removed from the top
+/// level; a path-scoped keyword is removed from every object under that path
+/// (JSON Schema nests the same keyword at any depth).
+fn strip_rejected_request_field(
+    body: &mut serde_json::Value,
+    field: &StrippedRequestField,
+) -> bool {
+    if field.path.is_empty() {
+        return body
+            .as_object_mut()
+            .is_some_and(|map| map.remove(&field.key).is_some());
+    }
+    let mut node = body;
+    for segment in field.path.split('.') {
+        let Some(next) = node.get_mut(segment) else {
+            return false;
+        };
+        node = next;
+    }
+    remove_key_recursively(node, &field.key)
+}
+
+fn remove_key_recursively(node: &mut serde_json::Value, key: &str) -> bool {
+    match node {
+        serde_json::Value::Object(map) => {
+            let mut removed = map.remove(key).is_some();
+            for value in map.values_mut() {
+                removed |= remove_key_recursively(value, key);
+            }
+            removed
+        }
+        serde_json::Value::Array(items) => {
+            let mut removed = false;
+            for item in items {
+                removed |= remove_key_recursively(item, key);
+            }
+            removed
+        }
+        _ => false,
+    }
+}
+
+/// Fields a provider has already rejected, keyed by model id.
+///
+/// A rejection is a stable property of the model ("`temperature` is deprecated
+/// for this model"), so remembering it turns the fix into a single wasted
+/// round-trip per model per process instead of one on every request. Clients
+/// are constructed per request in the shell, so this outlives them.
+static REJECTED_REQUEST_FIELDS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<StrippedRequestField>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn remembered_rejected_fields(model_id: &str) -> Vec<StrippedRequestField> {
+    REJECTED_REQUEST_FIELDS
+        .lock()
+        .map(|memo| memo.get(model_id).cloned().unwrap_or_default())
+        .unwrap_or_default()
+}
+
+fn remember_rejected_field(model_id: &str, field: &StrippedRequestField) {
+    if let Ok(mut memo) = REJECTED_REQUEST_FIELDS.lock() {
+        let fields = memo.entry(model_id.to_owned()).or_default();
+        if !fields.contains(field) {
+            fields.push(field.clone());
+        }
+    }
 }
 
 fn encode_provider_tool_name(name: &str, prefix: &str) -> String {
@@ -391,6 +609,72 @@ fn ensure_claude_code_system_blocks(request: &mut messages::MessagesRequest) {
         blocks.insert(0, text_block(billing_header_text(request)));
     }
     request.system = Some(messages::SystemParam::Blocks(blocks));
+}
+
+/// Strip `thinking` blocks the real Anthropic API would reject.
+///
+/// The Messages request builder replays every stored reasoning sibling as a
+/// `thinking` content block. That is correct for the xAI Messages backend
+/// (which wants `tco_*` blobs and prior-turn reasoning back verbatim for
+/// prefix-cache continuity), but `api.anthropic.com` cryptographically
+/// validates every replayed block and fails the whole request with
+/// `messages.N.content.M: Invalid \`signature\` in \`thinking\` block` when
+/// any block does not verify — e.g. reasoning that crossed a provider or
+/// account switch, was mutated by compaction, or was collapsed from
+/// interleaved thinking.
+///
+/// Per the extended-thinking contract, thinking blocks from prior turns may
+/// always be omitted (the server strips them from context anyway); only the
+/// final assistant message of an in-flight tool-use loop must retain its
+/// thinking. So:
+///
+/// - thinking disabled for this request → drop every thinking block
+///   (the API 400s on thinking blocks without a `thinking` config);
+/// - assistant messages before the final one → drop thinking blocks;
+/// - final assistant message without `tool_use` → drop thinking blocks
+///   (not required for continuation, so sending them is pure risk);
+/// - final assistant message with `tool_use` → keep only blocks carrying
+///   both thinking text and a signature (unsigned text or signature-only
+///   blobs can never validate);
+/// - messages left with no content (thinking-only turns) are removed
+///   entirely, because the API rejects empty content arrays.
+fn sanitize_thinking_blocks(request: &mut messages::MessagesRequest) {
+    let thinking_enabled = matches!(
+        request.thinking,
+        Some(messages::ThinkingConfig::Enabled { .. } | messages::ThinkingConfig::Adaptive { .. })
+    );
+    let last_assistant = request
+        .messages
+        .iter()
+        .rposition(|message| matches!(message.role, messages::MessageRole::Assistant));
+
+    let mut original_index = 0usize;
+    request.messages.retain_mut(|message| {
+        let index = original_index;
+        original_index += 1;
+        if !matches!(message.role, messages::MessageRole::Assistant) {
+            return true;
+        }
+        let messages::MessageContent::Blocks(blocks) = &mut message.content else {
+            // Plain-text assistant content cannot contain thinking blocks.
+            return true;
+        };
+        if blocks.is_empty() {
+            return true;
+        }
+        let has_tool_use = blocks
+            .iter()
+            .any(|block| matches!(block, messages::ContentBlock::ToolUse { .. }));
+        let keep_thinking = thinking_enabled && Some(index) == last_assistant && has_tool_use;
+        blocks.retain(|block| match block {
+            messages::ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => keep_thinking && !thinking.is_empty() && !signature.is_empty(),
+            _ => true,
+        });
+        !blocks.is_empty()
+    });
 }
 
 fn hex_prefix(bytes: &[u8], len: usize) -> String {
@@ -631,6 +915,7 @@ impl std::fmt::Debug for SamplingClient {
 struct ClientDefaults {
     model: String,
     max_completion_tokens: Option<u32>,
+    context_window: u64,
     temperature: Option<f32>,
     top_p: Option<f32>,
     api_backend: ApiBackend,
@@ -638,6 +923,7 @@ struct ClientDefaults {
     stream_tool_calls: bool,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
     provider_request_adapter: Option<ProviderRequestAdapter>,
+    advisor_server_model: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -829,6 +1115,9 @@ impl SamplingClient {
     /// pre-computes the default request headers. This does not perform
     /// any network I/O.
     pub fn new(config: SamplerConfig) -> Result<Self> {
+        // Arms the `GROK_AUTH_TRACE` linkscope gate before the first request
+        // so auth traces cover the whole client lifetime. No-op when unset.
+        crate::auth_trace::trace_enabled();
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if let Some(ref api_key) = config.api_key {
@@ -958,6 +1247,7 @@ impl SamplingClient {
         let defaults = ClientDefaults {
             model: config.model,
             max_completion_tokens: config.max_completion_tokens,
+            context_window: config.context_window,
             temperature: config.temperature,
             top_p: config.top_p,
             api_backend: config.api_backend,
@@ -965,6 +1255,7 @@ impl SamplingClient {
             stream_tool_calls: config.stream_tool_calls,
             doom_loop_recovery: config.doom_loop_recovery,
             provider_request_adapter: config.provider_request_adapter,
+            advisor_server_model: config.advisor_server_model,
         };
 
         let endpoint = EndpointTemplate::new(&config.base_url, &config.query_params);
@@ -1049,6 +1340,7 @@ impl SamplingClient {
         else {
             return;
         };
+        sanitize_thinking_blocks(request);
         ensure_claude_code_system_blocks(request);
         if let Some(tools) = request.tools.as_mut() {
             for tool in tools {
@@ -1057,7 +1349,45 @@ impl SamplingClient {
         }
     }
 
-    fn apply_anthropic_cli_headers(&self, headers: &mut HeaderMap, model: &str) {
+    /// Whether the server-side advisor tool (beta header + raw tool
+    /// injection) is active for this client: only on the Anthropic
+    /// Messages API, over OAuth (Bearer) auth, going through the
+    /// Anthropic adapter, with an advisor model configured.
+    fn advisor_gate_active(&self) -> bool {
+        self.defaults.api_backend == ApiBackend::Messages
+            && is_anthropic_adapter(self.defaults.provider_request_adapter.as_ref())
+            && self.defaults.auth_scheme == AuthScheme::Bearer
+            && self.defaults.advisor_server_model.is_some()
+    }
+
+    /// Injects the wrapper's `extra_raw_tools` (plus the server advisor
+    /// tool, when [`Self::advisor_gate_active`]) into the serialized
+    /// Messages request body's `tools` array. Mirrors the Responses API
+    /// `extra_raw_tools` injection.
+    fn inject_messages_extra_tools(
+        &self,
+        extra_raw_tools: &mut Vec<serde_json::Value>,
+        body: &mut serde_json::Value,
+    ) {
+        if self.advisor_gate_active() {
+            if let Some(model) = self.defaults.advisor_server_model.as_deref() {
+                extra_raw_tools.push(serde_json::json!({
+                    "type": "advisor_20260301",
+                    "name": "advisor",
+                    "model": model,
+                }));
+            }
+        }
+        if !extra_raw_tools.is_empty() {
+            if let Some(tools) = body.get_mut("tools").and_then(|v| v.as_array_mut()) {
+                tools.extend(extra_raw_tools.drain(..));
+            } else {
+                body["tools"] = serde_json::Value::Array(std::mem::take(extra_raw_tools));
+            }
+        }
+    }
+
+    fn apply_anthropic_cli_headers(&self, headers: &mut HeaderMap, _model: &str) {
         if !is_anthropic_adapter(self.defaults.provider_request_adapter.as_ref()) {
             return;
         }
@@ -1069,7 +1399,8 @@ impl SamplingClient {
             .iter()
             .copied()
             .filter(|beta| {
-                *beta != "context-1m-2025-08-07" || !model.to_ascii_lowercase().contains("haiku")
+                (*beta != "context-1m-2025-08-07" || self.defaults.context_window > 200_000)
+                    && (*beta != "advisor-tool-2026-03-01" || self.advisor_gate_active())
             })
             .collect();
         for beta in existing.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -1114,8 +1445,7 @@ impl SamplingClient {
         else {
             return Ok(bytes.to_vec());
         };
-        let body =
-            std::str::from_utf8(bytes).map_err(|e| SamplingError::serialization_message(e))?;
+        let body = std::str::from_utf8(bytes).map_err(SamplingError::serialization_message)?;
         Ok(self.adapt_messages_event_json(body).into_bytes())
     }
 
@@ -1929,16 +2259,17 @@ impl SamplingClient {
                             data = %data,
                         );
 
-                        // Intercept the non-standard doom-loop event before
-                        // typed deserialization; async-openai's event enum
-                        // does not know it and would fail to parse it. With
-                        // the check disabled, the shared name-or-payload-type
-                        // predicate guards against a server emitting it
+                        // Intercept liveness-only and non-standard events before
+                        // typed deserialization; async-openai's event enum does
+                        // not know them and would fail to parse them. With the
+                        // doom-loop check disabled, the shared name-or-payload-type
+                        // predicate still guards against a server emitting it
                         // despite no opt-in (rollout skew), named or not.
-                        let swallow = match &doom_loop_for_stream {
-                            Some(collector) => collector.absorb(&event.event, data),
-                            None => is_check_event(&event.event, data),
-                        };
+                        let swallow = is_responses_keepalive_event(&event.event, data)
+                            || match &doom_loop_for_stream {
+                                Some(collector) => collector.absorb(&event.event, data),
+                                None => is_check_event(&event.event, data),
+                            };
                         if swallow {
                             Some(None)
                         } else if let Some(stream_error) = try_parse_stream_error(data) {
@@ -2023,28 +2354,71 @@ impl SamplingClient {
             tracing::error!("Failed to serialize messages request: {}", e);
             SamplingError::Serialization(e)
         })?;
+        self.inject_messages_extra_tools(&mut request.extra_raw_tools, &mut request_body);
         let mut headers = self.request_headers();
         self.apply_anthropic_cli_headers(&mut headers, &model_id);
         self.apply_command_adapter("messages", &model_id, &mut headers, &mut request_body)
             .await?;
-        let request_body = self.serialize_messages_body(&request_body)?;
-        let http_request = grok_headers
-            .apply(self.http.post(self.endpoint("messages")).headers(headers))
-            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-            .body(request_body);
+        // Same provider-rejection retry as the streaming path: strip the field
+        // the provider named in a 400 and send once more without it. Fields
+        // this model already rejected in this process are dropped up front.
+        let mut stripped = remembered_rejected_fields(&model_id);
+        for field in &stripped {
+            strip_rejected_request_field(&mut request_body, field);
+        }
+        let bytes = loop {
+            let serialized_body = self.serialize_messages_body(&request_body)?;
+            let payload_stats = crate::auth_trace::log_request(
+                "messages",
+                x_grok_req_id,
+                &model_id,
+                &self.base_url,
+                &headers,
+                serialized_body.as_bytes(),
+            );
+            let http_request = grok_headers
+                .apply(
+                    self.http
+                        .post(self.endpoint("messages"))
+                        .headers(headers.clone()),
+                )
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                .body(serialized_body);
 
-        let response = http_request.send().await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {}", e);
-            e
-        })?;
+            let response = http_request.send().await.map_err(|e| {
+                tracing::debug!("HTTP request failed: {}", e);
+                e
+            })?;
 
-        let status = response.status();
-        let model_metadata = extract_model_metadata(response.headers());
-        let retry_after_secs = extract_retry_after(response.headers());
-        let should_retry = extract_should_retry(response.headers());
-        let bytes = response.bytes().await?;
+            let status = response.status();
+            let model_metadata = extract_model_metadata(response.headers());
+            let retry_after_secs = extract_retry_after(response.headers());
+            let should_retry = extract_should_retry(response.headers());
+            if status.is_success() {
+                crate::auth_trace::log_success(
+                    "messages",
+                    x_grok_req_id,
+                    &model_id,
+                    status.as_u16(),
+                    Some(&payload_stats),
+                    response.headers(),
+                );
+            } else {
+                crate::auth_trace::log_rejection(
+                    "messages",
+                    x_grok_req_id,
+                    &model_id,
+                    status.as_u16(),
+                    Some(&payload_stats),
+                    response.headers(),
+                );
+            }
+            let bytes = response.bytes().await?;
 
-        if !status.is_success() {
+            if status.is_success() {
+                break bytes;
+            }
+
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 self.record_401_attribution(
                     crate::attribution::SamplingConsumer::Messages,
@@ -2058,7 +2432,34 @@ impl SamplingClient {
                 ));
             }
 
-            let message = user_facing_api_error_message(status, bytes.as_ref());
+            let server_message = parse_error_bytes(bytes.as_ref());
+
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && let Some(field) = parse_rejected_request_field(&server_message)
+                && !stripped.contains(&field)
+                && strip_rejected_request_field(&mut request_body, &field)
+            {
+                tracing::warn!(
+                    model_id = %model_id,
+                    field = %field,
+                    server_message = %server_message,
+                    "provider rejected a request field; retrying once without it"
+                );
+                remember_rejected_field(&model_id, &field);
+                stripped.push(field);
+                continue;
+            }
+
+            let req_headers =
+                self.format_request_headers(x_grok_conv_id, x_grok_req_id, &model_id, false);
+
+            let message = self.build_api_error_message(
+                status,
+                &server_message,
+                &self.endpoint("messages"),
+                &req_headers,
+                None,
+            );
             tracing::warn!(
                 status = %status,
                 error_message = %message,
@@ -2073,7 +2474,7 @@ impl SamplingClient {
                 retry_after_secs,
                 should_retry,
             });
-        }
+        };
 
         let bytes = self.adapt_messages_response_bytes(&bytes)?;
         let response_obj =
@@ -2146,40 +2547,74 @@ impl SamplingClient {
             tracing::error!("Failed to serialize messages stream request: {}", e);
             SamplingError::Serialization(e)
         })?;
+        self.inject_messages_extra_tools(&mut request.extra_raw_tools, &mut request_body);
         let mut headers = self.request_headers();
         self.apply_anthropic_cli_headers(&mut headers, &model_id);
         self.apply_command_adapter("messages", &model_id, &mut headers, &mut request_body)
             .await?;
-        let request_body = self.serialize_messages_body(&request_body)?;
-        let http_request = grok_headers
-            .apply(self.http.post(self.endpoint("messages")).headers(headers))
-            .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
-            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-            .body(request_body);
+        // Providers reject some fields deterministically: Anthropic 400s on an
+        // explicit `temperature` for newer models, and on JSON Schema keywords
+        // its structured-output validator does not implement. Those are
+        // body-only failures, so strip the field the provider named and retry
+        // once rather than failing every caller that sets it. Fields this model
+        // already rejected in this process are dropped before the first send.
+        let mut stripped = remembered_rejected_fields(&model_id);
+        for field in &stripped {
+            strip_rejected_request_field(&mut request_body, field);
+        }
+        let (response, status, payload_stats) = loop {
+            let serialized_body = self.serialize_messages_body(&request_body)?;
+            let payload_stats = crate::auth_trace::log_request(
+                "messages_stream",
+                x_grok_req_id,
+                &model_id,
+                &self.base_url,
+                &headers,
+                serialized_body.as_bytes(),
+            );
+            let http_request = grok_headers
+                .apply(
+                    self.http
+                        .post(self.endpoint("messages"))
+                        .headers(headers.clone()),
+                )
+                .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                .body(serialized_body);
 
-        let built_request = http_request.build().map_err(|e| {
-            tracing::error!("Failed to build HTTP request: {}", e);
-            SamplingError::Http(e)
-        })?;
+            let built_request = http_request.build().map_err(|e| {
+                tracing::error!("Failed to build HTTP request: {}", e);
+                SamplingError::Http(e)
+            })?;
 
-        tracing::debug!(
-            url = %built_request.url(),
-            method = %built_request.method(),
-            "Sending messages API stream request"
-        );
-        Self::log_request_headers(&built_request, "messages");
+            tracing::debug!(
+                url = %built_request.url(),
+                method = %built_request.method(),
+                "Sending messages API stream request"
+            );
+            Self::log_request_headers(&built_request, "messages");
 
-        let response = self.http.execute(built_request).await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {}", e);
-            record_stream_request_failure(&e);
-            e
-        })?;
+            let response = self.http.execute(built_request).await.map_err(|e| {
+                tracing::debug!("HTTP request failed: {}", e);
+                record_stream_request_failure(&e);
+                e
+            })?;
 
-        let status = response.status();
-        let span = tracing::Span::current();
-        span.record("status_code", status.as_u16() as i64);
-        span.record("success", status.is_success());
-        if !status.is_success() {
+            let status = response.status();
+            let span = tracing::Span::current();
+            span.record("status_code", status.as_u16() as i64);
+            span.record("success", status.is_success());
+            if status.is_success() {
+                break (response, status, payload_stats);
+            }
+            crate::auth_trace::log_rejection(
+                "messages_stream",
+                x_grok_req_id,
+                &model_id,
+                status.as_u16(),
+                Some(&payload_stats),
+                response.headers(),
+            );
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 span.record("error", "unauthorized (401)");
                 self.record_401_attribution(
@@ -2198,7 +2633,32 @@ impl SamplingClient {
             let retry_after_secs = extract_retry_after(response.headers());
             let should_retry = extract_should_retry(response.headers());
             let bytes = response.bytes().await?;
-            let message = user_facing_api_error_message(status, bytes.as_ref());
+            let server_message = parse_error_bytes(bytes.as_ref());
+
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && let Some(field) = parse_rejected_request_field(&server_message)
+                && !stripped.contains(&field)
+                && strip_rejected_request_field(&mut request_body, &field)
+            {
+                tracing::warn!(
+                    model_id = %model_id,
+                    field = %field,
+                    server_message = %server_message,
+                    "provider rejected a request field; retrying once without it"
+                );
+                remember_rejected_field(&model_id, &field);
+                stripped.push(field);
+                continue;
+            }
+
+            let message = self.build_api_error_message(
+                status,
+                &server_message,
+                &self.endpoint("messages"),
+                &req_headers,
+                Some(&resp_headers),
+            );
+
             span.record("error", message.as_str());
             tracing::error!(
                 status = %status,
@@ -2214,7 +2674,16 @@ impl SamplingClient {
                 retry_after_secs,
                 should_retry,
             });
-        }
+        };
+
+        crate::auth_trace::log_success(
+            "messages_stream",
+            x_grok_req_id,
+            &model_id,
+            status.as_u16(),
+            Some(&payload_stats),
+            response.headers(),
+        );
 
         let model_metadata = extract_model_metadata(response.headers());
 
@@ -2547,6 +3016,128 @@ mod tests {
     use xai_grok_sampling_types::messages;
     use xai_grok_sampling_types::types::ChatRequestMessage;
 
+    /// Anthropic 400s on an explicit `temperature` for newer models. The root
+    /// parameter it names must be recognized and removed so the retry differs.
+    #[test]
+    fn deprecated_root_parameter_is_parsed_and_stripped() {
+        let field = parse_rejected_request_field("`temperature` is deprecated for this model.")
+            .expect("deprecated parameter should be recognized");
+        assert_eq!(field.path, "");
+        assert_eq!(field.key, "temperature");
+        assert_eq!(field.to_string(), "temperature");
+
+        let mut body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "temperature": 0.0,
+            "max_tokens": 2048
+        });
+        assert!(strip_rejected_request_field(&mut body, &field));
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["max_tokens"], 2048);
+        // Second pass changes nothing, so the caller must not retry forever.
+        assert!(!strip_rejected_request_field(&mut body, &field));
+    }
+
+    /// The structured-output validator rejects schema keywords by path. The
+    /// keyword must be removed at every depth under that path, and only there.
+    #[test]
+    fn unsupported_schema_keyword_is_stripped_under_its_path_only() {
+        let field = parse_rejected_request_field(
+            "output_config.format.schema: For 'array' type, property 'maxItems' is not supported",
+        )
+        .expect("unsupported schema keyword should be recognized");
+        assert_eq!(field.path, "output_config.format.schema");
+        assert_eq!(field.key, "maxItems");
+        assert_eq!(field.to_string(), "output_config.format.schema.maxItems");
+
+        let mut body = serde_json::json!({
+            "maxItems": 3,
+            "output_config": {
+                "format": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "pages": {
+                                "type": "array",
+                                "maxItems": 12,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "sources": { "type": "array", "maxItems": 4 }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        assert!(strip_rejected_request_field(&mut body, &field));
+        let schema = &body["output_config"]["format"]["schema"];
+        assert!(schema["properties"]["pages"].get("maxItems").is_none());
+        assert!(
+            schema["properties"]["pages"]["items"]["properties"]["sources"]
+                .get("maxItems")
+                .is_none(),
+            "nested keyword must be stripped too: {schema}"
+        );
+        assert_eq!(schema["properties"]["pages"]["type"], "array");
+        // A same-named key outside the named path is untouched.
+        assert_eq!(body["maxItems"], 3);
+    }
+
+    /// Everything else must fail closed: a real model error must surface as an
+    /// error instead of silently mutating the request and retrying.
+    #[test]
+    fn unrelated_errors_do_not_trigger_a_retry() {
+        for message in [
+            "invalid_request_error: credit balance is too low",
+            "overloaded_error: server is overloaded",
+            "messages.0.content: expected an array",
+        ] {
+            assert_eq!(
+                parse_rejected_request_field(message),
+                None,
+                "must not strip anything for: {message}"
+            );
+        }
+    }
+
+    /// A named field that is not in the body must not trigger a retry: the
+    /// resent request would be byte-identical and loop.
+    #[test]
+    fn absent_field_reports_no_change() {
+        let field = parse_rejected_request_field("`top_k` is deprecated for this model.")
+            .expect("deprecated parameter should be recognized");
+        let mut body = serde_json::json!({ "model": "claude-opus-4-8" });
+        assert!(!strip_rejected_request_field(&mut body, &field));
+    }
+
+    /// The rejection memo makes the fix cost one round-trip per model per
+    /// process: a later request for the same model drops the field up front.
+    #[test]
+    fn rejected_field_is_remembered_per_model() {
+        let field = parse_rejected_request_field("`temperature` is deprecated for this model.")
+            .expect("deprecated parameter should be recognized");
+        let model = "test-model-remembers-temperature";
+        assert!(remembered_rejected_fields(model).is_empty());
+
+        remember_rejected_field(model, &field);
+        remember_rejected_field(model, &field);
+        assert_eq!(remembered_rejected_fields(model), vec![field.clone()]);
+        assert!(
+            remembered_rejected_fields("test-model-unaffected").is_empty(),
+            "the memo must be per model"
+        );
+
+        let mut body = serde_json::json!({ "temperature": 0.0, "max_tokens": 8 });
+        for remembered in remembered_rejected_fields(model) {
+            strip_rejected_request_field(&mut body, &remembered);
+        }
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["max_tokens"], 8);
+    }
+
     fn minimal_config() -> SamplerConfig {
         SamplerConfig {
             api_key: Some("test-key".to_string()),
@@ -2578,6 +3169,7 @@ mod tests {
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             provider_request_adapter: None,
+            advisor_server_model: None,
             header_injector: None,
         }
     }
@@ -2640,6 +3232,260 @@ mod tests {
         }
     }
 
+    fn thinking_block(thinking: &str, signature: &str) -> messages::ContentBlock {
+        messages::ContentBlock::Thinking {
+            thinking: thinking.to_owned(),
+            signature: signature.to_owned(),
+        }
+    }
+
+    fn tool_use_block(id: &str) -> messages::ContentBlock {
+        messages::ContentBlock::ToolUse {
+            id: id.to_owned(),
+            name: "bash".to_owned(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    fn assistant_blocks(blocks: Vec<messages::ContentBlock>) -> messages::Message {
+        messages::Message {
+            role: messages::MessageRole::Assistant,
+            content: messages::MessageContent::Blocks(blocks),
+        }
+    }
+
+    fn user_text(text: &str) -> messages::Message {
+        messages::Message {
+            role: messages::MessageRole::User,
+            content: messages::MessageContent::Text(text.to_owned()),
+        }
+    }
+
+    fn block_types(message: &messages::Message) -> Vec<&'static str> {
+        match &message.content {
+            messages::MessageContent::Text(_) => vec!["text"],
+            messages::MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .map(|block| match block {
+                    messages::ContentBlock::Text { .. } => "text",
+                    messages::ContentBlock::Image { .. } => "image",
+                    messages::ContentBlock::ToolUse { .. } => "tool_use",
+                    messages::ContentBlock::ToolResult { .. } => "tool_result",
+                    messages::ContentBlock::Thinking { .. } => "thinking",
+                })
+                .collect(),
+        }
+    }
+
+    /// Regression: api.anthropic.com validates the signature of every replayed
+    /// `thinking` block and rejects the whole request with
+    /// `messages.N.content.0: Invalid signature in thinking block` (seen after
+    /// a failed compaction retry). Prior-turn thinking must be stripped; only
+    /// the final assistant message of an in-flight tool loop keeps its
+    /// (plausibly valid) thinking.
+    #[test]
+    fn anthropic_adapter_strips_prior_turn_thinking_keeps_final_tool_loop_thinking() {
+        let mut cfg = minimal_config();
+        cfg.api_backend = ApiBackend::Messages;
+        cfg.provider_request_adapter = Some(ProviderRequestAdapter::Anthropic {
+            tool_name_prefix: "mcp__".to_string(),
+            command: None,
+        });
+        let client = SamplingClient::new(cfg).expect("client");
+
+        let mut request = messages::MessagesRequest {
+            thinking: Some(messages::ThinkingConfig::Adaptive {
+                display: Some(messages::ThinkingDisplay::Summarized),
+            }),
+            messages: vec![
+                user_text("do the thing"),
+                // Prior turn: thinking must be stripped even though signed.
+                assistant_blocks(vec![
+                    thinking_block("old reasoning", "sig_old"),
+                    tool_use_block("toolu_1"),
+                ]),
+                user_text("tool result 1"),
+                // Final assistant turn of the tool loop: valid thinking kept.
+                assistant_blocks(vec![
+                    thinking_block("fresh reasoning", "sig_fresh"),
+                    tool_use_block("toolu_2"),
+                ]),
+                user_text("tool result 2"),
+            ],
+            ..Default::default()
+        };
+
+        client.apply_messages_request_adapter(&mut request);
+
+        assert_eq!(block_types(&request.messages[1]), vec!["tool_use"]);
+        assert_eq!(
+            block_types(&request.messages[3]),
+            vec!["thinking", "tool_use"],
+            "final assistant turn must keep its signed thinking for tool-loop continuation",
+        );
+    }
+
+    /// Signature-only blobs (`tco_*` cross-provider reasoning) and unsigned
+    /// thinking can never validate at api.anthropic.com — drop them even on
+    /// the final assistant message.
+    #[test]
+    fn anthropic_adapter_drops_implausible_final_thinking() {
+        let mut cfg = minimal_config();
+        cfg.api_backend = ApiBackend::Messages;
+        cfg.provider_request_adapter = Some(ProviderRequestAdapter::Anthropic {
+            tool_name_prefix: "mcp__".to_string(),
+            command: None,
+        });
+        let client = SamplingClient::new(cfg).expect("client");
+
+        let mut request = messages::MessagesRequest {
+            thinking: Some(messages::ThinkingConfig::Adaptive { display: None }),
+            messages: vec![
+                user_text("go"),
+                assistant_blocks(vec![
+                    // Signature-only blob (e.g. cross-provider encrypted reasoning).
+                    thinking_block("", "tco_blob"),
+                    // Unsigned thinking text (e.g. non-Anthropic model output).
+                    thinking_block("unsigned", ""),
+                    tool_use_block("toolu_1"),
+                ]),
+                user_text("tool result"),
+            ],
+            ..Default::default()
+        };
+
+        client.apply_messages_request_adapter(&mut request);
+
+        assert_eq!(block_types(&request.messages[1]), vec!["tool_use"]);
+    }
+
+    /// Thinking on a final assistant message *without* tool use is not needed
+    /// for continuation; replaying it is pure signature-validation risk.
+    #[test]
+    fn anthropic_adapter_strips_final_thinking_without_tool_use() {
+        let mut cfg = minimal_config();
+        cfg.api_backend = ApiBackend::Messages;
+        cfg.provider_request_adapter = Some(ProviderRequestAdapter::Anthropic {
+            tool_name_prefix: "mcp__".to_string(),
+            command: None,
+        });
+        let client = SamplingClient::new(cfg).expect("client");
+
+        let mut request = messages::MessagesRequest {
+            thinking: Some(messages::ThinkingConfig::Adaptive { display: None }),
+            messages: vec![
+                user_text("hi"),
+                assistant_blocks(vec![
+                    thinking_block("pondering", "sig"),
+                    messages::ContentBlock::Text {
+                        text: "answer".to_owned(),
+                        cache_control: None,
+                    },
+                ]),
+                user_text("follow-up"),
+            ],
+            ..Default::default()
+        };
+
+        client.apply_messages_request_adapter(&mut request);
+
+        assert_eq!(block_types(&request.messages[1]), vec!["text"]);
+    }
+
+    /// A thinking-only assistant message (aborted turn) must be removed
+    /// entirely once its thinking is stripped: the API rejects messages with
+    /// empty content arrays.
+    #[test]
+    fn anthropic_adapter_removes_thinking_only_assistant_messages() {
+        let mut cfg = minimal_config();
+        cfg.api_backend = ApiBackend::Messages;
+        cfg.provider_request_adapter = Some(ProviderRequestAdapter::Anthropic {
+            tool_name_prefix: "mcp__".to_string(),
+            command: None,
+        });
+        let client = SamplingClient::new(cfg).expect("client");
+
+        let mut request = messages::MessagesRequest {
+            thinking: Some(messages::ThinkingConfig::Adaptive { display: None }),
+            messages: vec![
+                user_text("hi"),
+                assistant_blocks(vec![thinking_block("aborted turn", "sig")]),
+                user_text("continue"),
+            ],
+            ..Default::default()
+        };
+
+        client.apply_messages_request_adapter(&mut request);
+
+        assert_eq!(request.messages.len(), 2);
+        assert!(matches!(
+            request.messages[0].role,
+            messages::MessageRole::User
+        ));
+        assert!(matches!(
+            request.messages[1].role,
+            messages::MessageRole::User
+        ));
+    }
+
+    /// When the request has no `thinking` config, replayed thinking blocks are
+    /// rejected outright by the Messages API — strip them everywhere.
+    #[test]
+    fn anthropic_adapter_strips_all_thinking_when_disabled() {
+        let mut cfg = minimal_config();
+        cfg.api_backend = ApiBackend::Messages;
+        cfg.provider_request_adapter = Some(ProviderRequestAdapter::Anthropic {
+            tool_name_prefix: "mcp__".to_string(),
+            command: None,
+        });
+        let client = SamplingClient::new(cfg).expect("client");
+
+        let mut request = messages::MessagesRequest {
+            thinking: None,
+            messages: vec![
+                user_text("go"),
+                assistant_blocks(vec![
+                    thinking_block("reasoning", "sig"),
+                    tool_use_block("toolu_1"),
+                ]),
+                user_text("tool result"),
+            ],
+            ..Default::default()
+        };
+
+        client.apply_messages_request_adapter(&mut request);
+
+        assert_eq!(block_types(&request.messages[1]), vec!["tool_use"]);
+    }
+
+    /// The xAI Messages backend (no Anthropic adapter) must keep replaying
+    /// reasoning verbatim — `tco_*` blobs and prior-turn thinking included.
+    #[test]
+    fn non_anthropic_backend_keeps_thinking_blocks_verbatim() {
+        let mut cfg = minimal_config();
+        cfg.api_backend = ApiBackend::Messages;
+        let client = SamplingClient::new(cfg).expect("client");
+
+        let mut request = messages::MessagesRequest {
+            thinking: Some(messages::ThinkingConfig::Adaptive { display: None }),
+            messages: vec![
+                user_text("go"),
+                assistant_blocks(vec![thinking_block("", "tco_blob"), tool_use_block("t1")]),
+                user_text("tool result"),
+                assistant_blocks(vec![thinking_block("later", "sig")]),
+            ],
+            ..Default::default()
+        };
+
+        client.apply_messages_request_adapter(&mut request);
+
+        assert_eq!(
+            block_types(&request.messages[1]),
+            vec!["thinking", "tool_use"]
+        );
+        assert_eq!(block_types(&request.messages[3]), vec!["thinking"]);
+    }
+
     #[test]
     fn anthropic_adapter_injects_billing_identity_and_cch() {
         let mut cfg = minimal_config();
@@ -2681,9 +3527,10 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_headers_skip_context_1m_for_haiku() {
+    fn anthropic_headers_skip_context_1m_for_200k_context() {
         let mut cfg = minimal_config();
         cfg.api_backend = ApiBackend::Messages;
+        cfg.context_window = 200_000;
         cfg.provider_request_adapter = Some(ProviderRequestAdapter::Anthropic {
             tool_name_prefix: "mcp__".to_string(),
             command: None,
@@ -2699,6 +3546,297 @@ mod tests {
             .unwrap();
         assert!(betas.contains("claude-code-20250219"));
         assert!(!betas.contains("context-1m-2025-08-07"));
+    }
+
+    #[test]
+    fn anthropic_headers_include_context_1m_for_1m_context() {
+        let mut cfg = minimal_config();
+        cfg.api_backend = ApiBackend::Messages;
+        cfg.context_window = 1_000_000;
+        cfg.provider_request_adapter = Some(ProviderRequestAdapter::Anthropic {
+            tool_name_prefix: "mcp__".to_string(),
+            command: None,
+        });
+        let client = SamplingClient::new(cfg).expect("client");
+        let mut headers = HeaderMap::new();
+
+        client.apply_anthropic_cli_headers(&mut headers, "claude-sonnet-5");
+
+        let betas = headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(betas.contains("context-1m-2025-08-07"));
+    }
+    /// Builds a client for the advisor matrix with the given axis values and
+    /// returns whether the beta header and the raw `advisor_20260301` tool
+    /// are both present (they are wired off the same gate, so either both
+    /// appear or neither does).
+    fn advisor_probe(
+        api_backend: ApiBackend,
+        auth_scheme: AuthScheme,
+        anthropic_adapter: bool,
+        advisor_server_model: Option<&str>,
+    ) -> (bool, bool) {
+        let mut cfg = minimal_config();
+        cfg.api_backend = api_backend;
+        cfg.auth_scheme = auth_scheme;
+        cfg.provider_request_adapter = if anthropic_adapter {
+            Some(ProviderRequestAdapter::Anthropic {
+                tool_name_prefix: "mcp__".to_string(),
+                command: None,
+            })
+        } else {
+            None
+        };
+        cfg.advisor_server_model = advisor_server_model.map(str::to_string);
+        let client = SamplingClient::new(cfg).expect("client should build");
+
+        let mut headers = HeaderMap::new();
+        client.apply_anthropic_cli_headers(&mut headers, "claude-sonnet-5");
+        let beta_present = headers
+            .get("anthropic-beta")
+            .and_then(|v| v.to_str().ok())
+            .map(|betas| betas.contains("advisor-tool-2026-03-01"))
+            .unwrap_or(false);
+
+        let mut extra_raw_tools = Vec::new();
+        let mut body = serde_json::json!({});
+        client.inject_messages_extra_tools(&mut extra_raw_tools, &mut body);
+        let tool_present = body
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|tools| {
+                tools.iter().any(|t| {
+                    t.get("type").and_then(|v| v.as_str()) == Some("advisor_20260301")
+                        && t.get("name").and_then(|v| v.as_str()) == Some("advisor")
+                })
+            })
+            .unwrap_or(false);
+
+        (beta_present, tool_present)
+    }
+
+    #[test]
+    fn advisor_present_when_messages_anthropic_bearer_and_model_set() {
+        let (beta, tool) = advisor_probe(
+            ApiBackend::Messages,
+            AuthScheme::Bearer,
+            true,
+            Some("claude-opus-5"),
+        );
+        assert!(beta, "expected advisor beta present in the positive case");
+        assert!(tool, "expected advisor tool present in the positive case");
+    }
+
+    #[test]
+    fn advisor_absent_for_responses_backend() {
+        let (beta, tool) = advisor_probe(
+            ApiBackend::Responses,
+            AuthScheme::Bearer,
+            true,
+            Some("claude-opus-5"),
+        );
+        assert!(!beta, "Responses backend must not get the advisor beta");
+        assert!(!tool, "Responses backend must not get the advisor tool");
+    }
+
+    #[test]
+    fn advisor_absent_for_chat_completions_backend() {
+        let (beta, tool) = advisor_probe(
+            ApiBackend::ChatCompletions,
+            AuthScheme::Bearer,
+            true,
+            Some("claude-opus-5"),
+        );
+        assert!(
+            !beta,
+            "ChatCompletions backend must not get the advisor beta"
+        );
+        assert!(
+            !tool,
+            "ChatCompletions backend must not get the advisor tool"
+        );
+    }
+
+    #[test]
+    fn advisor_absent_for_x_api_key_scheme() {
+        let (beta, tool) = advisor_probe(
+            ApiBackend::Messages,
+            AuthScheme::XApiKey,
+            true,
+            Some("claude-opus-5"),
+        );
+        assert!(!beta, "XApiKey scheme must not get the advisor beta");
+        assert!(!tool, "XApiKey scheme must not get the advisor tool");
+    }
+
+    #[test]
+    fn advisor_absent_for_non_anthropic_adapter() {
+        let (beta, tool) = advisor_probe(
+            ApiBackend::Messages,
+            AuthScheme::Bearer,
+            false,
+            Some("claude-opus-5"),
+        );
+        assert!(!beta, "non-Anthropic adapter must not get the advisor beta");
+        assert!(!tool, "non-Anthropic adapter must not get the advisor tool");
+    }
+
+    #[test]
+    fn advisor_absent_when_model_none() {
+        let (beta, tool) = advisor_probe(ApiBackend::Messages, AuthScheme::Bearer, true, None);
+        assert!(!beta, "advisor_server_model=None must not get the beta");
+        assert!(!tool, "advisor_server_model=None must not get the tool");
+    }
+
+    #[test]
+    fn advisor_matrix_cartesian_sweep() {
+        let backends = [
+            ApiBackend::Messages,
+            ApiBackend::Responses,
+            ApiBackend::ChatCompletions,
+        ];
+        let auth_schemes = [AuthScheme::Bearer, AuthScheme::XApiKey];
+        let adapters = [true, false];
+        let models: [Option<&str>; 2] = [Some("claude-opus-5"), None];
+
+        for backend in backends {
+            for auth in auth_schemes {
+                for adapter in adapters {
+                    for model in models {
+                        let expected = backend == ApiBackend::Messages
+                            && auth == AuthScheme::Bearer
+                            && adapter
+                            && model.is_some();
+                        let (beta, tool) = advisor_probe(backend.clone(), auth, adapter, model);
+                        assert_eq!(
+                            beta, expected,
+                            "beta mismatch for backend={backend:?} auth={auth:?} adapter={adapter} model={model:?}"
+                        );
+                        assert_eq!(
+                            tool, expected,
+                            "tool mismatch for backend={backend:?} auth={auth:?} adapter={adapter} model={model:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    /// Dedicated coupling invariant (independent of whether the gate formula
+    /// itself is correct): across the full axis matrix, the advisor beta and
+    /// the advisor tool must never diverge -- either both present or both
+    /// absent, on every combination. A regression that wires one without the
+    /// other (e.g. a beta-filter edit that forgets the tool injection, or
+    /// vice versa) would pass `advisor_matrix_cartesian_sweep`'s per-field
+    /// `expected` comparison only if it broke both identically; this test
+    /// catches an asymmetric break directly.
+    #[test]
+    fn advisor_beta_tool_never_diverge_across_matrix() {
+        let backends = [
+            ApiBackend::Messages,
+            ApiBackend::Responses,
+            ApiBackend::ChatCompletions,
+        ];
+        let auth_schemes = [AuthScheme::Bearer, AuthScheme::XApiKey];
+        let adapters = [true, false];
+        let models: [Option<&str>; 2] = [Some("claude-opus-5"), None];
+
+        for backend in backends {
+            for auth in auth_schemes {
+                for adapter in adapters {
+                    for model in models {
+                        let (beta, tool) = advisor_probe(backend.clone(), auth, adapter, model);
+                        assert_eq!(
+                            beta, tool,
+                            "beta/tool diverged for backend={backend:?} auth={auth:?} adapter={adapter} model={model:?}: beta={beta} tool={tool}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The injected tool's exact shape: `{"type":"advisor_20260301","name":"advisor","model":<configured model>}`.
+    /// Two distinct models must produce two distinct `model` fields -- the
+    /// value must be threaded from `advisor_server_model`, never hardcoded.
+    #[test]
+    fn advisor_tool_shape_matches_configured_model_exactly() {
+        for model in ["claude-opus-5", "claude-sonnet-5-preview"] {
+            let mut cfg = minimal_config();
+            cfg.api_backend = ApiBackend::Messages;
+            cfg.auth_scheme = AuthScheme::Bearer;
+            cfg.provider_request_adapter = Some(ProviderRequestAdapter::Anthropic {
+                tool_name_prefix: "mcp__".to_string(),
+                command: None,
+            });
+            cfg.advisor_server_model = Some(model.to_string());
+            let client = SamplingClient::new(cfg).expect("client should build");
+
+            let mut extra_raw_tools = Vec::new();
+            let mut body = serde_json::json!({});
+            client.inject_messages_extra_tools(&mut extra_raw_tools, &mut body);
+
+            let tools = body
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .expect("gate-active injection must populate body.tools");
+            assert_eq!(tools.len(), 1, "exactly one advisor tool must be injected");
+            assert_eq!(
+                tools[0],
+                serde_json::json!({
+                    "type": "advisor_20260301",
+                    "name": "advisor",
+                    "model": model,
+                }),
+                "injected tool must be exactly {{type, name, model}} with the configured model, not hardcoded"
+            );
+        }
+    }
+
+    /// When the gate is active AND the request already carries client-side
+    /// tools (body["tools"] already populated before injection), the advisor
+    /// tool must be APPENDED -- existing tools must never be dropped or
+    /// overwritten.
+    #[test]
+    fn advisor_tool_appended_without_dropping_existing_tools() {
+        let mut cfg = minimal_config();
+        cfg.api_backend = ApiBackend::Messages;
+        cfg.auth_scheme = AuthScheme::Bearer;
+        cfg.provider_request_adapter = Some(ProviderRequestAdapter::Anthropic {
+            tool_name_prefix: "mcp__".to_string(),
+            command: None,
+        });
+        cfg.advisor_server_model = Some("claude-opus-5".to_string());
+        let client = SamplingClient::new(cfg).expect("client should build");
+
+        let existing_tool = serde_json::json!({
+            "name": "read_file",
+            "description": "Reads a file",
+            "input_schema": {"type": "object"},
+        });
+        let mut extra_raw_tools = Vec::new();
+        let mut body = serde_json::json!({ "tools": [existing_tool.clone()] });
+        client.inject_messages_extra_tools(&mut extra_raw_tools, &mut body);
+
+        let tools = body
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .expect("tools array must remain present");
+        assert_eq!(
+            tools.len(),
+            2,
+            "the pre-existing client tool and the injected advisor tool must both be present"
+        );
+        assert_eq!(
+            tools[0], existing_tool,
+            "the pre-existing tool must be preserved in place, not dropped"
+        );
+        assert_eq!(
+            tools[1].get("type").and_then(|v| v.as_str()),
+            Some("advisor_20260301"),
+            "the advisor tool must be appended after the existing tool"
+        );
     }
 
     #[tokio::test]
@@ -2816,13 +3954,48 @@ mod tests {
     }
 
     #[test]
-    fn extract_retry_after_ignores_http_date() {
+    fn extract_retry_after_ms_is_preferred_and_rounded_up() {
         let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "60".parse().unwrap());
+        headers.insert("retry-after-ms", "1500".parse().unwrap());
+        assert_eq!(extract_retry_after(&headers), Some(2));
+    }
+
+    #[test]
+    fn extract_retry_after_ms_is_capped() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after-ms", "3600000".parse().unwrap());
+        assert_eq!(extract_retry_after(&headers), Some(120));
+    }
+
+    #[test]
+    fn extract_retry_after_invalid_ms_falls_back_to_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after-ms", "nope".parse().unwrap());
+        headers.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
+        assert_eq!(extract_retry_after(&headers), Some(30));
+    }
+
+    #[test]
+    fn extract_retry_after_parses_http_date() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let future = Utc::now() + chrono::Duration::hours(1);
         headers.insert(
             reqwest::header::RETRY_AFTER,
-            "Fri, 31 Dec 2025 23:59:59 GMT".parse().unwrap(),
+            future.to_rfc2822().parse().unwrap(),
         );
-        assert_eq!(extract_retry_after(&headers), None);
+        assert_eq!(extract_retry_after(&headers), Some(120));
+    }
+
+    #[test]
+    fn extract_retry_after_past_http_date_is_zero() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let past = Utc::now() - chrono::Duration::hours(1);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            past.to_rfc2822().parse().unwrap(),
+        );
+        assert_eq!(extract_retry_after(&headers), Some(0));
     }
 
     #[test]

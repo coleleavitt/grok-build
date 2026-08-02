@@ -187,31 +187,32 @@ impl ChannelSpawner {
         model: Option<String>,
         harness_agent_type: Option<String>,
     ) -> Result<String, SpawnError> {
-        let request = SubagentRequest {
-            id: id.to_string(),
+        use xai_grok_tools::implementations::grok_build::task::spawn::SubagentSpawnParams;
+        use xai_grok_tools::implementations::grok_build::task::types::SubagentEvent;
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let request = SubagentSpawnParams {
+            id: Some(id.to_string()),
             prompt,
             description: GOAL_STRATEGIST_SUBAGENT_DESCRIPTION.to_string(),
             subagent_type: GOAL_STRATEGIST_SUBAGENT_TYPE.to_string(),
             parent_session_id: self.parent_session_id.clone(),
             parent_prompt_id: self.parent_prompt_id.clone(),
-            resume_from: None,
             cwd: self.cwd.clone(),
-            runtime_overrides: SubagentRuntimeOverrides {
-                model,
-                harness_agent_type,
-                ..Default::default()
-            },
-            run_in_background: false,
-            // Harness-internal: never surface to the model's idle reminder.
-            surface_completion: false,
-            await_to_completion: false,
-            fork_context: false,
-            owner: SubagentOwner::Task,
-            cancel_token: tokio_util::sync::CancellationToken::new(),
-        };
-        let backend = ChannelBackend::new(self.event_tx.clone());
-        let result = backend
-            .spawn_with_foreground_wait(request, self.foreground_wait.as_ref())
+            model,
+            harness_agent_type,
+            ..Default::default()
+        }
+        .into_request_with_result_tx(result_tx);
+        if self
+            .event_tx
+            .send(SubagentEvent::Spawn(Box::new(request)))
+            .is_err()
+        {
+            return Err(SpawnError::Transport(
+                "subagent coordinator channel closed".to_string(),
+            ));
+        }
+        let result = result_rx
             .await
             .map_err(|error| SpawnError::Transport(error.to_string()))?;
         if result.backgrounded {

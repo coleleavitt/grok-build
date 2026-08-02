@@ -1207,6 +1207,12 @@ pub struct MessagesRequestWrapper {
 
     /// Optional tracing context (e.g., where to persist the finalized request payload).
     pub trace: Option<Box<dyn TraceContext>>,
+
+    /// Server-side (non-`ToolParam`) tools that can't be expressed via the
+    /// Messages API's typed tool enum (e.g. the Anthropic OAuth advisor
+    /// tool). Injected as raw JSON into the serialized request body's
+    /// `tools` array, mirroring `CreateResponseWrapper::extra_raw_tools`.
+    pub extra_raw_tools: Vec<serde_json::Value>,
 }
 
 impl MessagesRequestWrapper {
@@ -1222,6 +1228,7 @@ impl MessagesRequestWrapper {
             x_grok_deployment_id: None,
             x_grok_user_id: None,
             trace: None,
+            extra_raw_tools: vec![],
         }
     }
 

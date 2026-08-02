@@ -1,0 +1,134 @@
+{
+  "suite": "G002 advisor_20260301 server-side advisor tool -- adversarial QA (executor lane)",
+  "scope": {
+    "target": "SamplerConfig.advisor_server_model gate (advisor_gate_active, client.rs:1048) driving the advisor-tool-2026-03-01 beta and the raw advisor_20260301 tool injection (inject_messages_extra_tools) into Anthropic Messages requests, plus the SessionActor::reconstruct_full_config wiring",
+    "constraint": "implementation is FROZEN; only tests + this artifact were added; no defects found so no fixes were made",
+    "existing_matrix_extended": "7 pre-existing sampler tests incl. the 24-combo advisor_matrix_cartesian_sweep (advisor_probe helper) in crates/codegen/xai-grok-sampler/src/client.rs"
+  },
+  "cases": [
+    {
+      "id": "case1a",
+      "name": "non_streaming_create_message_injects_advisor_tool_on_the_wire",
+      "surface": "api",
+      "expected": "Non-streaming create_message (via conversation_messages) with the gate active injects the advisor_20260301 tool into the literal outgoing JSON body and the advisor-tool-2026-03-01 beta into the outgoing anthropic-beta header, verified against the real bytes received by a live mock HTTP server (not just at the private inject_messages_extra_tools call level).",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-sampler --test test_advisor_injection non_streaming_create_message_injects_advisor_tool_on_the_wire"
+    },
+    {
+      "id": "case1b",
+      "name": "streaming_create_message_stream_injects_advisor_tool_on_the_wire",
+      "surface": "api",
+      "expected": "Streaming create_message_stream (via conversation_stream_messages) with the gate active ALSO injects the advisor_20260301 tool + advisor-tool-2026-03-01 beta on the wire, proven against a real SSE mock server round-trip. Adversarial hypothesis under test: the streaming path silently skips injection. Result: it does not -- both call sites route through the same apply_anthropic_cli_headers / inject_messages_extra_tools calls with no path-dependent branching.",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-sampler --test test_advisor_injection streaming_create_message_stream_injects_advisor_tool_on_the_wire"
+    },
+    {
+      "id": "case2",
+      "name": "advisor_beta_tool_never_diverge_across_matrix",
+      "surface": "package",
+      "expected": "Across the full 3(backend) x 2(auth_scheme) x 2(adapter) x 2(model) = 24-combination axis matrix, anthropic-beta presence == advisor_20260301 tool presence in EVERY combination (dedicated coupling invariant, independent of whether advisor_gate_active()'s own formula is correct -- catches an asymmetric regression that breaks only one of the two).",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-sampler --lib advisor_beta_tool_never_diverge_across_matrix"
+    },
+    {
+      "id": "case2b",
+      "name": "advisor_matrix_cartesian_sweep (pre-existing, re-verified)",
+      "surface": "package",
+      "expected": "Across the same 24-combination matrix, beta==tool==expected where expected = (Messages && Bearer && anthropic_adapter && model.is_some()) -- the full gate formula, not just the coupling invariant.",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-sampler --lib advisor_matrix_cartesian_sweep"
+    },
+    {
+      "id": "case3a",
+      "name": "advisor_absent_for_responses_backend (pre-existing, re-verified)",
+      "surface": "package",
+      "expected": "Mixed negative axis: Responses backend + Bearer + anthropic adapter + model set (single wrong axis = backend) -> both beta and tool absent.",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-sampler --lib advisor_absent_for_responses_backend"
+    },
+    {
+      "id": "case3b_axis",
+      "name": "advisor_absent_for_chat_completions_backend / advisor_absent_for_x_api_key_scheme / advisor_absent_for_non_anthropic_adapter / advisor_absent_when_model_none (pre-existing, re-verified)",
+      "surface": "package",
+      "expected": "Each remaining negative axis in isolation (ChatCompletions backend; XApiKey scheme with Messages+anthropic+model set -- the second mixed-axis case the assignment names; non-Anthropic adapter; advisor_server_model=None) suppresses both beta and tool.",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-sampler --lib advisor_absent_for_chat_completions_backend advisor_absent_for_x_api_key_scheme advisor_absent_for_non_anthropic_adapter advisor_absent_when_model_none"
+    },
+    {
+      "id": "case3b_shape",
+      "name": "advisor_tool_shape_matches_configured_model_exactly",
+      "surface": "package",
+      "expected": "The injected tool is exactly {\"type\":\"advisor_20260301\",\"name\":\"advisor\",\"model\":<configured model>} with no extra/missing fields, and two distinct configured models produce two distinct model field values -- proves the model is threaded through advisor_server_model, not hardcoded.",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-sampler --lib advisor_tool_shape_matches_configured_model_exactly"
+    },
+    {
+      "id": "case4",
+      "name": "advisor_tool_appended_without_dropping_existing_tools",
+      "surface": "package",
+      "expected": "When the gate is active AND the request body already has client-side tools populated in body[\"tools\"], the advisor tool is APPENDED after them without dropping or reordering the pre-existing entries.",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-sampler --lib advisor_tool_appended_without_dropping_existing_tools"
+    },
+    {
+      "id": "case5a",
+      "name": "advisor_server_model_present_when_all_axes_align",
+      "surface": "package",
+      "expected": "SessionActor::reconstruct_full_config: server_advisor=true + Messages + anthropic adapter + the default (Bearer) auth_scheme resolves advisor_server_model = Some(the active model). Bearer is AuthScheme's #[default] variant, so a fresh ModelAuthFacts memo (no live Anthropic OAuth credential needed) already reaches Bearer -- the positive leg is genuinely reachable hermetically, contrary to an initial assumption that it required live OAuth state.",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-shell --lib advisor_server_model_present_when_all_axes_align"
+    },
+    {
+      "id": "case5b",
+      "name": "advisor_server_model_none_when_server_advisor_flag_is_false",
+      "surface": "package",
+      "expected": "server_advisor=false suppresses advisor_server_model even with Messages + anthropic adapter otherwise eligible.",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-shell --lib advisor_server_model_none_when_server_advisor_flag_is_false"
+    },
+    {
+      "id": "case5c",
+      "name": "advisor_server_model_none_when_backend_is_not_messages",
+      "surface": "package",
+      "expected": "A non-Messages backend (ChatCompletions) suppresses advisor_server_model even with server_advisor=true and an anthropic adapter set.",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-shell --lib advisor_server_model_none_when_backend_is_not_messages"
+    },
+    {
+      "id": "case5d",
+      "name": "advisor_server_model_none_when_auth_scheme_is_not_bearer",
+      "surface": "package",
+      "expected": "Forcing auth_scheme=XApiKey via the model_auth_facts test memo (hermetic stand-in for the live-credential override branch) suppresses advisor_server_model even with server_advisor/Messages/anthropic-adapter all set -- a single wrong axis suppresses the whole gate on the shell wiring side too.",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-shell --lib advisor_server_model_none_when_auth_scheme_is_not_bearer"
+    }
+  ],
+  "totals": {
+    "cases": 12,
+    "pass": 12,
+    "fail": 0,
+    "blockers": 0,
+    "tests_added": 16,
+    "tests_added_breakdown": {
+      "xai-grok-sampler_unit_client.rs": 4,
+      "xai-grok-sampler_integration_test_advisor_injection.rs": 2,
+      "xai-grok-shell_unit_auth_error_no_retry_tests.rs": 4,
+      "re_verified_pre_existing": 6
+    }
+  },
+  "commands": {
+    "sampler_unit_new_and_matrix": "cargo test -p xai-grok-sampler --lib advisor_",
+    "sampler_integration_new": "cargo test -p xai-grok-sampler --test test_advisor_injection",
+    "shell_wiring_new": "cargo test -p xai-grok-shell --lib advisor_server_model"
+  },
+  "files_added": [
+    "crates/codegen/xai-grok-sampler/tests/test_advisor_injection.rs",
+    "artifacts/advisor-g002-qa-report.json"
+  ],
+  "files_modified": [
+    "crates/codegen/xai-grok-sampler/src/client.rs (extended #[cfg(test)] mod tests: advisor_beta_tool_never_diverge_across_matrix, advisor_tool_shape_matches_configured_model_exactly, advisor_tool_appended_without_dropping_existing_tools)",
+    "crates/codegen/xai-grok-shell/src/session/acp_session_tests/auth_error_no_retry_tests.rs (added 4 reconstruct_full_config advisor_server_model wiring tests)"
+  ],
+  "implementation_files_modified": [],
+  "defects_found": []
+}

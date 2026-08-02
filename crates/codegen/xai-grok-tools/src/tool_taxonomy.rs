@@ -56,6 +56,9 @@ impl ToolKind {
             ToolKind::MemorySearch => "Memory Search",
             ToolKind::MemoryGet => "Memory Read",
             ToolKind::Task => "Subagent",
+            ToolKind::Advisor => "Advisor",
+            ToolKind::Research => "Research",
+            ToolKind::Bounty => "Bounty",
             ToolKind::EnterPlan => "Enter Plan Mode",
             ToolKind::ExitPlan => "Exit Plan Mode",
             ToolKind::AskUser => "Ask User",
@@ -87,6 +90,7 @@ impl ToolKind {
             | ToolKind::MemoryGet
             | ToolKind::WebSearch
             | ToolKind::WebFetch
+            | ToolKind::Research
             | ToolKind::EnterPlan
             | ToolKind::ExitPlan
             | ToolKind::AskUser => true,
@@ -101,6 +105,8 @@ impl ToolKind {
             | ToolKind::KillTaskAction
             | ToolKind::Skill
             | ToolKind::Task
+            | ToolKind::Advisor
+            | ToolKind::Bounty
             | ToolKind::ImageGen
             | ToolKind::VideoGen
             | ToolKind::ImageToVideo

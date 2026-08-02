@@ -51,6 +51,15 @@ fn search_replace_call(id: &str, path: &str) -> ToolCallResponse {
         ),
     }
 }
+
+fn read_file_call(id: &str, arguments: &str) -> ToolCallResponse {
+    ToolCallResponse {
+        id: id.to_string(),
+        kind: "function".to_string(),
+        function: crate::sampling::types::ToolCallFunction::new("read_file", arguments),
+    }
+}
+
 async fn prepare(
     actor: &SessionActor,
     call: ToolCallResponse,
@@ -79,6 +88,35 @@ async fn tool_result_text(actor: &SessionActor, call_id: &str) -> String {
         })
         .unwrap_or_else(|| panic!("no tool_result for {call_id} in {conv:?}"))
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_tool_call_uses_matching_concatenated_json_object() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let actor = build_gate_actor().await;
+            let prepared = prepare(
+                &actor,
+                read_file_call(
+                    "call_concat",
+                    r#"{"target_file":1}{"target_file":"/tmp/selected.txt"}"#,
+                ),
+            )
+            .await
+            .expect("second concatenated object should prepare");
+
+            assert_eq!(prepared.concatenated_json_count, 2);
+            assert_eq!(
+                prepared
+                    .parsed_args
+                    .get("target_file")
+                    .and_then(serde_json::Value::as_str),
+                Some("/tmp/selected.txt")
+            );
+        })
+        .await;
+}
+
 /// The headline: plan mode Active + allow-all permissions (the always-approve
 /// worst case) still rejects a grok edit outside the plan file, without ever
 /// reaching the permission layer, and steers the model to `exit_plan_mode`.

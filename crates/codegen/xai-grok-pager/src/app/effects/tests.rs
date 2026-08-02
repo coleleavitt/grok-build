@@ -2017,6 +2017,71 @@ fn to_meta_always_emits_yolo_mode_explicitly() {
     }
 }
 #[test]
+fn to_meta_omits_advisor_enabled_when_default() {
+    let flags = SessionFlags { advisor_enabled: None, ..Default::default() };
+    let meta = flags.to_meta().expect("permission seeds must always emit meta");
+    assert!(
+        meta.get("advisorEnabled").is_none(),
+        "advisorEnabled must be omitted when default-on (None), meta={meta:?}"
+    );
+}
+#[test]
+fn to_meta_emits_advisor_enabled_false_when_disabled() {
+    let flags = SessionFlags { advisor_enabled: Some(false), ..Default::default() };
+    let meta = flags.to_meta().expect("advisor_enabled must emit meta");
+    assert_eq!(meta["advisorEnabled"], false);
+}
+#[test]
+fn to_meta_emits_advisor_enabled_true_when_forced_on() {
+    let flags = SessionFlags { advisor_enabled: Some(true), ..Default::default() };
+    let meta = flags.to_meta().expect("advisor_enabled must emit meta");
+    assert_eq!(meta["advisorEnabled"], true);
+}
+#[test]
+fn to_meta_omits_server_advisor_when_disabled() {
+    let flags = SessionFlags { server_advisor: false, ..Default::default() };
+    let meta = flags.to_meta().expect("permission seeds must always emit meta");
+    assert!(
+        meta.get("serverAdvisor").is_none(),
+        "serverAdvisor must be omitted when false, meta={meta:?}"
+    );
+}
+#[test]
+fn to_meta_emits_server_advisor_when_enabled() {
+    let flags = SessionFlags { server_advisor: true, ..Default::default() };
+    let meta = flags.to_meta().expect("server_advisor must emit meta");
+    assert_eq!(meta["serverAdvisor"], true);
+}
+#[test]
+fn to_meta_server_advisor_is_inert_beyond_its_own_key() {
+    // Adversarial case 5 (G001/G002 boundary): toggling `server_advisor`
+    // must change ONLY the `serverAdvisor` key. It must not alter
+    // `agentProfile`, `askUserQuestion`, `advisorEnabled`, `yoloMode`, or
+    // `autoMode` — G001 only threads the flag through, it does not yet wire
+    // any tool/prompt/provider behavior to it.
+    let base = SessionFlags {
+        plan_mode: true,
+        subagents: true,
+        ask_user: false,
+        yolo_mode: true,
+        auto_mode: false,
+        advisor_enabled: Some(false),
+        ..Default::default()
+    };
+    let off = SessionFlags { server_advisor: false, ..base.clone() };
+    let on = SessionFlags { server_advisor: true, ..base };
+    let meta_off = off.to_meta().expect("permission seeds must always emit meta");
+    let mut meta_on = on.to_meta().expect("permission seeds must always emit meta");
+    assert_eq!(meta_on["serverAdvisor"], true);
+    assert!(meta_off.get("serverAdvisor").is_none());
+    meta_on.remove("serverAdvisor");
+    assert_eq!(
+        serde_json::Value::Object(meta_on),
+        serde_json::Value::Object(meta_off),
+        "every key other than serverAdvisor must be identical regardless of server_advisor"
+    );
+}
+#[test]
 fn to_meta_chat_mode_stamps_kind_and_omits_agent_profile() {
     let flags = SessionFlags {
         chat_mode: true,

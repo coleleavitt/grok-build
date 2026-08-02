@@ -51,6 +51,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
             compactions_remaining: None,
             compaction_at_tokens: None,
             doom_loop_recovery: None,
+            advisor_server_model: None,
             provider_request_adapter: None,
             header_injector: None,
         },
@@ -140,6 +141,28 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         parent_notification_handle: None,
         parent_scheduler_handle: None,
     }
+}
+pub(crate) fn make_request(
+    subagent_type: &str,
+) -> (SubagentRequest, oneshot::Receiver<SubagentResult>) {
+    let (tx, rx) = oneshot::channel();
+    let req = SubagentRequest {
+        id: uuid::Uuid::now_v7().to_string(),
+        prompt: "do something".into(),
+        description: "test task".into(),
+        subagent_type: subagent_type.into(),
+        parent_session_id: "test-parent".into(),
+        parent_prompt_id: Some("parent-prompt".into()),
+        resume_from: None,
+        cwd: None,
+        runtime_overrides: Default::default(),
+        run_in_background: false,
+        surface_completion: true,
+        fork_context: false,
+        advisor_gate_prevalidated: false,
+        result_tx: tx,
+    };
+    (req, rx)
 }
 #[derive(Default)]
 pub(crate) struct DummyLspDispatch;

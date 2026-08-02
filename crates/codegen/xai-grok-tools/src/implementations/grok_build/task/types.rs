@@ -96,15 +96,12 @@ pub struct SubagentRequest {
     /// Harness-only: seed child with normalized parent conversation, then append
     /// `prompt`. Not on TaskToolInput. Successful `resume_from` takes precedence.
     pub fork_context: bool,
-    pub owner: SubagentOwner,
-    pub cancel_token: CancellationToken,
-}
-
-/// Spawn command envelope owned by the coordinator mailbox.
-#[derive(Educe)]
-#[educe(Debug)]
-pub struct SubagentSpawnRequest {
-    pub request: Box<SubagentRequest>,
+    /// Advisor-only: the model-facing task tool has already enforced advisor
+    /// enablement and reserved per-session budget before sending this request.
+    /// The coordinator uses this to avoid double-charging while retaining its
+    /// defense-in-depth gate for non-tool callers.
+    pub advisor_gate_prevalidated: bool,
+    /// Oneshot channel for the coordinator to send back the result.
     #[educe(Debug(ignore))]
     pub result_tx: oneshot::Sender<SubagentResult>,
 }
@@ -285,6 +282,7 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
                 ToolKind::BackgroundTaskAction,
                 ToolKind::KillTaskAction,
                 ToolKind::Task,
+                ToolKind::Research,
                 ToolKind::EnterPlan,
                 ToolKind::ExitPlan,
                 ToolKind::AskUser,
@@ -312,6 +310,7 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
                 ToolKind::BackgroundTaskAction,
                 ToolKind::KillTaskAction,
                 ToolKind::Task,
+                ToolKind::Research,
                 ToolKind::EnterPlan,
                 ToolKind::ExitPlan,
                 ToolKind::AskUser,
@@ -332,6 +331,8 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
                 ToolKind::BackgroundTaskAction,
                 ToolKind::KillTaskAction,
                 ToolKind::Task,
+                ToolKind::Research,
+                ToolKind::Bounty,
                 ToolKind::EnterPlan,
                 ToolKind::ExitPlan,
                 ToolKind::AskUser,
@@ -770,6 +771,31 @@ pub struct SubagentValidateTypeRequest {
     pub respond_to: oneshot::Sender<SubagentValidateTypeOutcome>,
 }
 
+// Advisor preflight protocol
+
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum SubagentAdvisorPreflightOutcome {
+    Ok,
+    /// Advisor-specific policy rejected the request before spawn.
+    Rejected {
+        message: String,
+    },
+    /// Coordinator unreachable or parent context unavailable.
+    ValidationUnavailable,
+}
+
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct SubagentAdvisorPreflightRequest {
+    pub subagent_type: String,
+    pub parent_session_id: String,
+    pub prompt: String,
+    pub resume_from: Option<String>,
+    #[educe(Debug(ignore))]
+    pub respond_to: oneshot::Sender<SubagentAdvisorPreflightOutcome>,
+}
+
 // Describe-type protocol
 
 /// Outcome of a `describe_subagent_type` round-trip.
@@ -868,6 +894,7 @@ pub enum SubagentEvent {
     Inspect(SubagentInspectRequest),
     SpawnedRefs(SubagentSpawnedRefsRequest),
     ValidateType(SubagentValidateTypeRequest),
+    ValidateAdvisor(SubagentAdvisorPreflightRequest),
     DescribeType(SubagentDescribeRequest),
     LoopUnitActive(SubagentLoopUnitActiveRequest),
 }

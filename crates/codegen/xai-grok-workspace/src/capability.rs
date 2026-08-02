@@ -91,6 +91,9 @@ pub(crate) const ALL_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::MemorySearch,
     ToolKind::MemoryGet,
     ToolKind::Task,
+    ToolKind::Advisor,
+    ToolKind::Research,
+    ToolKind::Bounty,
     ToolKind::EnterPlan,
     ToolKind::ExitPlan,
     ToolKind::AskUser,
@@ -128,7 +131,15 @@ pub(crate) fn kind_allowed(mode: CapabilityMode, kind: ToolKind) -> bool {
 
     match kind {
         // Meta tools: always allowed.
-        Plan | EnterPlan | ExitPlan | AskUser | Skill | SearchTool | GoalUpdate => true,
+        //
+        // `Advisor` here only classifies it as a "meta tool" for capability
+        // filtering — it does NOT independently make advisor reachable.
+        // Whether `advisor` is actually reachable is enforced upstream by
+        // toolset membership (`AgentBuilder::build` strips it entirely when
+        // `!advisor_enabled || !subagents_enabled`, see
+        // `xai_grok_agent::builder::AgentBuilder::with_advisor_enabled`) and,
+        // for nested/child sessions, by the subagent depth gate.
+        Plan | EnterPlan | ExitPlan | AskUser | Skill | SearchTool | GoalUpdate | Advisor => true,
 
         // Read class.
         Read | MemoryGet | MemorySearch => {
@@ -136,7 +147,7 @@ pub(crate) fn kind_allowed(mode: CapabilityMode, kind: ToolKind) -> bool {
         }
 
         // Search class.
-        Search | WebSearch | WebFetch => {
+        Search | WebSearch | WebFetch | Research => {
             matches!(mode, M::ReadOnly | M::ReadWrite | M::Execute)
         }
 
@@ -150,7 +161,8 @@ pub(crate) fn kind_allowed(mode: CapabilityMode, kind: ToolKind) -> bool {
         // Bash / shell.
         Execute => matches!(mode, M::Execute),
 
-        BackgroundTaskAction | WaitTasksAction | KillTaskAction | Task | Monitor | Workflow => {
+        // Process control (background tasks, monitors).
+        BackgroundTaskAction | WaitTasksAction | KillTaskAction | Task | Bounty | Monitor => {
             matches!(mode, M::Execute)
         }
 

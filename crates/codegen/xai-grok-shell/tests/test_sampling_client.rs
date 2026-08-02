@@ -1260,6 +1260,33 @@ async fn test_doom_loop_check_disabled_sends_no_header_and_drops_check_frames() 
     assert_eq!(logged.header("x-grok-doom-loop-check"), None);
 }
 
+/// The Responses API can emit liveness-only keepalive frames. They are not
+/// model output and must be dropped before typed deserialization, otherwise
+/// async-openai rejects `{"type":"keepalive"}` as an unknown response event.
+#[tokio::test]
+async fn test_responses_api_stream_drops_keepalive_events() {
+    let server = MockInferenceServer::start().await.unwrap();
+    let mut events =
+        responses_api_reasoning_and_text_events("pondering", "Hello there", "test-model");
+    events.insert(1, SseEvent::data(r#"{"type":"keepalive"}"#));
+    events.insert(2, SseEvent::with_event("keepalive", "not json"));
+    server.enqueue_response("/v1/responses", ScriptedResponse::sse(events));
+
+    let client = create_test_client(&server.url(), ApiBackend::Responses);
+    let request = ConversationRequest::from_items(vec![ConversationItem::user("Hello")]);
+    let (mut stream, _metadata, _collector) =
+        client.conversation_stream_responses(request).await.unwrap();
+
+    let mut completed = false;
+    while let Some(event_result) = stream.next().await {
+        let event = event_result.expect("keepalive frames must be dropped, not fail the stream");
+        if matches!(event, rs::ResponseStreamEvent::ResponseCompleted(_)) {
+            completed = true;
+        }
+    }
+    assert!(completed);
+}
+
 // ============================================================================
 // Multi-turn Conversation Tests
 // ============================================================================

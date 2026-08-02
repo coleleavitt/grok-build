@@ -1,0 +1,66 @@
+{
+  "name": "openai",
+  "version": "0.1.0",
+  "description": "OpenAI GPT models as a Grok model provider (Responses API).",
+  "homepage": "https://platform.openai.com/docs/models",
+  "keywords": ["openai", "gpt", "model-provider"],
+  "modelProviders": {
+    "openai": {
+      "name": "OpenAI",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiBackend": "responses",
+      "authScheme": "bearer",
+      "envKey": "OPENAI_API_KEY",
+      "models": {
+        "gpt-5.5": {
+          "model": "gpt-5.5",
+          "name": "GPT-5.5",
+          "description": "OpenAI frontier reasoning model. 1.05M context, 128K max output.",
+          "contextWindow": 1050000,
+          "maxCompletionTokens": 128000,
+          "supportsReasoningEffort": true
+        },
+        "gpt-5.5-pro": {
+          "model": "gpt-5.5-pro",
+          "name": "GPT-5.5 Pro",
+          "description": "OpenAI high-compute reasoning model. 1.05M context, 128K max output.",
+          "contextWindow": 1050000,
+          "maxCompletionTokens": 128000,
+          "supportsReasoningEffort": true
+        },
+        "gpt-5.4": {
+          "model": "gpt-5.4",
+          "name": "GPT-5.4",
+          "description": "OpenAI frontier reasoning model. 1.05M context, 128K max output.",
+          "contextWindow": 1050000,
+          "maxCompletionTokens": 128000,
+          "supportsReasoningEffort": true
+        },
+        "gpt-5.4-pro": {
+          "model": "gpt-5.4-pro",
+          "name": "GPT-5.4 Pro",
+          "description": "OpenAI high-compute reasoning model. 1.05M context, 128K max output.",
+          "contextWindow": 1050000,
+          "maxCompletionTokens": 128000,
+          "supportsReasoningEffort": true
+        },
+        "gpt-5.4-mini": {
+          "model": "gpt-5.4-mini",
+          "name": "GPT-5.4 mini",
+          "description": "OpenAI efficient reasoning model. 400K context, 128K max output.",
+          "contextWindow": 400000,
+          "maxCompletionTokens": 128000,
+          "supportsReasoningEffort": true
+        },
+        "gpt-5.4-nano": {
+          "model": "gpt-5.4-nano",
+          "name": "GPT-5.4 nano",
+          "description": "OpenAI low-cost reasoning model. 400K context, 128K max output.",
+          "contextWindow": 400000,
+          "maxCompletionTokens": 128000,
+          "supportsReasoningEffort": true
+        }
+      }
+    }
+  }
+}

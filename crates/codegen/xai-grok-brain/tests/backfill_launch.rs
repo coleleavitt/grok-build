@@ -98,12 +98,16 @@ fn backfill_then_request_recall_uses_public_service_path() {
     assert_eq!(entity.title, "Zephyr Project");
     let sources = service.sources(entity.id).unwrap();
     assert_eq!(sources.len(), 2, "unknown source refs must be ignored");
-    assert!(sources
-        .iter()
-        .any(|s| s.source_id.as_deref() == Some("session-1")));
-    assert!(sources
-        .iter()
-        .any(|s| s.source_id.as_deref() == Some("file://docs/zephyr.md")));
+    assert!(
+        sources
+            .iter()
+            .any(|s| s.source_id.as_deref() == Some("session-1"))
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|s| s.source_id.as_deref() == Some("file://docs/zephyr.md"))
+    );
     assert!(service.settings().unwrap().last_run_at.is_some());
 
     // A later public request gets the backfilled value through service recall.
@@ -112,9 +116,12 @@ fn backfill_then_request_recall_uses_public_service_path() {
             session_id: "fresh-session",
             prompt_id: "fresh-prompt",
             user_text: "What was the Zephyr project?",
+            workspace_scope: None,
         })
         .unwrap();
-    let context = recall.injected_context.expect("backfilled page should recall");
+    let context = recall
+        .injected_context
+        .expect("backfilled page should recall");
     assert!(context.contains("Zephyr project codename"));
     assert!(recall.remembered_page.is_none());
 

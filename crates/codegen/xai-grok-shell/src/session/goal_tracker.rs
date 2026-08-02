@@ -846,6 +846,12 @@ impl GoalTracker {
         self.goal_dir().join("strategy.md")
     }
 
+    /// Directory for automatic adversarial review artifacts
+    /// (`<session_dir>/goal/review`).
+    pub fn review_dir(&self) -> PathBuf {
+        crate::session::goal_review::review_dir_for_goal_dir(&self.goal_dir())
+    }
+
     /// Move the last classifier details file out of the scratch root
     /// (which the caller is about to remove) into the durable session
     /// goal dir and update `last_classifier_details_path`, so the

@@ -104,6 +104,12 @@ pub struct AcpConnection {
 #[derive(Debug, Clone, Default)]
 pub struct ConnectFlags {
     pub subagents: bool,
+    /// Advisor tool override (`--advisor` / `--no-advisor`). `None` leaves
+    /// the default-on resolution to `AdvisorConfig::from_env`
+    /// (`GROK_ADVISOR_DISABLED` / `GROK_DISABLE_ADVISOR` / `GROK_ADVISOR_ENABLED`).
+    pub advisor_enabled: Option<bool>,
+    /// Opt in to server-side advisor execution (`--server-advisor`).
+    pub server_advisor: bool,
     pub experimental_memory: bool,
     pub no_memory: bool,
     pub disable_web_search: bool,

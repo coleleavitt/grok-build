@@ -1094,6 +1094,56 @@ fn read_session_or_init_meta_str<'a>(
     };
     read(session_meta).or_else(|| read(init_meta))
 }
+/// Read a bool field from `session_meta` first, falling back to `init_meta`.
+/// Bool sibling of `read_session_or_init_meta_str`.
+fn read_session_or_init_meta_bool(
+    session_meta: Option<&acp::Meta>,
+    init_meta: Option<&acp::Meta>,
+    key: &str,
+) -> Option<bool> {
+    let read = |m: Option<&acp::Meta>| -> Option<bool> {
+        m.and_then(|m| m.get(key)).and_then(|v| v.as_bool())
+    };
+    read(session_meta).or_else(|| read(init_meta))
+}
+/// Resolve whether the `advisor` tool is enabled for this session.
+///
+/// `_meta.advisorEnabled` (from `--advisor`/`--no-advisor`) outranks env/config;
+/// when the key is absent, falls back to `AdvisorConfig::from_env().enabled`
+/// (default on). Used to gate BOTH the advertised toolset (tool-strip site)
+/// and the advisor-advertising prompt section, so the two never disagree.
+pub(crate) fn resolve_advisor_enabled(
+    session_meta: Option<&acp::Meta>,
+    init_meta: Option<&acp::Meta>,
+) -> bool {
+    read_session_or_init_meta_bool(session_meta, init_meta, "advisorEnabled")
+        .unwrap_or_else(|| xai_tool_types::advisor::AdvisorConfig::from_env().enabled)
+}
+/// `<advisor>` prompt section advertising the first-class `advisor` tool,
+/// appended to the spawn system prompt only when advisor is resolved-enabled.
+const ADVISOR_PROMPT_SECTION: &str = "\n\n<advisor>\nYou have an `advisor` tool: a fast read-only side-reviewer. Call it before starting substantive work, whenever you are stuck or uncertain, and before you declare a task done. It returns concise advice and never edits or executes.\n</advisor>";
+/// Re-append [`ADVISOR_PROMPT_SECTION`] to a system prompt that was rebuilt
+/// *after* initial spawn (e.g. the zero-turn model-switch harness rebuild in
+/// `handle_rebuild_agent_for_definition`), mirroring `build_spawn_system_prompt`'s
+/// gating exactly so the advisor tool and its prompt nudge never disagree.
+///
+/// - `has_override` short-circuits to a no-op: a verbatim `systemPromptOverride`
+///   is returned untouched, never decorated (mirrors `build_spawn_system_prompt`'s
+///   `if let Some(override_prompt) = ...` branch, which returns the override as-is).
+/// - Idempotent: a prompt that already contains the section is returned unchanged,
+///   so calling this on every rebuild cannot double-append.
+pub(crate) fn maybe_append_advisor_section(
+    prompt: String,
+    advisor_enabled: bool,
+    has_override: bool,
+) -> String {
+    if has_override || !advisor_enabled || prompt.contains(ADVISOR_PROMPT_SECTION) {
+        return prompt;
+    }
+    let mut prompt = prompt;
+    prompt.push_str(ADVISOR_PROMPT_SECTION);
+    prompt
+}
 use xai_chat_state::conversation_util::replace_or_insert_system_head;
 /// Non-empty `systemPromptOverride` from session meta (preferred) or init meta.
 /// A blank string (empty or whitespace-only) is treated as "no override" so a
@@ -1130,6 +1180,9 @@ fn build_spawn_system_prompt(
             prompt.push_str("\n\n<human_rules>\n");
             prompt.push_str(rules);
             prompt.push_str("\n</human_rules>");
+        }
+        if resolve_advisor_enabled(session_meta, init_meta) {
+            prompt.push_str(ADVISOR_PROMPT_SECTION);
         }
         prompt
     }

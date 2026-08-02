@@ -1115,11 +1115,12 @@ pub trait StorageAdapter: Send + Sync {
         state: &crate::session::announcement_state::AnnouncementState,
     ) -> io::Result<()>;
 
-    /// Write/update the goal mode orchestration state
+    /// Write/update the goal mode orchestration state. `None` removes the
+    /// persisted state so a cleared goal does not resurrect on session resume.
     async fn write_goal_mode_state(
         &self,
         info: &Info,
-        state: &crate::session::goal_tracker::GoalOrchestration,
+        state: Option<&crate::session::goal_tracker::GoalOrchestration>,
     ) -> io::Result<()>;
 
     async fn delete_goal_mode_state(&self, info: &Info) -> io::Result<()>;

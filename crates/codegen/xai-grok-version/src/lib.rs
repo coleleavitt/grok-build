@@ -29,7 +29,15 @@ pub fn installed_semver() -> Result<Version, semver::Error> {
 ///
 /// Example: `"0.2.5 [stable]"` or `"0.2.5 [alpha]"`.
 pub fn display_version(channel_label: &str) -> String {
-    format!("{}{}", VERSION, channel_label)
+    append_channel_label(VERSION, channel_label)
+}
+
+fn append_channel_label(version: &str, channel_label: &str) -> String {
+    if channel_label.trim().is_empty() {
+        version.to_string()
+    } else {
+        format!("{}{}", version, channel_label)
+    }
 }
 
 /// Format a version-with-commit string with a channel label.
@@ -37,7 +45,7 @@ pub fn display_version(channel_label: &str) -> String {
 /// Same semantics as [`display_version`] but for the full
 /// `"0.2.5 (abc1234)"` string.
 pub fn display_version_with_commit(version_with_commit: &str, channel_label: &str) -> String {
-    format!("{}{}", version_with_commit, channel_label)
+    append_channel_label(version_with_commit, channel_label)
 }
 
 #[cfg(test)]
@@ -53,6 +61,7 @@ mod tests {
             ("0.2.5 (abc1234)", " [alpha]", "0.2.5 (abc1234) [alpha]"),
             ("0.2.5 (abc1234)", " [stable]", "0.2.5 (abc1234) [stable]"),
             ("0.2.5 (abc1234)", "", "0.2.5 (abc1234)"),
+            ("0.2.5 (abc1234)", " \t ", "0.2.5 (abc1234)"),
             (
                 "0.1.220-alpha.2 (def0)",
                 " [alpha]",
@@ -70,6 +79,7 @@ mod tests {
         }
         // display_version uses compiled VERSION — just verify the label appends
         assert_eq!(display_version(""), VERSION);
+        assert_eq!(display_version(" \t "), VERSION);
         assert!(display_version(" [stable]").ends_with("[stable]"));
     }
 }

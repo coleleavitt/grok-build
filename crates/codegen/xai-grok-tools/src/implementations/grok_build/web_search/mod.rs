@@ -38,7 +38,7 @@ impl crate::types::tool_metadata::ToolMetadata for WebSearchTool {
     }
 
     fn description_template(&self) -> &str {
-        "Search the web for up-to-date information, tailored for coding and software development tasks."
+        "Search the web for up-to-date information, tailored for coding and software development tasks. Supports key-free provider prefixes such as `papers:`, `arxiv:`, `scholar:`, `openalex:`, `crossref:`, `pubmed:`, `doaj:`, `dblp:`, `unpaywall:`, `wiki:`, `ddg:`, `uni:`, `searxng:`, `millionshort:` (uses `~/.grok/credentials.toml [millionshort]` when login is required), and `4get:`. Credential-backed providers are hidden unless built with the `web-search-credentialed-providers` feature."
     }
 
     fn requires_expr(&self) -> Expr<ToolRequirement> {

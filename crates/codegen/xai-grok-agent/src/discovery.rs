@@ -1337,11 +1337,18 @@ mod tests {
         );
 
         let entries = all_subagents_with_home(tmp.path(), &HashMap::new(), None, None);
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 6);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["general-purpose", "explore", "plan", "test-agent"]
+            vec![
+                "general-purpose",
+                "explore",
+                "plan",
+                "advisor",
+                "deep-research",
+                "test-agent",
+            ]
         );
     }
 
@@ -1550,6 +1557,15 @@ mod tests {
         let toggle = HashMap::from([("test-agent".to_string(), false)]);
         let entries = all_subagents_with_home(tmp.path(), &toggle, None, None);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["general-purpose", "explore", "plan"]);
+        assert_eq!(
+            names,
+            vec![
+                "general-purpose",
+                "explore",
+                "plan",
+                "advisor",
+                "deep-research",
+            ]
+        );
     }
 }

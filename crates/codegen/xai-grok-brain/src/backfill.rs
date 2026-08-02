@@ -27,6 +27,10 @@ pub const BRAIN_MAX_TRANSCRIPT_CHARS: usize = 24_000;
 pub const BRAIN_MAX_DOCS: usize = 20;
 /// Onyx recent-window for first run: 14 days.
 pub const BRAIN_LOOKBACK_DAYS: i64 = 14;
+/// Grok-specific cap: extra artifact lines mined per session.
+pub const BRAIN_MAX_ARTIFACT_LINES_PER_SESSION: usize = 16;
+/// Grok-specific cap: characters from one artifact excerpt.
+pub const BRAIN_MAX_CHARS_PER_ARTIFACT: usize = 1_000;
 
 /// A parsed persisted Grok session, before Onyx-style bounds are applied.
 #[derive(Debug, Clone)]
@@ -98,13 +102,16 @@ pub fn build_bounded_run_context(
         });
         if settings.use_connectors {
             for doc in &session.documents {
-                if docs.iter().any(|existing: &DocumentSource| existing.id == doc.id) {
-                    continue;
-                }
-                docs.push(doc.clone());
                 if docs.len() >= BRAIN_MAX_DOCS {
                     break;
                 }
+                if docs
+                    .iter()
+                    .any(|existing: &DocumentSource| existing.id == doc.id)
+                {
+                    continue;
+                }
+                docs.push(doc.clone());
             }
         }
     }
@@ -165,7 +172,10 @@ fn read_session_dir(dir: &Path) -> Result<Option<PersistedBrainSession>> {
     let id = summary
         .info
         .and_then(|info| info.id)
-        .or_else(|| dir.file_name().map(|name| name.to_string_lossy().into_owned()))
+        .or_else(|| {
+            dir.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
         .unwrap_or_else(|| "unknown-session".to_owned());
     let updated_at = summary
         .updated_at
@@ -175,7 +185,11 @@ fn read_session_dir(dir: &Path) -> Result<Option<PersistedBrainSession>> {
         .session_summary
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("Grok session {id}"));
-    let (lines, documents) = read_chat_history(&chat_path)?;
+    let (mut lines, mut documents) = read_chat_history(&chat_path)?;
+    let (artifact_lines, artifact_documents) = read_session_artifacts(dir)?;
+    lines.extend(artifact_lines);
+    documents.extend(artifact_documents);
+    dedup_documents(&mut documents);
     if lines.is_empty() {
         return Ok(None);
     }
@@ -229,6 +243,319 @@ fn read_chat_history(path: &Path) -> Result<(Vec<String>, Vec<DocumentSource>)> 
     Ok((lines, docs))
 }
 
+fn read_session_artifacts(path: &Path) -> Result<(Vec<String>, Vec<DocumentSource>)> {
+    let mut lines = Vec::new();
+    let mut docs = Vec::new();
+    read_jsonl_artifact_file(path, "events.jsonl", "Event", &mut lines, &mut docs)?;
+    read_jsonl_artifact_file(path, "updates.jsonl", "Update", &mut lines, &mut docs)?;
+    read_text_artifact_dir(path, "terminal", "Terminal log", &mut lines, &mut docs)?;
+    read_text_artifact_dir(path, "mcp", "Tool output", &mut lines, &mut docs)?;
+    read_text_artifact_dir(path, "subagents", "Subagent output", &mut lines, &mut docs)?;
+    read_text_artifact_dir(path, "goal", "Goal artifact", &mut lines, &mut docs)?;
+    read_text_artifact_dir(path, "test_reports", "Test report", &mut lines, &mut docs)?;
+    read_text_artifact_dir(path, "reports", "Test report", &mut lines, &mut docs)?;
+    read_named_text_artifact_file(path, "plan.md", "Plan artifact", &mut lines, &mut docs)?;
+    read_named_text_artifact_file(path, "plan.json", "Plan artifact", &mut lines, &mut docs)?;
+    read_named_text_artifact_file(
+        path,
+        "plan_mode.json",
+        "Plan artifact",
+        &mut lines,
+        &mut docs,
+    )?;
+    lines.truncate(BRAIN_MAX_ARTIFACT_LINES_PER_SESSION);
+    Ok((lines, docs))
+}
+
+fn read_jsonl_artifact_file(
+    session_dir: &Path,
+    file_name: &str,
+    label: &str,
+    lines: &mut Vec<String>,
+    docs: &mut Vec<DocumentSource>,
+) -> Result<()> {
+    if lines.len() >= BRAIN_MAX_ARTIFACT_LINES_PER_SESSION {
+        return Ok(());
+    }
+    let path = session_dir.join(file_name);
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(&path)?;
+    let mut kept = 0usize;
+    for line in content.lines().rev() {
+        if kept >= 4 || lines.len() >= BRAIN_MAX_ARTIFACT_LINES_PER_SESSION {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let excerpt = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|value| summarize_json_artifact(&value))
+            .unwrap_or_else(|| truncate_chars(line, BRAIN_MAX_CHARS_PER_ARTIFACT));
+        if excerpt.trim().is_empty() {
+            continue;
+        }
+        collect_document_refs(&excerpt, docs);
+        lines.push(format!("{label} {file_name}: {excerpt}"));
+        docs.push(artifact_document(&path, label, &excerpt));
+        kept += 1;
+    }
+    Ok(())
+}
+
+fn read_text_artifact_dir(
+    session_dir: &Path,
+    dir_name: &str,
+    label: &str,
+    lines: &mut Vec<String>,
+    docs: &mut Vec<DocumentSource>,
+) -> Result<()> {
+    if lines.len() >= BRAIN_MAX_ARTIFACT_LINES_PER_SESSION {
+        return Ok(());
+    }
+    let root = session_dir.join(dir_name);
+    if !root.exists() {
+        return Ok(());
+    }
+    let mut files = Vec::new();
+    collect_artifact_files(&root, &mut files)?;
+    files.sort_by_key(|path| {
+        std::cmp::Reverse(
+            path.metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_secs()),
+        )
+    });
+    for path in files.into_iter().take(6) {
+        if lines.len() >= BRAIN_MAX_ARTIFACT_LINES_PER_SESSION {
+            break;
+        }
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let excerpt = summarize_artifact_file(&path, &content);
+        if excerpt.is_empty() {
+            continue;
+        }
+        collect_document_refs(&excerpt, docs);
+        let rel = path
+            .strip_prefix(session_dir)
+            .unwrap_or(&path)
+            .to_string_lossy();
+        lines.push(format!("{label} {rel}: {excerpt}"));
+        docs.push(artifact_document(&path, label, &excerpt));
+    }
+    Ok(())
+}
+
+fn read_named_text_artifact_file(
+    session_dir: &Path,
+    file_name: &str,
+    label: &str,
+    lines: &mut Vec<String>,
+    docs: &mut Vec<DocumentSource>,
+) -> Result<()> {
+    if lines.len() >= BRAIN_MAX_ARTIFACT_LINES_PER_SESSION {
+        return Ok(());
+    }
+    let path = session_dir.join(file_name);
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(&path)?;
+    let excerpt = summarize_artifact_file(&path, &content);
+    if excerpt.is_empty() {
+        return Ok(());
+    }
+    collect_document_refs(&excerpt, docs);
+    lines.push(format!("{label} {file_name}: {excerpt}"));
+    docs.push(artifact_document(&path, label, &excerpt));
+    Ok(())
+}
+
+fn collect_artifact_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_artifact_files(&path, out)?;
+        } else if file_type.is_file()
+            && !path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext == "lock")
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn summarize_artifact_file(path: &Path, content: &str) -> String {
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+    if matches!(extension, "json" | "jsonl") {
+        let mut pieces = Vec::new();
+        for line in content.lines().rev().take(8) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && let Some(summary) = summarize_json_artifact(&value)
+            {
+                pieces.push(summary);
+            }
+            if pieces.len() >= 4 {
+                break;
+            }
+        }
+        if !pieces.is_empty() {
+            return truncate_chars(&pieces.join(" | "), BRAIN_MAX_CHARS_PER_ARTIFACT);
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
+            && let Some(summary) = summarize_json_artifact(&value)
+        {
+            return summary;
+        }
+    }
+    summarize_text_artifact(content)
+}
+
+fn summarize_json_artifact(value: &serde_json::Value) -> Option<String> {
+    let mut parts = Vec::new();
+    collect_json_strings(value, "", &mut parts);
+    parts.dedup();
+    let joined = parts
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .take(12)
+        .collect::<Vec<_>>()
+        .join("; ");
+    (!joined.trim().is_empty()).then(|| truncate_chars(&joined, BRAIN_MAX_CHARS_PER_ARTIFACT))
+}
+
+fn collect_json_strings(value: &serde_json::Value, key: &str, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            if keep_json_key(key) || text.contains("error") || text.contains("failed") {
+                out.push(format_json_piece(key, text));
+            }
+        }
+        serde_json::Value::Number(number) => {
+            if keep_json_key(key) {
+                out.push(format!("{key}={number}"));
+            }
+        }
+        serde_json::Value::Bool(flag) => {
+            if keep_json_key(key) {
+                out.push(format!("{key}={flag}"));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter().take(6) {
+                collect_json_strings(item, key, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                collect_json_strings(value, key, out);
+            }
+        }
+        serde_json::Value::Null => {}
+    }
+}
+
+fn keep_json_key(key: &str) -> bool {
+    matches!(
+        key,
+        "type"
+            | "method"
+            | "sessionUpdate"
+            | "name"
+            | "description"
+            | "message"
+            | "error"
+            | "status"
+            | "command"
+            | "summary"
+            | "title"
+            | "text"
+            | "output"
+            | "stdout"
+            | "stderr"
+            | "result"
+            | "exit_code"
+            | "exitCode"
+            | "task_id"
+            | "taskId"
+            | "server_name"
+            | "tool_name"
+            | "toolName"
+            | "model_id"
+            | "path"
+    )
+}
+
+fn format_json_piece(key: &str, text: &str) -> String {
+    let text = text.replace(['\n', '\r', '\t'], " ");
+    let text = truncate_chars(text.trim(), 240);
+    if key.is_empty() {
+        text
+    } else {
+        format!("{key}: {text}")
+    }
+}
+
+fn summarize_text_artifact(content: &str) -> String {
+    let mut selected = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if selected.len() < 3
+            || line.contains("error")
+            || line.contains("failed")
+            || line.contains("passed")
+            || line.contains("test result")
+        {
+            selected.push(line.to_owned());
+        }
+        if selected.len() >= 10 {
+            break;
+        }
+    }
+    truncate_chars(&selected.join(" | "), BRAIN_MAX_CHARS_PER_ARTIFACT)
+}
+
+fn artifact_document(path: &Path, label: &str, excerpt: &str) -> DocumentSource {
+    let id = format!("file://{}", path.display());
+    let file_label = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| label.to_owned());
+    DocumentSource {
+        id: id.clone(),
+        label: format!("{label}: {file_label}"),
+        url: Some(id),
+        blurb: Some(truncate_chars(excerpt, 300)),
+    }
+}
+
+fn dedup_documents(docs: &mut Vec<DocumentSource>) {
+    let mut seen = std::collections::HashSet::new();
+    docs.retain(|doc| seen.insert(doc.id.clone()));
+}
+
 fn collect_document_refs(text: &str, docs: &mut Vec<DocumentSource>) {
     for uri in extract_file_uris(text) {
         if docs.iter().any(|doc| doc.id == uri) || docs.len() >= BRAIN_MAX_DOCS {
@@ -267,9 +594,7 @@ fn extract_file_uris(text: &str) -> Vec<String> {
         .filter_map(|token| {
             let idx = token.find("file://")?;
             let raw = &token[idx..];
-            let end = raw
-                .find([')', ']', '>', '"', '\''])
-                .unwrap_or(raw.len());
+            let end = raw.find([')', ']', '>', '"', '\'']).unwrap_or(raw.len());
             Some(raw[..end].trim_end_matches([',', '.', ';']).to_owned())
         })
         .filter(|s| s.len() > "file://".len())
@@ -318,7 +643,9 @@ enum ChatItemJson {
         #[serde(default)]
         synthetic_reason: Option<String>,
     },
-    Assistant { content: String },
+    Assistant {
+        content: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -383,11 +710,13 @@ mod tests {
         let selection = build_bounded_run_context(sessions, &settings, now);
         assert_eq!(selection.sessions.len(), 6, "days 0..5 survive cutoff");
         assert_eq!(selection.context.sessions.len(), 6);
-        assert!(selection
-            .context
-            .sessions
-            .iter()
-            .all(|s| s.lines.len() == BRAIN_MAX_MESSAGES_PER_SESSION));
+        assert!(
+            selection
+                .context
+                .sessions
+                .iter()
+                .all(|s| s.lines.len() == BRAIN_MAX_MESSAGES_PER_SESSION)
+        );
         assert_eq!(selection.context.documents.len(), 6);
     }
 
@@ -405,6 +734,24 @@ mod tests {
         settings.use_connectors = true;
         let with = build_bounded_run_context(vec![session("s", 0, 1)], &settings, now);
         assert_eq!(with.context.documents.len(), 1);
+    }
+
+    #[test]
+    fn connector_documents_are_capped_across_sessions() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 21, 12, 0, 0).unwrap();
+        let settings = BrainSettings {
+            enabled: true,
+            use_connectors: true,
+            focus_instructions: None,
+            last_run_at: None,
+        };
+        let sessions = (0..30)
+            .map(|i| session(&format!("doc-cap-{i}"), 0, 1))
+            .collect::<Vec<_>>();
+
+        let selection = build_bounded_run_context(sessions, &settings, now);
+
+        assert_eq!(selection.context.documents.len(), BRAIN_MAX_DOCS);
     }
 
     #[test]
@@ -429,7 +776,98 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].lines.len(), 2);
         assert_eq!(sessions[0].documents.len(), 2);
-        assert!(sessions[0].documents.iter().any(|d| d.id == "file://docs/brain.md"));
-        assert!(sessions[0].documents.iter().any(|d| d.id == "/repo/notes.txt"));
+        assert!(
+            sessions[0]
+                .documents
+                .iter()
+                .any(|d| d.id == "file://docs/brain.md")
+        );
+        assert!(
+            sessions[0]
+                .documents
+                .iter()
+                .any(|d| d.id == "/repo/notes.txt")
+        );
+    }
+    #[test]
+    fn reads_grok_artifacts_into_bounded_session_context() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("sessions/cwd/session-artifacts");
+        std::fs::create_dir_all(session_dir.join("terminal")).unwrap();
+        std::fs::create_dir_all(session_dir.join("mcp")).unwrap();
+        std::fs::create_dir_all(session_dir.join("subagents/child")).unwrap();
+        std::fs::create_dir_all(session_dir.join("goal")).unwrap();
+        std::fs::create_dir_all(session_dir.join("test_reports")).unwrap();
+        std::fs::write(
+            session_dir.join("summary.json"),
+            r#"{"info":{"id":"session-artifacts"},"session_summary":"Artifact Demo","updated_at":"2026-07-21T12:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("chat_history.jsonl"),
+            r#"{"type":"user","content":[{"type":"text","text":"Work on Zephyr"}]}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("events.jsonl"),
+            r#"{"type":"turn_completed","message":"unit tests passed","model_id":"gpt-test"}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("updates.jsonl"),
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","content":{"text":"cargo test failed then passed"}}}}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("terminal/call_1.log"),
+            "cargo test -p demo\ntest result: ok. 3 passed\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("mcp/call_1.json"),
+            r#"{"tool_name":"codegraph_explore","result":"found Brain source citation detail"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("subagents/child/output.json"),
+            r#"{"summary":"subagent found the Brain graph issue"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("goal/plan.md"),
+            "# Plan\n## Verification plan\nRun Brain tests\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("test_reports/brain.junit.xml"),
+            "<testsuite tests=\"1\" failures=\"0\"><testcase name=\"brain\"/></testsuite>",
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("plan.json"),
+            r#"{"title":"Brain command plan","status":"in_progress"}"#,
+        )
+        .unwrap();
+
+        let sessions = read_persisted_sessions(tmp.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let joined = sessions[0].lines.join("\n");
+        assert!(joined.contains("Event events.jsonl"));
+        assert!(joined.contains("Update updates.jsonl"));
+        assert!(joined.contains("Terminal log terminal/call_1.log"));
+        assert!(joined.contains("Tool output mcp/call_1.json"));
+        assert!(joined.contains("Subagent output subagents/child/output.json"));
+        assert!(joined.contains("Goal artifact goal/plan.md"));
+        assert!(joined.contains("Test report test_reports/brain.junit.xml"));
+        assert!(joined.contains("Plan artifact plan.json"));
+        assert!(
+            sessions[0]
+                .documents
+                .iter()
+                .any(|doc| doc.label.contains("Terminal log"))
+        );
     }
 }

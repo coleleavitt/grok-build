@@ -2742,6 +2742,15 @@ impl Config {
             .default(goal_enabled)
             .resolve()
     }
+    /// Automatic post-change review is intentionally default-off while the
+    /// staged pipeline rolls out. Env/config can enable it; no remote setting
+    /// is wired yet.
+    pub(crate) fn resolve_goal_review_enabled(&self) -> Resolved<bool> {
+        BoolFlag::env("GROK_GOAL_REVIEW")
+            .config(self.goal.review_enabled)
+            .default(false)
+            .resolve()
+    }
     pub(crate) fn resolve_goal_planner_enabled(&self, goal_enabled: bool) -> Resolved<bool> {
         BoolFlag::env("GROK_GOAL_PLANNER")
             .config(self.goal.planner_enabled)
@@ -4804,6 +4813,8 @@ pub struct GoalConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classifier_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub planner_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_enabled: Option<bool>,
@@ -5073,30 +5084,27 @@ pub(crate) fn first_own_credential(
         .map(str::to_owned)
         .or_else(|| env_key.and_then(EnvKeys::resolve_value))
 }
-/// Priority: model api_key/env_key > cached auth-provider token > session
-/// token > XAI_API_KEY.
+/// Resolve credentials for a model.
+/// Priority: model api_key/env_key > first-party session token > first-party
+/// XAI_API_KEY. Third-party endpoints never receive xAI/session credentials.
+///
+/// When `env_key` lists multiple names, the first set non-empty value is used.
 pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> ResolvedCredentials {
     let info = model.info();
+    let is_xai_endpoint = crate::util::is_xai_api_url(&info.base_url);
     let (api_key, base_url, auth_type) = if let Some(key) = model.own_credential() {
         (
             Some(key),
             info.base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )
-    } else if let Some(provider) = model.auth_provider.as_ref() {
-        debug_assert!(model.effective_auth_provider().is_some());
-        (
-            provider.cached_token(),
-            info.base_url.clone(),
-            xai_chat_state::AuthType::ApiKey,
-        )
-    } else if let Some(key) = session_key {
+    } else if is_xai_endpoint && let Some(key) = session_key {
         (
             Some(key.to_owned()),
             info.base_url.clone(),
             xai_chat_state::AuthType::SessionToken,
         )
-    } else if let Ok(key) = crate::agent::auth_method::read_xai_api_key_env() {
+    } else if is_xai_endpoint && let Ok(key) = crate::agent::auth_method::read_xai_api_key_env() {
         let url = model
             .api_base_url
             .clone()
@@ -5477,6 +5485,7 @@ pub fn sampling_config_for_model(
         compactions_remaining: info.compactions_remaining,
         compaction_at_tokens: info.compaction_at_tokens,
         doom_loop_recovery: None,
+        advisor_server_model: None,
         provider_request_adapter: info.provider_request_adapter.clone(),
         header_injector: None,
     }
@@ -6897,6 +6906,24 @@ reasoning_effort = "low"
         }
     }
     #[test]
+    #[serial]
+    fn third_party_model_missing_env_key_does_not_fall_back_to_session_or_xai_key() {
+        use xai_chat_state::AuthType;
+        use xai_grok_test_support::EnvGuard;
+
+        let openai_key = "GROK_TEST_MISSING_OPENAI_KEY";
+        let _missing = EnvGuard::unset(openai_key);
+        let _xai = EnvGuard::set("XAI_API_KEY", "xai-key-must-not-leak");
+        let mut model = test_model_entry("gpt-test", "https://api.openai.com/v1", None, None, None);
+        model.env_key = Some(EnvKeys::single(openai_key));
+
+        let creds = resolve_credentials(&model, Some("session-jwt-must-not-leak"));
+
+        assert_eq!(creds.auth_type, AuthType::ApiKey);
+        assert_eq!(creds.api_key, None);
+        assert_eq!(creds.base_url, "https://api.openai.com/v1");
+    }
+    #[test]
     fn env_keys_deser_string_or_array() {
         let one: EnvKeys = serde_json::from_str(r#""ANTHROPIC_AUTH_TOKEN""#).unwrap();
         assert_eq!(one.names(), vec!["ANTHROPIC_AUTH_TOKEN"]);
@@ -7719,7 +7746,10 @@ reasoning_effort = "low"
         let resolved = resolve_model_list_with_providers(&cfg, None, &providers);
 
         for key in [
+            "claude-opus-4-6",
+            "claude-opus-4-7",
             "claude-opus-4-8",
+            "claude-sonnet-4-6",
             "claude-sonnet-5",
             "claude-haiku-4-5",
             "claude-fable-5",
@@ -7742,6 +7772,18 @@ reasoning_effort = "low"
             );
         }
         assert_eq!(
+            resolved["claude-opus-4-6"].info.context_window.get(),
+            1_000_000
+        );
+        assert_eq!(
+            resolved["claude-opus-4-7"].info.context_window.get(),
+            1_000_000
+        );
+        assert_eq!(
+            resolved["claude-sonnet-4-6"].info.context_window.get(),
+            1_000_000
+        );
+        assert_eq!(
             resolved["claude-opus-4-8"].info.context_window.get(),
             1_000_000
         );
@@ -7750,8 +7792,84 @@ reasoning_effort = "low"
             200_000
         );
         assert_eq!(
+            resolved["claude-opus-4-6"].info.max_completion_tokens,
+            Some(128_000)
+        );
+        assert_eq!(
+            resolved["claude-opus-4-7"].info.max_completion_tokens,
+            Some(128_000)
+        );
+        assert_eq!(
+            resolved["claude-sonnet-4-6"].info.max_completion_tokens,
+            Some(128_000)
+        );
+        assert_eq!(
             resolved["claude-opus-4-8"].info.max_completion_tokens,
-            Some(64_000)
+            Some(128_000)
+        );
+        assert_eq!(
+            resolved["claude-sonnet-5"].info.max_completion_tokens,
+            Some(128_000)
+        );
+        assert_eq!(
+            resolved["claude-fable-5"].info.max_completion_tokens,
+            Some(128_000)
+        );
+    }
+
+    /// End-to-end for the bundled OpenAI provider plugin: the shipped
+    /// `plugins/openai/plugin.json` must parse as a plugin manifest and
+    /// flatten into the model catalog with OpenAI Responses API settings.
+    #[test]
+    fn bundled_openai_plugin_contributes_gpt_models() {
+        use xai_grok_agent::plugins::manifest::{ManifestLoadResult, load_manifest};
+
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("repo root");
+        let plugin_root = repo_root.join("plugins/openai");
+        let manifest = match load_manifest(&plugin_root).expect("manifest loads") {
+            ManifestLoadResult::Found(m) => *m,
+            ManifestLoadResult::NotFound => panic!("plugins/openai/plugin.json missing"),
+        };
+        assert_eq!(manifest.name, "openai");
+
+        let mut providers = IndexMap::new();
+        for (provider_id, provider) in manifest.model_providers {
+            providers.insert(provider_id, plugin_provider_to_config(provider));
+        }
+        let empty: toml::Value = toml::from_str("").unwrap();
+        let cfg = Config::new_from_toml_cfg(&empty).expect("empty config parses");
+        let resolved = resolve_model_list_with_providers(&cfg, None, &providers);
+
+        for key in [
+            "gpt-5.5",
+            "gpt-5.5-pro",
+            "gpt-5.4",
+            "gpt-5.4-pro",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+        ] {
+            let model = resolved
+                .get(key)
+                .unwrap_or_else(|| panic!("plugin model `{key}` missing from catalog"));
+            assert_eq!(model.info.model, key);
+            assert_eq!(model.info.base_url, "https://api.openai.com/v1");
+            assert_eq!(model.info.api_backend, ApiBackend::Responses);
+            assert_eq!(model.info.auth_scheme, AuthScheme::Bearer);
+            assert_eq!(model.env_key, Some(EnvKeys::single("OPENAI_API_KEY")));
+            let expected_context = match key {
+                "gpt-5.4-mini" | "gpt-5.4-nano" => 400_000,
+                _ => 1_050_000,
+            };
+            assert_eq!(model.info.context_window.get(), expected_context);
+            assert_eq!(model.info.max_completion_tokens, Some(128_000));
+            assert!(model.info.supports_reasoning_effort);
+        }
+        assert!(
+            resolved.keys().all(|key| !key.starts_with("gpt-5.6")),
+            "GPT-5.6 preview models should not be contributed by the OpenAI plugin"
         );
     }
 
@@ -10111,6 +10229,7 @@ reasoning_effort = "low"
         unsafe {
             std::env::remove_var("GROK_GOAL");
             std::env::remove_var("GROK_GOAL_CLASSIFIER");
+            std::env::remove_var("GROK_GOAL_REVIEW");
             std::env::remove_var("GROK_GOAL_PLANNER");
             std::env::remove_var("GROK_GOAL_SUMMARY");
             std::env::remove_var("GROK_GOAL_VERIFIER_N");
@@ -10216,6 +10335,39 @@ reasoning_effort = "low"
         assert_eq!(r.source, ConfigSource::Env);
         clear_goal_envs();
     }
+    #[test]
+    #[serial]
+    fn resolve_goal_review_defaults_off_for_safe_rollout() {
+        clear_goal_envs();
+        let r = cfg_with_goal(true).resolve_goal_review_enabled();
+        assert!(!r.value);
+        assert_eq!(r.source, ConfigSource::Default);
+        clear_goal_envs();
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_goal_review_env_and_config_enable_it() {
+        clear_goal_envs();
+        let r = cfg_with_goal_config(GoalConfig {
+            review_enabled: Some(true),
+            ..Default::default()
+        })
+        .resolve_goal_review_enabled();
+        assert!(r.value);
+        assert_eq!(r.source, ConfigSource::Config);
+
+        unsafe { std::env::set_var("GROK_GOAL_REVIEW", "0") };
+        let r = cfg_with_goal_config(GoalConfig {
+            review_enabled: Some(true),
+            ..Default::default()
+        })
+        .resolve_goal_review_enabled();
+        assert!(!r.value);
+        assert_eq!(r.source, ConfigSource::Env);
+        clear_goal_envs();
+    }
+
     #[test]
     #[serial]
     fn resolve_goal_planner_default_tracks_goal_enabled() {

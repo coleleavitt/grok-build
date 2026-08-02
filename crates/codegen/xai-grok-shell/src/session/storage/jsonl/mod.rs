@@ -1567,11 +1567,18 @@ impl StorageAdapter for JsonlStorageAdapter {
     async fn write_goal_mode_state(
         &self,
         info: &Info,
-        state: &crate::session::goal_tracker::GoalOrchestration,
+        state: Option<&crate::session::goal_tracker::GoalOrchestration>,
     ) -> io::Result<()> {
+        let target = self.goal_mode_state_file(info);
+        let Some(state) = state else {
+            // Cleared goal: remove the persisted state (missing file is fine).
+            return match tokio::fs::remove_file(&target).await {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            };
+        };
         let json = serde_json::to_vec_pretty(state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let target = self.goal_mode_state_file(info);
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use axum::Router;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, Sse};
 use axum::routing::post;
 use futures_util::stream::{self, StreamExt};
@@ -21,11 +21,11 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use xai_grok_sampler::{
-    ApiBackend, RequestId, RetryPolicy, SamplerActor, SamplerConfig, SamplingChannel,
-    SamplingErrorKind, SamplingEvent,
+    ApiBackend, AuthScheme, BearerResolver, RequestId, RetryPolicy, SamplerActor, SamplerConfig,
+    SamplingChannel, SamplingErrorKind, SamplingEvent,
 };
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationRequest, DoomLoopRecoveryPolicy, UserItem,
+    ConversationItem, ConversationRequest, DoomLoopRecoveryPolicy, ProviderRequestAdapter, UserItem,
 };
 use xai_grok_test_support::{SseEvent, sse};
 
@@ -100,6 +100,7 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         compaction_at_tokens: None,
         doom_loop_recovery: None,
         provider_request_adapter: None,
+        advisor_server_model: None,
         header_injector: None,
     }
 }
@@ -114,6 +115,15 @@ fn user_request(text: &str) -> ConversationRequest {
             ..Default::default()
         })],
         ..Default::default()
+    }
+}
+
+#[derive(Debug)]
+struct StaticBearer(&'static str);
+
+impl BearerResolver for StaticBearer {
+    fn current_bearer(&self) -> Option<String> {
+        Some(self.0.to_string())
     }
 }
 
@@ -490,6 +500,66 @@ async fn rate_limit_exhausts_at_threshold_and_yields_failed() {
     // hits). Allow a small slack in case scheduling fires a third
     // attempt before the threshold check.
     assert!((1..=3).contains(&hits), "expected 1-3 hits, got {hits}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_oauth_rate_limit_hands_off_without_retry_after_sleep() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let counter_handler = Arc::clone(&counter);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = Arc::clone(&counter_handler);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, "120")],
+                    json!({
+                        "error": {
+                            "type": "rate_limit_error",
+                            "message": "This request would exceed your account's rate limit."
+                        }
+                    })
+                    .to_string(),
+                )
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let mut cfg = test_config(server.base_url(), "test-model");
+    cfg.auth_scheme = AuthScheme::Bearer;
+    cfg.bearer_resolver = Some(Arc::new(StaticBearer(
+        "sk-ant-oat01-abcdefghijklmnopqrstuvwxyz012345",
+    )));
+    cfg.provider_request_adapter = Some(ProviderRequestAdapter::Anthropic {
+        tool_name_prefix: "mcp__".to_string(),
+        command: None,
+    });
+    let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
+
+    let rid = RequestId::from("req-anthropic-oauth-429");
+    handle.submit(rid.clone(), user_request("hi"));
+
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(2)).await;
+    server.shutdown();
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SamplingEvent::Retrying { .. })),
+        "Anthropic OAuth 429 should hand off to shell rotation, not sleep"
+    );
+    match events.last().unwrap() {
+        SamplingEvent::Failed { error, .. } => {
+            assert_eq!(error.kind, SamplingErrorKind::RateLimited);
+            assert_eq!(error.status_code, Some(429));
+            assert_eq!(error.retry_after_secs, Some(120));
+        }
+        other => panic!("expected Failed(RateLimited), got {other:?}"),
+    }
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
 
 // ---------------------------------------------------------------------------

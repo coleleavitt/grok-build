@@ -15,12 +15,11 @@
 //! - `TaskModelValidator` — validates explicit model slugs before spawn
 
 pub mod backend;
-pub mod coordinator;
-mod coordinator_state;
-pub use coordinator_state::{cap_completion_output, completion_summary};
+pub mod spawn;
 pub mod types;
 
 use self::backend::SubagentBackendResource;
+use self::spawn::SubagentSpawnParams;
 use self::types::CurrentPromptIdResource;
 
 use self::types::*;
@@ -29,17 +28,19 @@ use crate::types::requirements::{Expr, ToolRequirement};
 #[allow(unused_imports)]
 use crate::types::resources::SharedResources;
 use crate::types::tool::{ToolKind, ToolNamespace};
-use regex::Regex;
-use xai_tool_types::{SubagentCompletedOutput, SubagentIsolationMode, TaskToolInput};
+use xai_tool_types::{
+    ADVISOR_SUBAGENT, SubagentCompletedOutput, SubagentIsolationMode, TaskToolInput,
+};
 
 /// Default max nesting depth when [`MaxSubagentDepth`] is not injected.
 pub const MAX_SUBAGENT_DEPTH: u32 = 1;
 
-pub fn effective_max_subagent_depth(resources: &crate::types::resources::Resources) -> u32 {
-    resources
-        .get::<MaxSubagentDepth>()
-        .map(|d| d.0)
-        .unwrap_or(MAX_SUBAGENT_DEPTH)
+fn is_advisor_subagent(subagent_type: &str) -> bool {
+    subagent_type == ADVISOR_SUBAGENT.name
+}
+
+fn advisor_model_unavailable_message(detail: impl Into<String>) -> String {
+    xai_tool_types::advisor::AdvisorError::ModelUnavailable(detail.into()).to_string()
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -344,38 +345,75 @@ impl xai_tool_runtime::Tool for TaskTool {
             }
         }
 
+        let is_advisor = is_advisor_subagent(&input.subagent_type);
         if let Some(ref requested) = model {
-            let validator = model_validator.ok_or_else(|| {
-                xai_tool_runtime::ToolError::custom(
-                    "validation_unavailable",
-                    "Cannot validate Task.model: model catalog validator is unavailable.",
-                )
-            })?;
+            let validator = match model_validator {
+                Some(validator) => validator,
+                None if is_advisor => {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "validation_unavailable",
+                        format!(
+                            "Advisor unavailable: {}",
+                            advisor_model_unavailable_message(
+                                "model catalog validator is unavailable"
+                            )
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "validation_unavailable",
+                        "Cannot validate Task.model: model catalog validator is unavailable.",
+                    ));
+                }
+            };
             if let Some(error) = validator.error_for(requested) {
+                if is_advisor {
+                    return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+                        "Advisor unavailable: {}",
+                        advisor_model_unavailable_message(error)
+                    )));
+                }
                 return Err(xai_tool_runtime::ToolError::invalid_arguments(error));
             }
         }
+
+        let advisor_gate_prevalidated = if is_advisor {
+            match backend
+                .backend()
+                .validate_advisor_spawn(
+                    &input.subagent_type,
+                    &parent_session_id,
+                    &input.prompt,
+                    resume_from.as_deref(),
+                )
+                .await
+            {
+                SubagentAdvisorPreflightOutcome::Ok => true,
+                SubagentAdvisorPreflightOutcome::Rejected { message } => {
+                    return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+                        "Advisor unavailable: {message}"
+                    )));
+                }
+                SubagentAdvisorPreflightOutcome::ValidationUnavailable => {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "validation_unavailable",
+                        "Cannot validate advisor launch: the subagent coordinator is unreachable. Retry shortly or notify ops.",
+                    ));
+                }
+            }
+        } else {
+            false
+        };
 
         // 3. Build the subagent request
         let id = input
             .task_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-        let child_cancellation = tokio_util::sync::CancellationToken::new();
-        let cancellation_forwarder = (!input.run_in_background)
-            .then(|| {
-                tool_cancellation.map(|tool_cancellation| {
-                    let child_cancellation = child_cancellation.clone();
-                    tokio::spawn(async move {
-                        tool_cancellation.cancelled().await;
-                        child_cancellation.cancel();
-                    })
-                })
-            })
-            .flatten();
 
-        let request = SubagentRequest {
-            id: id.clone(),
+        let request = SubagentSpawnParams {
+            id: Some(id.clone()),
             prompt: input.prompt.clone(),
             description: input.description.clone(),
             subagent_type: input.subagent_type.clone(),
@@ -383,31 +421,25 @@ impl xai_tool_runtime::Tool for TaskTool {
             parent_prompt_id,
             resume_from,
             cwd,
-            runtime_overrides: SubagentRuntimeOverrides {
-                model,
-                model_override_provenance: ModelOverrideProvenance::Tool,
-                reasoning_effort: None,
-                persona: None,
-                capability_mode: input.capability_mode,
-                isolation: input.isolation,
-                // Model-issued `task` spawns never override the harness; the
-                // parent agent decides the flavor (the `/goal` harness override
-                // is set only by the harness-internal role spawners).
-                harness_agent_type: None,
-                completion_output_cap: None,
-                spawn_depth: None,
-                output_token_budget: None,
-                output_schema: None,
-                loop_task_id: None,
-            },
+            model,
+            model_override_provenance: ModelOverrideProvenance::Tool,
+            reasoning_effort: None,
+            persona: None,
+            capability_mode: input.capability_mode,
+            isolation: input.isolation,
+            // Model-issued `task` spawns never override the harness; the
+            // parent agent decides the flavor (the `/goal` harness override
+            // is set only by the harness-internal role spawners).
+            harness_agent_type: None,
             run_in_background: input.run_in_background,
             // Model-spawned subagents must still appear in the idle reminder.
             surface_completion: true,
-            await_to_completion: false,
-            fork_context: false,
-            owner: SubagentOwner::Task,
-            cancel_token: child_cancellation,
-        };
+            // Advisor is a side reviewer: it needs the bounded parent
+            // conversation snapshot supplied by the coordinator's fork path.
+            fork_context: is_advisor_subagent(&input.subagent_type),
+            advisor_gate_prevalidated,
+        }
+        .into_request();
 
         // 4. Background mode: fire-and-forget via backend.spawn().
         // Coordinator stores the result for TaskOutputTool polling.
@@ -576,6 +608,22 @@ mod tests {
     where
         F: Fn(&str, &str) -> SubagentValidateTypeOutcome + Send + 'static,
     {
+        make_backend_with_validation_and_advisor_fn(outcome_fn, |_, _, _, _| {
+            SubagentAdvisorPreflightOutcome::Ok
+        })
+    }
+
+    fn make_backend_with_validation_and_advisor_fn<F, G>(
+        outcome_fn: F,
+        advisor_fn: G,
+    ) -> (
+        SubagentBackendResource,
+        mpsc::UnboundedReceiver<SubagentEvent>,
+    )
+    where
+        F: Fn(&str, &str) -> SubagentValidateTypeOutcome + Send + 'static,
+        G: Fn(&str, &str, &str, Option<&str>) -> SubagentAdvisorPreflightOutcome + Send + 'static,
+    {
         let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<SubagentEvent>();
         let (proxy_tx, proxy_rx) = mpsc::unbounded_channel::<SubagentEvent>();
         let backend = SubagentBackendResource(Arc::new(ChannelBackend::new(raw_tx)));
@@ -584,6 +632,15 @@ mod tests {
                 match event {
                     SubagentEvent::ValidateType(req) => {
                         let outcome = outcome_fn(&req.subagent_type, &req.parent_session_id);
+                        let _ = req.respond_to.send(outcome);
+                    }
+                    SubagentEvent::ValidateAdvisor(req) => {
+                        let outcome = advisor_fn(
+                            &req.subagent_type,
+                            &req.parent_session_id,
+                            &req.prompt,
+                            req.resume_from.as_deref(),
+                        );
                         let _ = req.respond_to.send(outcome);
                     }
                     other => {
@@ -987,13 +1044,47 @@ mod tests {
     }
 
     fn resources_for_task(backend: SubagentBackendResource) -> Resources {
+        resources_for_task_with_session(backend, "parent-session")
+    }
+
+    fn resources_for_task_with_session(
+        backend: SubagentBackendResource,
+        session_id: &str,
+    ) -> Resources {
         let mut resources = Resources::new();
         resources.insert(backend);
         resources.insert(SubagentDepthCounter(0));
-        resources.insert(SessionIdResource("parent-session".to_string()));
+        resources.insert(SessionIdResource(session_id.to_string()));
         resources.insert(CurrentPromptIdResource("prompt-123".to_string()));
         resources.insert(TaskModelValidator::new(|_| None));
         resources
+    }
+
+    static ADVISOR_ENV_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn advisor_env_lock() -> &'static tokio::sync::Mutex<()> {
+        ADVISOR_ENV_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        name: &'static str,
+        previous: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.name, value) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
+    fn set_env(name: &'static str, value: &str) -> EnvGuard {
+        let previous = std::env::var(name).ok();
+        unsafe { std::env::set_var(name, value) };
+        EnvGuard { name, previous }
     }
 
     #[tokio::test]
@@ -1122,6 +1213,66 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "spawn must not reach the coordinator"
+        );
+    }
+
+    #[tokio::test]
+    async fn advisor_invalid_model_returns_clear_error_before_spawn() {
+        let _env_lock = advisor_env_lock().lock().await;
+        let _enabled = set_env("GROK_ADVISOR_ENABLED", "true");
+        let (backend, mut rx) = make_backend();
+        let mut resources = resources_for_task_with_session(backend, "advisor-invalid-model");
+        resources.insert(TaskModelValidator::new(|requested| {
+            (requested == "missing-advisor-model").then(|| {
+                "Unknown Task.model slug 'missing-advisor-model'. Valid model slugs: alpha, zeta. \
+                 Omit `model` to inherit the parent model."
+                    .to_string()
+            })
+        }));
+        let mut input = task_input(ADVISOR_SUBAGENT.name, true);
+        input.model = Some("missing-advisor-model".to_string());
+
+        let result =
+            xai_tool_runtime::Tool::run(&TaskTool, test_ctx(resources.into_shared()), input).await;
+
+        let msg = result
+            .expect_err("invalid advisor model must reject before spawn")
+            .to_string();
+        assert!(msg.contains("Advisor unavailable: advisor model unavailable"));
+        assert!(msg.contains("missing-advisor-model"));
+        assert!(msg.contains("Valid model slugs: alpha, zeta"));
+        assert!(
+            rx.try_recv().is_err(),
+            "advisor model validation must fail before coordinator spawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn advisor_model_catalog_unavailable_returns_clear_error_before_spawn() {
+        let _env_lock = advisor_env_lock().lock().await;
+        let _enabled = set_env("GROK_ADVISOR_ENABLED", "true");
+        let (backend, mut rx) = make_backend();
+        let mut resources = Resources::new();
+        resources.insert(backend);
+        resources.insert(SubagentDepthCounter(0));
+        resources.insert(SessionIdResource(
+            "advisor-missing-model-catalog".to_string(),
+        ));
+        resources.insert(CurrentPromptIdResource("prompt-123".to_string()));
+        let mut input = task_input(ADVISOR_SUBAGENT.name, true);
+        input.model = Some("any-model".to_string());
+
+        let result =
+            xai_tool_runtime::Tool::run(&TaskTool, test_ctx(resources.into_shared()), input).await;
+
+        let msg = result
+            .expect_err("missing advisor model catalog must reject before spawn")
+            .to_string();
+        assert!(msg.contains("Advisor unavailable: advisor model unavailable"));
+        assert!(msg.contains("model catalog validator is unavailable"));
+        assert!(
+            rx.try_recv().is_err(),
+            "missing model catalog must fail before coordinator spawn"
         );
     }
 
@@ -1636,7 +1787,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_task_spawn_sets_fork_context_false() {
+    async fn model_task_spawn_sets_fork_context_false_for_non_advisor() {
         let (backend, mut rx) = make_backend();
         let mut resources = Resources::new();
         resources.insert(backend);
@@ -1649,7 +1800,11 @@ mod tests {
             let request = unwrap_spawn(rx.recv().await.unwrap());
             assert!(
                 !request.fork_context,
-                "model-spawned task must not set fork_context"
+                "non-advisor model-spawned task must not set fork_context"
+            );
+            assert!(
+                !request.advisor_gate_prevalidated,
+                "non-advisor task must not consume advisor budget"
             );
             request
                 .respond_with(|request| SubagentResult {
@@ -1681,6 +1836,196 @@ mod tests {
         .await
         .unwrap();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn advisor_task_spawn_forks_parent_context_and_marks_gate_prevalidated() {
+        let _env_lock = advisor_env_lock().lock().await;
+        let _enabled = set_env("GROK_ADVISOR_ENABLED", "true");
+        let _budget = set_env("GROK_ADVISOR_BUDGET", "50000");
+        let (backend, mut rx) = make_backend();
+        let resources = resources_for_task_with_session(backend, "advisor-fork-session");
+
+        let shared = resources.into_shared();
+        let handle = tokio::spawn(async move {
+            let request = unwrap_spawn(rx.recv().await.unwrap());
+            assert_eq!(request.subagent_type, ADVISOR_SUBAGENT.name);
+            assert_eq!(request.parent_session_id, "advisor-fork-session");
+            assert!(
+                request.fork_context,
+                "advisor must receive the coordinator's bounded parent-context fork"
+            );
+            assert!(
+                request.advisor_gate_prevalidated,
+                "TaskTool must reserve advisor budget before coordinator spawn"
+            );
+            request
+                .result_tx
+                .send(SubagentResult {
+                    success: true,
+                    output: "advice".into(),
+                    subagent_id: request.id.clone(),
+                    child_session_id: request.id.clone(),
+                    ..Default::default()
+                })
+                .unwrap();
+        });
+
+        let result = xai_tool_runtime::Tool::run(
+            &TaskTool,
+            test_ctx(shared),
+            TaskToolInput {
+                description: "review plan".into(),
+                prompt: "Review the current approach and identify the top risk.".into(),
+                subagent_type: ADVISOR_SUBAGENT.name.into(),
+                run_in_background: false,
+                capability_mode: None,
+                isolation: None,
+                resume_from: None,
+                cwd: None,
+                model: None,
+                task_id: None,
+            },
+        )
+        .await
+        .expect("advisor spawn should succeed");
+
+        handle.await.unwrap();
+        match result {
+            ToolOutput::SubagentCompleted(sub) => {
+                assert_eq!(sub.subagent_type, ADVISOR_SUBAGENT.name);
+                assert_eq!(sub.output, "advice");
+            }
+            other => panic!("expected SubagentCompleted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_research_task_spawn_reaches_model_facing_dispatch() {
+        let (backend, mut rx) = make_backend();
+        let resources = resources_for_task_with_session(backend, "deep-research-session");
+
+        let shared = resources.into_shared();
+        let handle = tokio::spawn(async move {
+            let request = unwrap_spawn(rx.recv().await.unwrap());
+            assert_eq!(request.subagent_type, "deep-research");
+            assert_eq!(request.parent_session_id, "deep-research-session");
+            assert!(
+                !request.fork_context,
+                "deep-research gets its task prompt directly, not the advisor side-review fork"
+            );
+            assert!(
+                !request.advisor_gate_prevalidated,
+                "deep-research must not consume advisor budget"
+            );
+            request
+                .result_tx
+                .send(SubagentResult {
+                    success: true,
+                    output: "# Research report\n\n[C1] evidence".into(),
+                    subagent_id: request.id.clone(),
+                    child_session_id: request.id.clone(),
+                    tool_calls: 2,
+                    turns: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+        });
+
+        let result = xai_tool_runtime::Tool::run(
+            &TaskTool,
+            test_ctx(shared),
+            TaskToolInput {
+                description: "research rust".into(),
+                prompt: "Research Rust async cancellation and cite evidence.".into(),
+                subagent_type: "deep-research".into(),
+                run_in_background: false,
+                capability_mode: None,
+                isolation: None,
+                resume_from: None,
+                cwd: None,
+                model: None,
+                task_id: None,
+            },
+        )
+        .await
+        .expect("deep-research TaskTool spawn should succeed");
+
+        handle.await.unwrap();
+        match result {
+            ToolOutput::SubagentCompleted(sub) => {
+                assert_eq!(sub.subagent_type, "deep-research");
+                assert!(sub.output.contains("Research report"));
+                assert_eq!(sub.tool_calls, 2);
+            }
+            other => panic!("expected SubagentCompleted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn advisor_disabled_default_background_fails_before_spawn() {
+        let _env_lock = advisor_env_lock().lock().await;
+        let _enabled = set_env("GROK_ADVISOR_ENABLED", "false");
+        let (backend, mut rx) = make_backend_with_validation_and_advisor_fn(
+            |_, _| SubagentValidateTypeOutcome::Ok,
+            |_, _, _, _| SubagentAdvisorPreflightOutcome::Rejected {
+                message: "advisor is disabled".to_string(),
+            },
+        );
+        let resources = resources_for_task_with_session(backend, "advisor-disabled-session");
+        let input: TaskToolInput = serde_json::from_str(
+            r#"{
+                "description": "review plan",
+                "prompt": "Please review the current approach.",
+                "subagent_type": "advisor"
+            }"#,
+        )
+        .unwrap();
+        assert!(
+            input.run_in_background,
+            "model-facing advisor calls default to background mode"
+        );
+
+        let result =
+            xai_tool_runtime::Tool::run(&TaskTool, test_ctx(resources.into_shared()), input).await;
+
+        let msg = result
+            .expect_err("disabled advisor must fail before background spawn")
+            .to_string();
+        assert!(msg.contains("Advisor unavailable: advisor is disabled"));
+        assert!(
+            rx.try_recv().is_err(),
+            "TaskTool must not emit a Spawn for disabled advisor calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn advisor_budget_exhausted_background_fails_before_spawn() {
+        let _env_lock = advisor_env_lock().lock().await;
+        let _enabled = set_env("GROK_ADVISOR_ENABLED", "true");
+        let _budget = set_env("GROK_ADVISOR_BUDGET", "1");
+        let (backend, mut rx) = make_backend_with_validation_and_advisor_fn(
+            |_, _| SubagentValidateTypeOutcome::Ok,
+            |_, _, _, _| SubagentAdvisorPreflightOutcome::Rejected {
+                message: "advisor token budget exhausted: requested 42, remaining 1".to_string(),
+            },
+        );
+        let resources = resources_for_task_with_session(backend, "advisor-budget-session");
+        let mut input = task_input(ADVISOR_SUBAGENT.name, true);
+        input.prompt = "This advisor prompt is intentionally longer than one token.".into();
+
+        let result =
+            xai_tool_runtime::Tool::run(&TaskTool, test_ctx(resources.into_shared()), input).await;
+
+        let msg = result
+            .expect_err("exhausted advisor budget must fail before background spawn")
+            .to_string();
+        assert!(msg.contains("Advisor unavailable"));
+        assert!(msg.contains("advisor token budget exhausted"));
+        assert!(
+            rx.try_recv().is_err(),
+            "TaskTool must not emit a Spawn after an advisor budget rejection"
+        );
     }
 
     #[test]

@@ -31,6 +31,7 @@ use xai_chat_state::compaction_utils::{
     prepare_conversation_for_verbatim_summarization, sanitize_compacted_history,
     validate_compacted_history,
 };
+use xai_grok_sampler::{SamplingErrorInfo, SamplingErrorKind};
 use xai_grok_sampling_types::{ApiBackend, ConversationItem};
 /// Default percentage points below the auto-compact threshold at which prefire
 /// (background pass-1) starts, giving pass-1 runway to finish before the limit.
@@ -42,6 +43,55 @@ fn prefire_lead_percent() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_PREFIRE_LEAD_PERCENT)
 }
+/// Deflate an estimator-token `budget` using the provider's own token counts
+/// parsed from a context-overflow `message`.
+///
+/// The input ladder's budgets assume the byte-heuristic estimator ≈ the
+/// provider tokenizer, but the overflow that got us here proves otherwise
+/// (e.g. Anthropic counted 1,285,075 tokens in a history the estimator put
+/// under 1M). Scaling the budget by `estimated / provider_count` re-expresses
+/// it in estimator units so `fit_conversation_to_budget` actually drops
+/// enough turns. A flat 25% haircut backstops messages without usable counts.
+/// The result is clamped to always shrink (`budget − 1` minimum drop) so the
+/// ladder can never re-send the identical rejected payload.
+fn calibrate_overflow_budget(budget: u64, message: &str, rejected_estimated: u64) -> u64 {
+    const FALLBACK_HAIRCUT_NUM: u64 = 3;
+    const FALLBACK_HAIRCUT_DEN: u64 = 4;
+    let calibrated = xai_grok_compaction::parse_context_overflow_sizes(message)
+        .filter(|sizes| sizes.prompt_tokens > 0 && rejected_estimated > 0)
+        .map(|sizes| {
+            // budget × (estimated / provider) — in u128 to avoid overflow.
+            let scaled =
+                (budget as u128) * (rejected_estimated as u128) / (sizes.prompt_tokens as u128);
+            scaled.min(u64::MAX as u128) as u64
+        })
+        .unwrap_or_else(|| budget / FALLBACK_HAIRCUT_DEN * FALLBACK_HAIRCUT_NUM);
+    calibrated.min(budget.saturating_sub(1))
+}
+
+fn compaction_rate_limit_error(message: &str) -> Option<SamplingErrorInfo> {
+    if !(message.contains("status 429")
+        || message.contains("Too Many Requests")
+        || message.contains("rate_limit_error"))
+    {
+        return None;
+    }
+    Some(SamplingErrorInfo {
+        kind: SamplingErrorKind::RateLimited,
+        status_code: Some(429),
+        message: message
+            .strip_prefix("compact failed: ")
+            .unwrap_or(message)
+            .to_string(),
+        is_retryable: true,
+        retry_after_secs: None,
+        model_metadata: None,
+        empty_response_context: None,
+        doom_loop_triggers: None,
+        doom_loop_aborted_at_chunk: None,
+    })
+}
+
 /// Cheap fingerprint of a conversation prefix for prefire NOTE₁ validity. A
 /// mismatch means the prefix changed (edit / rewind / branch) since pass-1, so
 /// the cached NOTE₁ no longer summarizes the current prefix and must be dropped.
@@ -154,6 +204,68 @@ mod two_pass_prefire_helper_tests {
     fn prefire_lead_percent_defaults_to_10() {
         unsafe { std::env::remove_var("GROK_PREFIRE_LEAD_PERCENT") };
         assert_eq!(prefire_lead_percent(), 10);
+    }
+}
+#[cfg(test)]
+mod overflow_budget_calibration_tests {
+    use super::{calibrate_overflow_budget, compaction_rate_limit_error};
+
+    /// The production failure: Anthropic counted 1,285,075 tokens in a
+    /// history the estimator put at ~880k, so the ladder's 967k budget looked
+    /// "already satisfied" and re-sent the identical rejected payload until
+    /// "Compaction failed.". Calibration must scale the budget below the
+    /// estimated size so the fit actually shrinks the input.
+    #[test]
+    fn provider_counts_deflate_budget_below_estimate() {
+        let message = "API error (status 400 Bad Request): invalid_request_error: \
+                       prompt is too long: 1285075 tokens > 1000000 maximum";
+        let budget = calibrate_overflow_budget(967_232, message, 880_000);
+        // 967_232 × 880_000 / 1_285_075 ≈ 662_306: well under the estimated
+        // payload size, so fit_conversation_to_budget must drop turns.
+        assert!(
+            budget < 880_000,
+            "calibrated budget {budget} must force a real shrink below the 880k estimate",
+        );
+        assert!(budget > 500_000, "must not over-shrink: {budget}");
+    }
+
+    /// Messages without parseable counts fall back to a flat haircut that
+    /// still guarantees shrinkage.
+    #[test]
+    fn unparseable_overflow_takes_flat_haircut() {
+        let budget =
+            calibrate_overflow_budget(1_000_000, "maximum context length exceeded", 900_000);
+        assert_eq!(budget, 750_000);
+    }
+
+    /// Whatever the arithmetic says, the result must be strictly below the
+    /// original budget so the ladder can never re-send identical input.
+    #[test]
+    fn calibrated_budget_always_shrinks() {
+        // Provider says the prompt was SMALLER than our estimate (estimator
+        // overcounts): naive scaling would inflate the budget.
+        let message = "prompt is too long: 100 tokens > 50 maximum";
+        let budget = calibrate_overflow_budget(1_000, message, 5_000);
+        assert!(budget < 1_000, "budget must strictly shrink, got {budget}");
+    }
+
+    #[test]
+    fn compaction_429_maps_to_rate_limit_error() {
+        let err = compaction_rate_limit_error(
+            "compact failed: API error (status 429 Too Many Requests): rate_limit_error: limited",
+        )
+        .expect("429 compaction errors must enter Anthropic rotation");
+        assert_eq!(err.kind, xai_grok_sampler::SamplingErrorKind::RateLimited);
+        assert_eq!(err.status_code, Some(429));
+        assert!(err.message.starts_with("API error"));
+    }
+
+    #[test]
+    fn compaction_non_rate_limit_error_is_not_mapped() {
+        assert!(
+            compaction_rate_limit_error("compact failed: API error (status 400 Bad Request)")
+                .is_none()
+        );
     }
 }
 impl SessionActor {
@@ -1183,12 +1295,30 @@ impl SessionActor {
                                 error = %message,
                                 "Compaction input overflowed deterministically; stepping down the input ladder to avoid an incompactable state"
                             );
+                            // The ladder budgets are in ESTIMATOR tokens, but
+                            // the overflow proves the provider counts more
+                            // than we estimate (heavy base64 / non-ASCII
+                            // histories undercount by 30%+). Deflate the
+                            // budget by the provider's own count so the fit
+                            // actually shrinks the payload — otherwise a
+                            // budget the estimator thinks we're under
+                            // re-sends the identical rejected bytes and the
+                            // ladder burns out into "Compaction failed.".
+                            let rejected_estimated = request_turns
+                                .iter()
+                                .map(xai_chat_state::estimate_item_tokens)
+                                .sum::<u64>();
+                            let calibrate = |budget: u64| {
+                                calibrate_overflow_budget(budget, &message, rejected_estimated)
+                            };
                             let conv = self.chat_state_handle.get_conversation().await;
                             request_turns = match stage {
                                 InputStage::VerbatimFitted => {
-                                    let budget = context_window
-                                        .saturating_sub(SUMMARY_BUDGET_RESERVE_TOKENS)
-                                        .saturating_sub(compaction_tool_tokens);
+                                    let budget = calibrate(
+                                        context_window
+                                            .saturating_sub(SUMMARY_BUDGET_RESERVE_TOKENS)
+                                            .saturating_sub(compaction_tool_tokens),
+                                    );
                                     let verbatim = xai_chat_state::compaction_utils::prepare_conversation_for_verbatim_summarization(
                                         conv,
                                         summary_strips_reasoning,
@@ -1198,8 +1328,10 @@ impl SessionActor {
                                     )
                                 }
                                 InputStage::Lossy => {
-                                    let lossy_budget = (context_window.saturating_mul(7) / 10)
-                                        .saturating_sub(compaction_tool_tokens);
+                                    let lossy_budget = calibrate(
+                                        (context_window.saturating_mul(7) / 10)
+                                            .saturating_sub(compaction_tool_tokens),
+                                    );
                                     xai_chat_state::compaction_utils::fit_conversation_to_budget(
                                         xai_chat_state::compaction_utils::prepare_conversation_for_summarization(
                                             conv,
@@ -1239,6 +1371,13 @@ impl SessionActor {
                         }
                         last_error = Some(acp::Error::internal_error().data(message));
                         break;
+                    }
+                    if let Some(rate_limit_error) = compaction_rate_limit_error(&message)
+                        && self
+                            .rotate_anthropic_after_rate_limit(&rate_limit_error)
+                            .await
+                    {
+                        continue;
                     }
                     last_failure_outcome = CompactionOutcome::Transient;
                     last_error = Some(acp::Error::internal_error().data(message));
@@ -2343,6 +2482,7 @@ mod inline_auto_compact_flow_tests {
             compactions_remaining: std::cell::Cell::new(None),
             compaction_at_tokens: std::cell::Cell::new(None),
             doom_loop_recovery: None,
+            server_advisor: false,
             doom_loop_turn_tally: Default::default(),
             file_state_tracker: Arc::new(FileStateTracker::new()),
             rewind_pending_prompt: std::sync::Mutex::new(None),
@@ -2435,6 +2575,7 @@ mod inline_auto_compact_flow_tests {
             workflow_manager: crate::session::workflow::manager::WorkflowManager::test_bundle().0,
             workflow_launch_tx: tokio::sync::mpsc::unbounded_channel().0,
             goal_classifier_enabled: false,
+            goal_review_enabled: false,
             goal_planner_enabled: false,
             goal_summary_enabled: false,
             goal_verifier_skeptic_count: 1,

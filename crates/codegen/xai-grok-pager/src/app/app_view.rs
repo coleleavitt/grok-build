@@ -966,6 +966,12 @@ pub struct AppView {
     /// Enable the ask-user-question tool for new sessions (`--ask-user`).
     /// Automatically enabled by `plan_mode`.
     pub ask_user: bool,
+    /// Advisor tool override for new sessions (`--advisor` / `--no-advisor`).
+    /// `None` leaves the default-on resolution to `AdvisorConfig::from_env`
+    /// (`GROK_ADVISOR_DISABLED` / `GROK_DISABLE_ADVISOR` / `GROK_ADVISOR_ENABLED`).
+    pub advisor_enabled: Option<bool>,
+    /// Opt in to server-side advisor execution (`--server-advisor`).
+    pub server_advisor: bool,
     /// Process-wide gateway light-frontend from CLI `--chat` only.
     /// Stamps `_meta["x.ai/session"].kind = "chat"` and omits Build agent
     /// profiles on create/load while set. `/chat` does **not** set this
@@ -1506,6 +1512,8 @@ impl AppView {
             require_plan_approval: false,
             plan_mode: false,
             subagents: false,
+            advisor_enabled: None,
+            server_advisor: false,
             ask_user: false,
             chat_mode: false,
             #[cfg(feature = "local-workspace")]
@@ -5949,6 +5957,8 @@ pub(crate) mod tests {
             require_plan_approval: false,
             plan_mode: false,
             subagents: false,
+            advisor_enabled: None,
+            server_advisor: false,
             ask_user: false,
             chat_mode: false,
             #[cfg(feature = "local-workspace")]

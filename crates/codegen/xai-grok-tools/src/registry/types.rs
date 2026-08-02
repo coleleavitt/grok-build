@@ -695,6 +695,9 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::GetTerminalCommandOutputTool>();
         b.register::<grok_build::WaitTasksTool>();
         b.register::<grok_build::TaskTool>();
+        b.register::<grok_build::AdvisorTool>();
+        b.register::<grok_build::ResearchTool>();
+        b.register::<grok_build::BountyTool>();
         b.register::<grok_build::WebSearchTool>();
         b.register_with_params::<grok_build::WebFetchTool, grok_build::web_fetch::WebFetchParams>();
         b.register::<grok_build::LspTool>();
@@ -1437,19 +1440,24 @@ impl FinalizedToolset {
         tool_name: &str,
         tool_params: &serde_json::Value,
     ) -> Result<ToolInput, xai_tool_runtime::ToolError> {
-        let (reverse_params, parse_input) = {
+        let (reverse_params, parse_input, input_schema) = {
             let tools = self.tools.read();
             let tool = tools
                 .iter()
                 .find(|t| t.client_name == tool_name)
                 .ok_or_else(|| Self::tool_not_found_error(tool_name))?;
-            (tool.reverse_params.clone(), tool.parse_input.clone())
+            (
+                tool.reverse_params.clone(),
+                tool.parse_input.clone(),
+                tool.input_schema.clone(),
+            )
         };
-        let canonical_params = if reverse_params.is_empty() {
+        let mut canonical_params = if reverse_params.is_empty() {
             tool_params.clone()
         } else {
             remap_json_keys(tool_params.clone(), &reverse_params)
         };
+        xai_tool_types::coerce_args_against_schema(&mut canonical_params, &input_schema);
         (parse_input)(canonical_params)
     }
     /// Execute a tool, returning only its raw output.
@@ -1474,7 +1482,7 @@ impl FinalizedToolset {
         tool_args: serde_json::Value,
         parent_ctx: xai_tool_runtime::ToolCallContext,
     ) -> Result<crate::types::output::ToolOutput, xai_tool_runtime::ToolError> {
-        let (registry_id, output_converter, reverse_params) = {
+        let (registry_id, output_converter, reverse_params, input_schema) = {
             let tools = self.tools.read();
             let entry = tools
                 .iter()
@@ -1484,13 +1492,15 @@ impl FinalizedToolset {
                 entry.registry_id.clone(),
                 entry.output_converter.clone(),
                 entry.reverse_params.clone(),
+                entry.input_schema.clone(),
             )
         };
-        let canonical_params = if reverse_params.is_empty() {
+        let mut canonical_params = if reverse_params.is_empty() {
             tool_args
         } else {
             remap_json_keys(tool_args, &reverse_params)
         };
+        xai_tool_types::coerce_args_against_schema(&mut canonical_params, &input_schema);
         let mut ctx = xai_tool_runtime::ToolCallContext::new(parent_ctx.call_id.clone());
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
@@ -1657,7 +1667,7 @@ impl FinalizedToolset {
         cwd_override: Option<std::path::PathBuf>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<DispatchParts, xai_tool_runtime::ToolError> {
-        let (registry_id, output_converter, reverse_params) = {
+        let (registry_id, output_converter, reverse_params, input_schema) = {
             let tools = self.tools.read();
             let entry = tools
                 .iter()
@@ -1667,13 +1677,15 @@ impl FinalizedToolset {
                 entry.registry_id.clone(),
                 entry.output_converter.clone(),
                 entry.reverse_params.clone(),
+                entry.input_schema.clone(),
             )
         };
-        let canonical_params = if reverse_params.is_empty() {
+        let mut canonical_params = if reverse_params.is_empty() {
             tool_args
         } else {
             remap_json_keys(tool_args, &reverse_params)
         };
+        xai_tool_types::coerce_args_against_schema(&mut canonical_params, &input_schema);
         let effective_tool_name = if tool_name == "use_tool" {
             serde_json::from_value::<crate::implementations::use_tool::UseToolInput>(
                 canonical_params.clone(),
@@ -4949,5 +4961,101 @@ mod tests {
             "gate ON must produce ≥ 1 Progress frame via workspace dispatch, got {progress_count}",
         );
         assert!(got_terminal, "must observe terminal");
+    }
+    /// Regression: providers sometimes deliver tool arguments with every
+    /// value JSON-encoded as a string (`"limit": "140"` instead of
+    /// `"limit": 140`). `try_parse` must coerce string-encoded numbers
+    /// against the tool's input schema instead of failing with
+    /// `invalid type: string "140", expected usize`.
+    #[tokio::test]
+    async fn try_parse_coerces_string_encoded_integers() {
+        let config = ToolServerConfig {
+            tools: vec![ToolConfig::from_id("GrokBuild:read_file".to_string())],
+            behavior_preset: None,
+        };
+        let tmp = TempDir::new().unwrap();
+        let toolset = ToolRegistryBuilder::new()
+            .finalize(config, test_session_context(&tmp))
+            .expect("toolset should finalize");
+        let input = toolset
+            .try_parse(
+                "read_file",
+                &serde_json::json!({
+                    "target_file": "src/lib.rs",
+                    "offset": "300",
+                    "limit": "140",
+                }),
+            )
+            .await
+            .expect("string-encoded integers must coerce against the schema");
+        let ToolInput::ReadFile(rf) = input else {
+            panic!("expected ReadFile input");
+        };
+        assert_eq!(rf.offset, Some(300));
+        assert_eq!(rf.limit, Some(140));
+    }
+    /// Regression: same failure mode for composite values — an array
+    /// argument arriving as a JSON-encoded string
+    /// (`"todos": "[{...}]"`) must be unwrapped against the schema
+    /// instead of failing with `expected a sequence`.
+    #[tokio::test]
+    async fn try_parse_unwraps_string_encoded_arrays() {
+        let config = ToolServerConfig {
+            tools: vec![ToolConfig::from_id("GrokBuild:todo_write".to_string())],
+            behavior_preset: None,
+        };
+        let tmp = TempDir::new().unwrap();
+        let toolset = ToolRegistryBuilder::new()
+            .finalize(config, test_session_context(&tmp))
+            .expect("toolset should finalize");
+        let input = toolset
+            .try_parse(
+                "todo_write",
+                &serde_json::json!({
+                    "merge": true,
+                    "todos": "[{\"id\": \"1\", \"content\": \"write tests\", \"status\": \"pending\"}]",
+                }),
+            )
+            .await
+            .expect("string-encoded arrays must be unwrapped against the schema");
+        let ToolInput::TodoWrite(tw) = input else {
+            panic!("expected TodoWrite input");
+        };
+        assert_eq!(tw.todos.len(), 1);
+        assert_eq!(tw.todos[0].id, "1");
+    }
+    /// The `call` path must apply the same schema-driven coercion as
+    /// `try_parse`, otherwise a call that parsed fine still fails at
+    /// dispatch when the local registry re-deserializes the raw params.
+    #[tokio::test]
+    async fn call_coerces_string_encoded_integers() {
+        let config = ToolServerConfig {
+            tools: vec![ToolConfig::from_id("GrokBuild:read_file".to_string())],
+            behavior_preset: None,
+        };
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("test.txt"),
+            "line one\nline two\nline three\n",
+        )
+        .unwrap();
+        let toolset = Arc::new(
+            ToolRegistryBuilder::new()
+                .finalize(config, test_session_context(&tmp))
+                .expect("toolset should finalize"),
+        );
+        toolset
+            .call(
+                "read_file",
+                serde_json::json!({
+                    "target_file": "test.txt",
+                    "offset": "2",
+                    "limit": "1",
+                }),
+                "test-call-coerce",
+                None,
+            )
+            .await
+            .expect("call with string-encoded integers must succeed");
     }
 }

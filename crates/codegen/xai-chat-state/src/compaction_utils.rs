@@ -97,14 +97,25 @@ pub fn prepare_conversation_for_segment(
     strip_images(strip_reasoning_blocks(conversation))
 }
 /// Drop a trailing assistant turn whose `tool_calls` lack a `ToolResult` (else strict backends reject the dangling `tool_use`).
+///
+/// Also drops trailing `Reasoning` siblings left orphaned by that pop (or by
+/// an aborted stream): a reasoning item with no following assistant output is
+/// rejected by the Responses API ("reasoning ... provided without its required
+/// following item") and would replay as an invalid thinking-only assistant
+/// message on the Messages API.
 pub fn truncate_trailing_incomplete_tool_call(
     mut conversation: Vec<ConversationItem>,
 ) -> Vec<ConversationItem> {
-    while matches!(
-        conversation.last(),
-        Some(ConversationItem::Assistant(a)) if !a.tool_calls.is_empty()
-    ) {
-        conversation.pop();
+    loop {
+        match conversation.last() {
+            Some(ConversationItem::Assistant(a)) if !a.tool_calls.is_empty() => {
+                conversation.pop();
+            }
+            Some(ConversationItem::Reasoning(_)) => {
+                conversation.pop();
+            }
+            _ => break,
+        }
     }
     conversation
 }
@@ -3118,6 +3129,51 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
         ]);
         assert_eq!(result.len(), 1, "reasoning sibling must be dropped");
         assert!(matches!(result[0], ConversationItem::Assistant(_)));
+    }
+    /// Popping a trailing incomplete assistant must also pop the `Reasoning`
+    /// sibling that preceded it — an orphaned trailing reasoning item is
+    /// rejected by the Responses API ("without its required following item")
+    /// and replays as an invalid thinking-only assistant message on the
+    /// Messages API.
+    #[test]
+    fn truncate_trailing_incomplete_tool_call_pops_orphaned_reasoning() {
+        use xai_grok_sampling_types::{AssistantItem, ToolCall, rs};
+        let reasoning = ConversationItem::Reasoning(rs::ReasoningItem {
+            id: String::new(),
+            summary: vec![rs::SummaryPart::SummaryText(rs::SummaryTextContent {
+                text: "about to call a tool".to_string(),
+            })],
+            content: None,
+            encrypted_content: Some("sig".to_string()),
+            status: None,
+        });
+        let result = truncate_trailing_incomplete_tool_call(vec![
+            ConversationItem::user("hello"),
+            reasoning.clone(),
+            ConversationItem::Assistant(AssistantItem {
+                content: "".into(),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "bash".to_string(),
+                    arguments: "{}".into(),
+                }],
+                model_id: None,
+                model_fingerprint: None,
+                reasoning_effort: None,
+            }),
+        ]);
+        assert_eq!(
+            result.len(),
+            1,
+            "assistant AND its reasoning must be popped"
+        );
+        assert!(matches!(result[0], ConversationItem::User(_)));
+
+        // A bare trailing reasoning item (aborted stream) is popped too.
+        let result =
+            truncate_trailing_incomplete_tool_call(vec![ConversationItem::user("hi"), reasoning]);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], ConversationItem::User(_)));
     }
     #[test]
     fn strip_reasoning_blocks_passes_other_items_through() {

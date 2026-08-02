@@ -169,7 +169,15 @@ impl SessionActor {
                     "rebuild_agent: build failed for agent_type={new_agent_name}: {e}"
                 ))
             })?;
-        let new_system_prompt = new_agent.system_prompt().to_string();
+        let new_system_prompt = crate::agent::mvp_agent::maybe_append_advisor_section(
+            new_agent.system_prompt().to_string(),
+            self.rebuild_spec.advisor_enabled,
+            // `new_agent.system_prompt()` is built purely from the discovered
+            // `AgentDefinition` (see `AgentRebuildSpec::build_agent`, which takes no
+            // session/init meta) — it can never be a verbatim `systemPromptOverride`,
+            // so this rebuild path always sees the composed/template prompt.
+            false,
+        );
         let mut new_prompt_context = new_agent.prompt_context().clone();
         new_prompt_context.normalize_for_persistence();
         if let Some(handle) = self.compaction.prefire.take_handle() {

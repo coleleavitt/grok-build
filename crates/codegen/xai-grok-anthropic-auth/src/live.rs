@@ -28,7 +28,13 @@ pub struct LiveCredential {
 
 struct LiveCredentialInner {
     manager: AnthropicAuthManager,
-    cache: Mutex<Option<Credential>>,
+    cache: Mutex<Option<CachedCredential>>,
+}
+
+#[derive(Clone)]
+struct CachedCredential {
+    account_name: String,
+    credential: Credential,
 }
 
 impl std::fmt::Debug for LiveCredential {
@@ -78,9 +84,12 @@ impl LiveCredential {
 
     /// Resolve (refresh if needed), update the cache, and return the credential.
     pub async fn ensure_fresh(&self) -> Result<Credential> {
-        let credential = self.inner.manager.resolve_credential().await?;
+        let (account_name, credential) = self.inner.manager.resolve_named_credential().await?;
         if let Ok(mut guard) = self.inner.cache.lock() {
-            *guard = Some(credential.clone());
+            *guard = Some(CachedCredential {
+                account_name,
+                credential: credential.clone(),
+            });
         }
         Ok(credential)
     }
@@ -92,10 +101,21 @@ impl LiveCredential {
         retry_after_secs: Option<u64>,
         message: &str,
     ) -> Result<Option<String>> {
-        let marked = self
+        let cached_account = self
             .inner
-            .manager
-            .record_selected_rate_limit(retry_after_secs, message)?;
+            .cache
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|c| c.account_name.clone()));
+        let marked = if let Some(account) = cached_account {
+            self.inner
+                .manager
+                .record_account_rate_limit(&account, retry_after_secs, message)?
+        } else {
+            self.inner
+                .manager
+                .record_selected_rate_limit(retry_after_secs, message)?
+        };
         if marked.is_some()
             && let Ok(mut guard) = self.inner.cache.lock()
         {
@@ -106,7 +126,33 @@ impl LiveCredential {
 
     /// Last cached credential, if any. Does not hit the network.
     pub fn current(&self) -> Option<Credential> {
-        self.inner.cache.lock().ok().and_then(|g| g.clone())
+        self.inner
+            .cache
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|c| c.credential.clone()))
+    }
+
+    /// Name of the account backing the cached credential, if any. Does not
+    /// hit the network — diagnostics for rotation / retry logs.
+    pub fn current_account_name(&self) -> Option<String> {
+        self.inner
+            .cache
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|c| c.account_name.clone()))
+    }
+
+    /// Redacted per-account diagnostics snapshot of the on-disk store —
+    /// status, cooldown, token expiry — for structured logs when rotation
+    /// or retries fail. Empty when the store cannot be read.
+    pub fn debug_snapshot(&self) -> Vec<crate::debug::AccountDebug> {
+        self.inner
+            .manager
+            .store()
+            .load()
+            .map(|data| crate::debug::snapshot_accounts(&data))
+            .unwrap_or_default()
     }
 
     /// Access-token string for sampler `BearerResolver` / construction-time
@@ -141,7 +187,7 @@ impl LiveCredential {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::Account;
+    use crate::account::{Account, RoutingStatus};
     use crate::endpoints::OAuthEndpoints;
     use crate::oauth::OAuthClient;
     use crate::store::{AccountData, AccountStore};
@@ -220,6 +266,52 @@ mod tests {
                 .as_deref(),
             Some("primary")
         );
+        assert!(live.current_bearer().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn record_rate_limit_marks_cached_account_not_new_selector() {
+        let (store, dir) = temp_store("rate-limit-cached-account");
+        let mut data = AccountData::default();
+        let mut primary = Account::new("primary", RefreshToken::new(VALID_REFRESH));
+        primary.access_token = Some(AccessToken::new(VALID_ACCESS));
+        primary.expires_at = Some(Utc.timestamp_opt(Utc::now().timestamp() + 3600, 0).unwrap());
+        let mut secondary = Account::new("secondary", RefreshToken::new(VALID_REFRESH));
+        secondary.access_token = Some(AccessToken::new("sk-ant-oat01-secondtokenvalue000001"));
+        secondary.expires_at = Some(Utc.timestamp_opt(Utc::now().timestamp() + 3600, 0).unwrap());
+        data.active_index = Some(0);
+        data.accounts.push(primary);
+        data.accounts.push(secondary);
+        store.save(&data).unwrap();
+
+        let endpoints = OAuthEndpoints {
+            token_url: "http://127.0.0.1:1/v1/oauth/token".into(),
+            ..OAuthEndpoints::prod()
+        };
+        let live = LiveCredential::new(AnthropicAuthManager::new(
+            store.clone(),
+            OAuthClient::new(endpoints),
+        ));
+        live.ensure_fresh().await.unwrap();
+        assert_eq!(live.current_bearer().as_deref(), Some(VALID_ACCESS));
+
+        store
+            .read_modify_write(|data| data.active_index = Some(1))
+            .unwrap();
+
+        assert_eq!(
+            live.record_rate_limit(Some(120), "rate_limit_error")
+                .unwrap()
+                .as_deref(),
+            Some("primary")
+        );
+        let reloaded = store.load().unwrap();
+        assert_eq!(
+            reloaded.find("primary").unwrap().unified_status,
+            Some(RoutingStatus::Rejected)
+        );
+        assert!(reloaded.find("secondary").unwrap().unified_status.is_none());
         assert!(live.current_bearer().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

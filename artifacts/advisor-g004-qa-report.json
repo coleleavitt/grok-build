@@ -1,0 +1,97 @@
+{
+  "kind": "package-test-report",
+  "scope": "G004 QA/red-team — subagent-spawn primitive (task/spawn.rs) behavior-preservation proof",
+  "target": {
+    "primitive": "crates/codegen/xai-grok-tools/src/implementations/grok_build/task/spawn.rs (SubagentSpawnParams, into_request, spawn_and_await)",
+    "call_sites": [
+      "TaskTool::run (task/mod.rs)",
+      "AdvisorTool::run (advisor/mod.rs)",
+      "SubagentEconomyInvoker::spawn_subagent (bounty.rs)",
+      "spawn_research_subagent (research.rs)"
+    ],
+    "schema": "crates/codegen/xai-grok-tools/schema/tool_meta.schema.json"
+  },
+  "implementation_modified": false,
+  "tests_added": {
+    "file": "crates/codegen/xai-grok-tools/src/implementations/grok_build/task/spawn.rs",
+    "module": "#[cfg(test)] mod tests",
+    "new_tests": [
+      "into_request_matches_advisor_site_profile",
+      "into_request_matches_bounty_site_profile",
+      "into_request_matches_research_site_profile",
+      "into_request_matches_task_site_profile_non_advisor",
+      "into_request_matches_task_site_profile_advisor"
+    ],
+    "preexisting_tests_covering_case_1": [
+      "into_request_maps_every_knob",
+      "into_request_generates_id_when_absent",
+      "into_request_preserves_explicit_id"
+    ],
+    "note": "The primitive's own pre-existing test module already fully covered case 1 (every SubagentSpawnParams field asserted against the mapped SubagentRequest/SubagentRuntimeOverrides field, plus id passthrough-when-Some and generate-when-None). This QA pass added case 2 (per-site field-profile snapshots) directly reachable via public SubagentSpawnParams construction; per-site params are not otherwise exposed as a separate testable seam, so the snapshots reconstruct each site's exact literal profile read from advisor/mod.rs, bounty.rs, research.rs, and task/mod.rs source."
+  },
+  "cases": [
+    {
+      "case": 1,
+      "name": "primitive_field_mapping",
+      "surface": "package",
+      "expected": "Every SubagentSpawnParams field (id Some/None, prompt, description, subagent_type, parent_session_id, parent_prompt_id, resume_from, cwd, model, model_override_provenance, reasoning_effort, persona, capability_mode, isolation, harness_agent_type, run_in_background, surface_completion, fork_context, advisor_gate_prevalidated) maps to the exact corresponding SubagentRequest / SubagentRuntimeOverrides field with no transformation.",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-tools --lib task::spawn",
+      "tests": [
+        "into_request_maps_every_knob",
+        "into_request_generates_id_when_absent",
+        "into_request_preserves_explicit_id"
+      ]
+    },
+    {
+      "case": 2,
+      "name": "per_site_snapshot",
+      "surface": "package",
+      "expected": "Each of the 4 call sites' exact SubagentSpawnParams literal profile (read from source: advisor ReadOnly/fork_context=true/surface_completion=true/Harness provenance/run_in_background=false; bounty cwd=Some/isolation=param/surface_completion=false/fork_context=false/Harness provenance/capability_mode=None; research subagent_type=\"deep-research\"/ReadOnly/all boolean flags false/Harness provenance/cwd=None; task Tool provenance/fork_context=is_advisor_subagent(subagent_type) checked true and false/surface_completion=true always) survives into_request() unchanged.",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-tools --lib task::spawn",
+      "tests": [
+        "into_request_matches_advisor_site_profile",
+        "into_request_matches_bounty_site_profile",
+        "into_request_matches_research_site_profile",
+        "into_request_matches_task_site_profile_non_advisor",
+        "into_request_matches_task_site_profile_advisor"
+      ]
+    },
+    {
+      "case": 3,
+      "name": "regression_suites",
+      "surface": "package",
+      "expected": "All pre-existing regression suites for the 4 migrated call sites, plus the primitive module and the schema-sync fixture test, pass unmodified.",
+      "verdict": "pass",
+      "runs": [
+        { "command": "cargo test -p xai-grok-tools --lib task::spawn", "result": "8 passed; 0 failed" },
+        { "command": "cargo test -p xai-grok-tools --lib advisor", "result": "25 passed; 0 failed" },
+        { "command": "cargo test -p xai-grok-tools --lib task::", "result": "148 passed; 0 failed" },
+        { "command": "cargo test -p xai-grok-tools --lib bounty", "result": "5 passed; 0 failed" },
+        { "command": "cargo test -p xai-grok-tools --lib research", "result": "5 passed; 0 failed" },
+        { "command": "cargo test -p xai-grok-tools --lib tool_meta_schema_is_up_to_date", "result": "1 passed; 0 failed" }
+      ]
+    },
+    {
+      "case": 4,
+      "name": "schema_toolkind_kinds",
+      "surface": "package",
+      "expected": "schema/tool_meta.schema.json ToolKind description contains 'advisor', 'research', and 'bounty', and still contains pre-existing kinds like 'task' and 'read'; the fixture test tool_meta_schema_is_up_to_date (which regenerates the schema from CanonicalToolMeta and compares) passes, proving the checked-in file is in sync with the type.",
+      "verdict": "pass",
+      "command": "cargo test -p xai-grok-tools --lib tool_meta_schema_is_up_to_date",
+      "evidence": "definitions.ToolKind.description in schema/tool_meta.schema.json lists: … \"task\", \"advisor\", \"research\", \"bounty\", … \"read\" (as part of the '(Rust deserializes them to `other` …). Known values: `read`, …' string) — all required tokens present."
+    }
+  ],
+  "totals": {
+    "cases": 4,
+    "cases_passed": 4,
+    "cases_failed": 0,
+    "new_tests_added": 5,
+    "regression_tests_run": 192,
+    "regression_tests_passed": 192,
+    "regression_tests_failed": 0
+  },
+  "behavior_drift_found": false,
+  "blockers": []
+}

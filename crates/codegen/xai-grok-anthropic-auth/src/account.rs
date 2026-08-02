@@ -128,6 +128,21 @@ pub struct Account {
     /// 7-day utilization fraction (0.0–1.0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub utilization7d: Option<f64>,
+    /// Raw `/api/oauth/usage` response from Claude.ai.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<serde_json::Value>,
+    /// When [`Self::usage`] was fetched (epoch ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_fetched_at: Option<i64>,
+    /// Last `/api/oauth/usage` fetch error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_error: Option<String>,
+    /// 5-hour usage reset (epoch ms), from `/api/oauth/usage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_five_hour_resets_at: Option<i64>,
+    /// 7-day usage reset (epoch ms), from `/api/oauth/usage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_seven_day_resets_at: Option<i64>,
     /// Unified routing status from the last response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unified_status: Option<RoutingStatus>,
@@ -167,6 +182,11 @@ impl Account {
             capabilities: None,
             utilization5h: None,
             utilization7d: None,
+            usage: None,
+            usage_fetched_at: None,
+            usage_error: None,
+            usage_five_hour_resets_at: None,
+            usage_seven_day_resets_at: None,
             unified_status: None,
             rate_limit_reset_time: None,
             refresh_failure_count: None,
@@ -259,7 +279,17 @@ impl Account {
         } else if max_util >= 0.9 {
             score -= 1;
         }
+        if self.has_rate_limit_error() {
+            score -= 8;
+        }
         score
+    }
+
+    fn has_rate_limit_error(&self) -> bool {
+        // ponytail: stored auth errors are strings; use structured error kind if the store grows one.
+        self.last_auth_error
+            .as_deref()
+            .is_some_and(|e| e.contains("rate_limit") || e.contains("429"))
     }
 }
 

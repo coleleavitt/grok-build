@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod account;
+pub mod debug;
 pub mod endpoints;
 pub mod error;
 pub mod live;
@@ -27,6 +28,7 @@ pub mod store;
 pub mod token;
 
 pub use account::{Account, AccountCapabilities, PlanType, RoutingStatus};
+pub use debug::{AccountDebug, key_prefix, snapshot_accounts};
 pub use endpoints::{OAuthEndpoints, Scope};
 pub use error::{AnthropicAuthError, Result};
 pub use live::LiveCredential;

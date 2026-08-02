@@ -3762,3 +3762,41 @@ async fn load_session_without_updates_survives_merged_chat_line() {
             "resume succeeds; only the merged record is dropped"
         );
 }
+/// Goal-mode durable state: `Some` round-trips through the resume loader,
+/// `None` removes the file so a cleared goal cannot resurrect on resume.
+/// This is the storage half of the "/goal resume says No goal set after
+/// restart" regression — the write side lives in `GoalNotifySender`.
+#[tokio::test]
+async fn write_goal_mode_state_round_trips_and_clears() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+
+    let mut tracker = crate::session::goal_tracker::GoalTracker::new(
+        temp_dir.path().join("goal-scratch"),
+    );
+    tracker.create_goal("g1".into(), "ship it".into(), None, 0, "now".into(), None);
+    tracker.pause(crate::session::goal_tracker::GoalPauseReason::Infra);
+    let state = tracker.snapshot().cloned().unwrap();
+
+    adapter.write_goal_mode_state(&info, Some(&state)).await.unwrap();
+    let loaded = adapter.load_session_without_updates(&info).await.unwrap();
+    let restored = loaded.goal_mode_state.expect("paused goal must survive restart");
+    assert_eq!(restored.goal_id, "g1");
+    assert_eq!(restored.objective, "ship it");
+    assert_eq!(
+        restored.status,
+        crate::session::goal_tracker::GoalStatus::InfraPaused,
+        "paused-on-error status must round-trip so /goal resume finds it",
+    );
+
+    adapter.write_goal_mode_state(&info, None).await.unwrap();
+    let loaded = adapter.load_session_without_updates(&info).await.unwrap();
+    assert!(
+        loaded.goal_mode_state.is_none(),
+        "cleared goal must not resurrect on resume"
+    );
+    // Clearing an already-missing state stays Ok (idempotent).
+    adapter.write_goal_mode_state(&info, None).await.unwrap();
+}

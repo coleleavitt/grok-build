@@ -1027,6 +1027,7 @@ fn resume_source_worktree_reuse() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        tokens_used: 0,
     };
     let worktree = source_with_worktree.worktree_path.clone();
     assert_eq!(
@@ -1045,6 +1046,7 @@ fn resume_source_worktree_reuse() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        tokens_used: 0,
     };
     assert!(
             source_without_worktree.worktree_path.is_none(),
@@ -1089,6 +1091,7 @@ fn resume_inherited_cwd_requires_existing_non_worktree_dir() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        tokens_used: 0,
     };
     assert_eq!(
             resume_inherited_cwd(Some(&present)),
@@ -1120,6 +1123,7 @@ fn select_override_cwd_resume_never_falls_through_to_request_cwd() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        tokens_used: 0,
     };
     assert_eq!(select_override_cwd(Some(&source), Some("/x")), None);
 }
@@ -1537,6 +1541,7 @@ fn resume_rejects_conflicting_subagent_type() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        tokens_used: 0,
     };
     let request_type = "explore";
     assert_ne!(
@@ -1555,6 +1560,7 @@ fn resume_rejects_conflicting_persona() {
         subagent_type: "general-purpose".into(),
         persona: Some("implementer".into()),
         model_id: None,
+        tokens_used: 0,
     };
     let request_persona = Some("reviewer".to_string());
     let conflict = request_persona.as_deref() != source.persona.as_deref();
@@ -1571,6 +1577,7 @@ fn resume_allows_matching_identity() {
         subagent_type: "general-purpose".into(),
         persona: Some("implementer".into()),
         model_id: Some("grok-3".into()),
+        tokens_used: 0,
     };
     assert_eq!("general-purpose", source.subagent_type);
     assert_eq!(Some("implementer"), source.persona.as_deref());
@@ -1587,6 +1594,7 @@ fn resume_identity_does_not_gate_on_model() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: Some("grok-3".into()),
+        tokens_used: 0,
     };
     assert!(
             xai_grok_subagent_resolution::validate_resume_identity(

@@ -280,6 +280,8 @@ pub(crate) async fn spawn_session_actor(
     subagents_enabled: bool,
     subagents_max_depth: u32,
     ask_user_question_enabled: bool,
+    advisor_enabled: bool,
+    server_advisor: bool,
     client_hooks: crate::extensions::hooks::ClientHooks,
     prompt_display_cwd: Option<String>,
     subagent_toggle: std::collections::HashMap<String, bool>,
@@ -962,6 +964,7 @@ pub(crate) async fn spawn_session_actor(
         subagent_toggle: subagent_toggle.clone(),
         background_workflows_enabled,
         ask_user_question_enabled,
+        advisor_enabled,
         persona_summaries: persona_summaries.clone(),
         prompt_audience,
         role_instructions: role_instructions.clone(),
@@ -1577,6 +1580,7 @@ pub(crate) async fn spawn_session_actor(
         compactions_remaining: std::cell::Cell::new(sampling_config.compactions_remaining),
         compaction_at_tokens: std::cell::Cell::new(sampling_config.compaction_at_tokens),
         doom_loop_recovery,
+        server_advisor,
         doom_loop_turn_tally: Default::default(),
         file_state_tracker,
         rewind_pending_prompt: std::sync::Mutex::new(None),
@@ -1691,6 +1695,7 @@ pub(crate) async fn spawn_session_actor(
         goal_classifier_enabled: effective_config
             .resolve_goal_classifier_enabled(goal_enabled)
             .value,
+        goal_review_enabled: effective_config.resolve_goal_review_enabled().value,
         goal_planner_enabled: effective_config
             .resolve_goal_planner_enabled(goal_enabled)
             .value,
@@ -2233,6 +2238,8 @@ pub(crate) async fn spawn_session_on_thread(
     subagents_enabled: bool,
     subagents_max_depth: u32,
     ask_user_question_enabled: bool,
+    advisor_enabled: bool,
+    server_advisor: bool,
     client_hooks: crate::extensions::hooks::ClientHooks,
     prompt_display_cwd: Option<String>,
     subagent_toggle: std::collections::HashMap<String, bool>,
@@ -2407,6 +2414,8 @@ pub(crate) async fn spawn_session_on_thread(
                         subagents_enabled,
                         subagents_max_depth,
                         ask_user_question_enabled,
+                        advisor_enabled,
+                        server_advisor,
                         client_hooks,
                         prompt_display_cwd,
                         subagent_toggle,

@@ -958,6 +958,105 @@ fn system_prompt_override_from_meta_prefers_session_and_rejects_empty() {
     assert_eq!(system_prompt_override_from_meta(None, None), None);
 }
 #[test]
+#[serial_test::serial]
+fn resolve_advisor_enabled_meta_outranks_env_default_on() {
+    let _guard = xai_grok_test_support::EnvGuard::unset("GROK_ADVISOR_DISABLED");
+    let _guard2 = xai_grok_test_support::EnvGuard::unset("GROK_ADVISOR_ENABLED");
+    // Absent meta falls back to AdvisorConfig::from_env().enabled (default on).
+    assert!(resolve_advisor_enabled(None, None));
+    let session_false = serde_json::json!({ "advisorEnabled" : false });
+    assert!(!resolve_advisor_enabled(
+        session_false.as_object(),
+        None
+    ));
+    let session_true = serde_json::json!({ "advisorEnabled" : true });
+    let init_false = serde_json::json!({ "advisorEnabled" : false });
+    assert!(
+        resolve_advisor_enabled(session_true.as_object(), init_false.as_object()),
+        "session meta must outrank init meta"
+    );
+    assert!(
+        !resolve_advisor_enabled(None, init_false.as_object()),
+        "init meta is used when session meta is absent"
+    );
+}
+#[test]
+#[serial_test::serial]
+fn build_spawn_system_prompt_includes_advisor_section_by_default_and_when_explicitly_enabled() {
+    let _guard = xai_grok_test_support::EnvGuard::unset("GROK_ADVISOR_DISABLED");
+    let _guard2 = xai_grok_test_support::EnvGuard::unset("GROK_ADVISOR_ENABLED");
+    let base = "BASE PROMPT";
+    let absent = build_spawn_system_prompt(None, None, base);
+    assert!(
+        absent.contains("<advisor>"),
+        "advisor section must be present when advisorEnabled is absent (default on)"
+    );
+    let session_true = serde_json::json!({ "advisorEnabled" : true });
+    let explicit_on = build_spawn_system_prompt(session_true.as_object(), None, base);
+    assert!(explicit_on.contains("<advisor>"));
+}
+#[test]
+fn build_spawn_system_prompt_excludes_advisor_section_when_disabled() {
+    let base = "BASE PROMPT";
+    let session_false = serde_json::json!({ "advisorEnabled" : false });
+    let disabled = build_spawn_system_prompt(session_false.as_object(), None, base);
+    assert!(!disabled.contains("<advisor>"));
+}
+#[test]
+fn maybe_append_advisor_section_appends_when_enabled_and_no_override() {
+    let prompt = maybe_append_advisor_section("BASE PROMPT".to_string(), true, false);
+    assert!(prompt.contains("<advisor>"));
+}
+#[test]
+fn maybe_append_advisor_section_absent_when_disabled() {
+    let prompt = maybe_append_advisor_section("BASE PROMPT".to_string(), false, false);
+    assert!(!prompt.contains("<advisor>"));
+    assert_eq!(prompt, "BASE PROMPT");
+}
+#[test]
+fn maybe_append_advisor_section_absent_when_override_active() {
+    // Mirrors `build_spawn_system_prompt`'s override branch: a verbatim
+    // `systemPromptOverride` must never be decorated, even when advisor is enabled.
+    let prompt = maybe_append_advisor_section("VERBATIM OVERRIDE".to_string(), true, true);
+    assert_eq!(
+        prompt, "VERBATIM OVERRIDE",
+        "an active systemPromptOverride must be preserved verbatim, with no <advisor> section"
+    );
+}
+#[test]
+fn maybe_append_advisor_section_is_idempotent() {
+    let once = maybe_append_advisor_section("BASE PROMPT".to_string(), true, false);
+    let twice = maybe_append_advisor_section(once.clone(), true, false);
+    assert_eq!(twice, once, "re-applying on an already-decorated prompt must not double-append");
+    assert_eq!(
+        twice.matches("<advisor>").count(),
+        1,
+        "the <advisor> section must appear exactly once"
+    );
+}
+#[test]
+#[serial_test::serial]
+fn resolve_advisor_enabled_honors_env_disabled_when_meta_absent() {
+    // Adversarial case 2: GROK_ADVISOR_DISABLED=1 with NO meta key at all
+    // (neither session nor init) must fall through to AdvisorConfig::from_env()
+    // and resolve to disabled — the env override must not be silently ignored
+    // just because no meta object was ever constructed.
+    let _guard = xai_grok_test_support::EnvGuard::set("GROK_ADVISOR_DISABLED", "1");
+    let _guard2 = xai_grok_test_support::EnvGuard::unset("GROK_ADVISOR_ENABLED");
+    assert!(
+        !resolve_advisor_enabled(None, None),
+        "GROK_ADVISOR_DISABLED=1 with absent meta must disable advisor"
+    );
+    // The prompt-section gate must agree with the tool-strip gate on the same
+    // input, or the model would be told about a tool that isn't there.
+    let base = "BASE PROMPT";
+    let prompt = build_spawn_system_prompt(None, None, base);
+    assert!(
+        !prompt.contains("<advisor>"),
+        "advisor section must be absent when env-disabled with no meta override"
+    );
+}
+#[test]
 fn enqueue_replace_system_prompt_override_sends_when_present() {
     use crate::session::SessionCommand;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

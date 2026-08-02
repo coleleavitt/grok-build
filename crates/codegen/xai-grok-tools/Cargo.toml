@@ -17,7 +17,8 @@ educe = { workspace = true, features = ["Debug"] }
 async-openai = { workspace = true }
 xai-tty-utils = { workspace = true }
 xai-grok-config = { path = "../xai-grok-config" }
-xai-grok-extra-ca = { workspace = true }
+xai-grok-brain = { path = "../xai-grok-brain" }
+xai-grok-economy = { path = "../xai-grok-economy" }
 xai-grok-tools-api = { path = "../xai-grok-tools-api" }
 xai-grok-workspace-types = { path = "../xai-grok-workspace-types" }
 xai-grok-version = { workspace = true }
@@ -45,7 +46,7 @@ minijinja = { version = "2", features = ["custom_syntax"] }
 parking_lot = { workspace = true }
 htmd = { workspace = true }
 scraper = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls", "json", "gzip", "brotli", "deflate"] }
+reqwest = { workspace = true, features = ["rustls-tls", "json", "gzip", "brotli", "deflate", "cookies"] }
 pulldown-cmark = { workspace = true }
 regex = { workspace = true }
 schemars = { workspace = true }
@@ -84,6 +85,7 @@ serde_yaml = { workspace = true }
 shellexpand = "3.1"
 tempfile = { workspace = true }
 which = { workspace = true }
+toml = { workspace = true }
 
 chrono = { workspace = true }
 futures-util = { workspace = true }
@@ -126,4 +128,6 @@ workspace = true
 default-bazel = ["serde"]
 default = ["serde"]
 serde = []
-dhat-heap = ["dep:dhat"]
+# Credential/API-key-backed web-search providers (Google CSE, Brave, Tavily,
+# Exa, CORE). Off by default so the model only sees key-free routes.
+web-search-credentialed-providers = []

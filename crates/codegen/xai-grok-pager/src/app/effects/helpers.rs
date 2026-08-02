@@ -256,6 +256,13 @@ pub(crate) fn sanitize_user_error(raw: &str) -> String {
 pub(crate) struct SessionFlags {
     pub plan_mode: bool,
     pub subagents: bool,
+    /// Advisor tool override (`--advisor` / `--no-advisor`). `None` (the
+    /// default) omits `_meta.advisorEnabled` so the shell resolves it via
+    /// `AdvisorConfig::from_env`; `Some(_)` stamps the explicit override.
+    pub advisor_enabled: Option<bool>,
+    /// Opt in to server-side advisor execution (`--server-advisor`).
+    /// Stamped into `_meta.serverAdvisor` only when `true`.
+    pub server_advisor: bool,
     pub ask_user: bool,
     /// Restore code state on resume (`--restore-code`).
     /// Injected as `x.ai/restore_code` into `LoadSession` meta, or passed
@@ -346,6 +353,12 @@ impl SessionFlags {
                 self.auto_mode
             )),
         );
+        if let Some(advisor_enabled) = self.advisor_enabled {
+            meta.insert("advisorEnabled".into(), serde_json::json!(advisor_enabled));
+        }
+        if self.server_advisor {
+            meta.insert("serverAdvisor".into(), serde_json::json!(true));
+        }
         if meta.is_empty() { None } else { Some(meta) }
     }
 }
@@ -875,6 +888,20 @@ pub(super) async fn send_auth_cancel(tx: &AcpAgentTx, request_seq: u64) -> TaskR
     }
     TaskResult::AuthCancelComplete
 }
+/// Extract the `meta` object from a `x.ai/auth/check_subscription` response.
+///
+/// The shell reports "not authenticated" as an explicit `"meta": null`, which
+/// `.get("meta").cloned()` used to surface as `Some(Value::Null)`. Downstream
+/// `AuthMeta` parsing then failed with `invalid type: null, expected struct
+/// AuthMeta` (logged as `subscription.check.meta_parse_failed`). Null is
+/// normalized to `None`, which the dispatch layer already treats as
+/// "not authenticated / check failed".
+fn extract_subscription_meta(raw: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| v.get("meta").cloned())
+        .filter(|m| !m.is_null())
+}
 pub(super) async fn send_check_subscription(
     tx: &AcpAgentTx,
     verify: Option<u64>,
@@ -887,9 +914,7 @@ pub(super) async fn send_check_subscription(
     );
     match acp_send(req, tx).await {
         Ok(resp) => {
-            let meta = serde_json::from_str::<serde_json::Value>(resp.0.get())
-                .ok()
-                .and_then(|v| v.get("meta").cloned());
+            let meta = extract_subscription_meta(resp.0.get());
             TaskResult::CheckSubscriptionComplete {
                 verify,
                 meta,
@@ -928,9 +953,7 @@ pub(super) async fn send_credit_limit_recheck(
     );
     match acp_send(req, tx).await {
         Ok(resp) => {
-            let meta = serde_json::from_str::<serde_json::Value>(resp.0.get())
-                .ok()
-                .and_then(|v| v.get("meta").cloned());
+            let meta = extract_subscription_meta(resp.0.get());
             TaskResult::CreditLimitRecheckComplete {
                 agent_id,
                 meta,
@@ -1676,5 +1699,35 @@ pub(super) fn unregister_active_session_best_effort_in(
         )
         }
         Err(e) => tracing::warn!(?e, "Failed to unregister active session"),
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `"meta": null` (shell's "not authenticated") must map to
+    /// `None`, not `Some(Value::Null)` — the latter made the dispatch layer
+    /// log `subscription.check.meta_parse_failed` on every unauthenticated
+    /// check.
+    #[test]
+    fn subscription_meta_null_is_none() {
+        assert_eq!(
+            extract_subscription_meta(r#"{"authenticated": false, "meta": null}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn subscription_meta_absent_or_invalid_is_none() {
+        assert_eq!(extract_subscription_meta(r#"{"authenticated": false}"#), None);
+        assert_eq!(extract_subscription_meta("not json"), None);
+    }
+
+    #[test]
+    fn subscription_meta_object_passes_through() {
+        let meta = extract_subscription_meta(
+            r#"{"authenticated": true, "meta": {"tier": "pro"}}"#,
+        );
+        assert_eq!(meta, Some(serde_json::json!({"tier": "pro"})));
     }
 }

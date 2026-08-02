@@ -1,0 +1,134 @@
+{
+  "suite": "advisor-g001-adversarial-qa",
+  "kind": "api-package-test-report",
+  "target": {
+    "repo": "grok-build",
+    "branch": "feat/grok-economy-bounty-port",
+    "surface": "Rust crate API/package: AdvisorTool, enable gate, toolset advertisement, CLI tri-state"
+  },
+  "policy": "Tests only added; no implementation files modified. Any real defect found is reported as a blocker, not fixed.",
+  "cases": [
+    {
+      "id": 1,
+      "name": "DISABLE truly hides the tool (strip + keep)",
+      "surface": "api",
+      "expected": "apply_advisor_enabled_gate removes ToolKind::Advisor entries when advisor_enabled=false and preserves unrelated tools; keeps Advisor entries when advisor_enabled=true. A defensive multi-entry variant strips every Advisor-kind entry, not just the first.",
+      "verdict": "passed",
+      "command": "cargo test -p xai-grok-shell --lib agent::mvp_agent::tests::apply_advisor_enabled_gate_strips_advisor_when_disabled agent::mvp_agent::tests::apply_advisor_enabled_gate_keeps_advisor_when_enabled agent::mvp_agent::tests::apply_advisor_enabled_gate_disabled_removes_all_advisor_entries_only",
+      "tests": [
+        "agent::mvp_agent::tests::apply_advisor_enabled_gate_strips_advisor_when_disabled (pre-existing)",
+        "agent::mvp_agent::tests::apply_advisor_enabled_gate_keeps_advisor_when_enabled (pre-existing)",
+        "agent::mvp_agent::tests::apply_advisor_enabled_gate_disabled_removes_all_advisor_entries_only (ADDED)"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "DISABLE hides the prompt; env respected when meta absent",
+      "surface": "api",
+      "expected": "build_spawn_system_prompt excludes <advisor> when advisorEnabled=false in meta, includes it when absent (default-on) and when Some(true). Adversarial extension: GROK_ADVISOR_DISABLED=1 with NO meta key at all must still resolve to disabled via resolve_advisor_enabled -> AdvisorConfig::from_env(), and the prompt gate must agree with it.",
+      "verdict": "passed",
+      "command": "cargo test -p xai-grok-shell --lib agent::mvp_agent::tests::resolve_advisor_enabled_meta_outranks_env_default_on agent::mvp_agent::tests::build_spawn_system_prompt_includes_advisor_section_by_default_and_when_explicitly_enabled agent::mvp_agent::tests::build_spawn_system_prompt_excludes_advisor_section_when_disabled agent::mvp_agent::tests::resolve_advisor_enabled_honors_env_disabled_when_meta_absent",
+      "tests": [
+        "agent::mvp_agent::tests::resolve_advisor_enabled_meta_outranks_env_default_on (pre-existing)",
+        "agent::mvp_agent::tests::build_spawn_system_prompt_includes_advisor_section_by_default_and_when_explicitly_enabled (pre-existing)",
+        "agent::mvp_agent::tests::build_spawn_system_prompt_excludes_advisor_section_when_disabled (pre-existing)",
+        "agent::mvp_agent::tests::resolve_advisor_enabled_honors_env_disabled_when_meta_absent (ADDED - confirms env IS honored; no defect found)"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "NO-SUBAGENTS LEAK: plan-no-subagents and concise toolsets omit advisor",
+      "surface": "api",
+      "expected": "grok_build_plan_no_subagents_toolset() and grok_build_concise_toolset() must NOT contain an advisor tool entry (a leak would crash at runtime with no SubagentBackendResource).",
+      "verdict": "passed",
+      "command": "cargo test -p xai-grok-agent --lib config::tests::grok_build_plan_no_subagents_omits_advisor_tool config::tests::grok_build_concise_toolset_omits_advisor_tool",
+      "tests": [
+        "config::tests::grok_build_plan_no_subagents_omits_advisor_tool (pre-existing)",
+        "config::tests::grok_build_concise_toolset_omits_advisor_tool (ADDED)"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "TOOL IDENTITY: id/kind/registry resolution + serde robustness",
+      "surface": "api",
+      "expected": "AdvisorTool id==\"advisor\", ToolKind::Advisor, and is registered in the ToolRegistryBuilder::new() builder that backs ToolRegistry::new() (fully-qualified id \"GrokBuild:advisor\" resolves to ToolKind::Advisor). Input accepts {} and {\"focus\":\"x\"}, ignores unrecognized extra fields (no deny_unknown_fields), and rejects a malformed focus type.",
+      "verdict": "passed",
+      "command": "cargo test -p xai-grok-tools --lib implementations::grok_build::advisor::tests::tool_kind_is_advisor implementations::grok_build::advisor::tests::tool_id_renders_advisor implementations::grok_build::advisor::tests::tool_registered_in_registry_builder_as_advisor_kind implementations::grok_build::advisor::tests::input_deserializes_from_empty_object implementations::grok_build::advisor::tests::input_deserializes_with_focus implementations::grok_build::advisor::tests::input_deserialization_ignores_unexpected_extra_fields implementations::grok_build::advisor::tests::input_deserialization_rejects_wrong_focus_type",
+      "tests": [
+        "implementations::grok_build::advisor::tests::tool_kind_is_advisor (pre-existing)",
+        "implementations::grok_build::advisor::tests::tool_id_renders_advisor (pre-existing)",
+        "implementations::grok_build::advisor::tests::input_deserializes_from_empty_object (pre-existing)",
+        "implementations::grok_build::advisor::tests::input_deserializes_with_focus (pre-existing)",
+        "implementations::grok_build::advisor::tests::tool_registered_in_registry_builder_as_advisor_kind (ADDED)",
+        "implementations::grok_build::advisor::tests::input_deserialization_ignores_unexpected_extra_fields (ADDED)",
+        "implementations::grok_build::advisor::tests::input_deserialization_rejects_wrong_focus_type (ADDED)"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "SERVER FLAG INERT: --server-advisor only sets serverAdvisor meta",
+      "surface": "api",
+      "expected": "to_meta() emits serverAdvisor only when true and it must not alter agentProfile, askUserQuestion, advisorEnabled, yoloMode, or autoMode (G001/G002 boundary guard).",
+      "verdict": "passed",
+      "command": "cargo test -p xai-grok-pager --lib app::effects::tests::to_meta_emits_server_advisor_when_enabled app::effects::tests::to_meta_omits_server_advisor_when_disabled app::effects::tests::to_meta_server_advisor_is_inert_beyond_its_own_key",
+      "tests": [
+        "app::effects::tests::to_meta_emits_server_advisor_when_enabled (pre-existing)",
+        "app::effects::tests::to_meta_omits_server_advisor_when_disabled (pre-existing)",
+        "app::effects::tests::to_meta_server_advisor_is_inert_beyond_its_own_key (ADDED - byte-for-byte meta diff excluding serverAdvisor)"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "CLI TRI-STATE + CONFLICT: --advisor/--no-advisor",
+      "surface": "api",
+      "expected": "--advisor and --no-advisor conflict at the clap level (ArgumentConflict); advisor_enabled() resolves Some(true)/Some(false)/None correctly; --server-advisor parses independently.",
+      "verdict": "passed",
+      "command": "cargo test -p xai-grok-pager --lib app::cli::tests::advisor_flags_resolve_tri_state app::cli::tests::server_advisor_flag_parses",
+      "tests": [
+        "app::cli::tests::advisor_flags_resolve_tri_state (pre-existing, already adversarial: asserts ArgumentConflict)",
+        "app::cli::tests::server_advisor_flag_parses (pre-existing)"
+      ]
+    },
+    {
+      "id": 7,
+      "name": "BUDGET/PREFLIGHT: AdvisorTool routes through validate_advisor_spawn",
+      "surface": "api",
+      "expected": "AdvisorTool must call the SAME preflight gate TaskTool uses (validate_advisor_spawn). A Rejected outcome must yield a ToolError (not panic/silent success) and NO SubagentEvent::Spawn must be observed on the mock backend channel.",
+      "verdict": "passed",
+      "command": "cargo test -p xai-grok-tools --lib implementations::grok_build::advisor::tests::advisor_disabled_rejects_before_spawn implementations::grok_build::advisor::tests::advisor_validation_unavailable_returns_custom_error",
+      "tests": [
+        "implementations::grok_build::advisor::tests::advisor_disabled_rejects_before_spawn (pre-existing - asserts ToolError message and rx.try_recv().is_err())",
+        "implementations::grok_build::advisor::tests::advisor_validation_unavailable_returns_custom_error (pre-existing - ValidationUnavailable outcome path)"
+      ]
+    }
+  ],
+  "totals": {
+    "cases": 7,
+    "cases_passed": 7,
+    "cases_failed": 0,
+    "tests_run_total": 24,
+    "tests_added": 8,
+    "tests_pre_existing_reused": 16
+  },
+  "commands": [
+    "cargo test -p xai-grok-shell --lib agent::mvp_agent::tests::resolve_advisor_enabled_honors_env_disabled_when_meta_absent",
+    "cargo test -p xai-grok-shell --lib agent::mvp_agent::tests::apply_advisor_enabled_gate_disabled_removes_all_advisor_entries_only",
+    "cargo test -p xai-grok-agent --lib config::tests::grok_build_concise_toolset_omits_advisor_tool",
+    "cargo test -p xai-grok-tools --lib implementations::grok_build::advisor::tests::tool_registered_in_registry_builder_as_advisor_kind",
+    "cargo test -p xai-grok-tools --lib implementations::grok_build::advisor::tests::input_deserialization_ignores_unexpected_extra_fields",
+    "cargo test -p xai-grok-tools --lib implementations::grok_build::advisor::tests::input_deserialization_rejects_wrong_focus_type",
+    "cargo test -p xai-grok-pager --lib app::effects::tests::to_meta_server_advisor_is_inert_beyond_its_own_key",
+    "cargo test -p xai-grok-tools --lib advisor",
+    "cargo test -p xai-grok-agent --lib advisor",
+    "cargo test -p xai-grok-shell --lib advisor",
+    "cargo test -p xai-grok-pager --lib advisor"
+  ],
+  "full_run_results": {
+    "xai-grok-tools": "22 passed; 0 failed (advisor filter)",
+    "xai-grok-agent": "5 passed; 0 failed (advisor filter)",
+    "xai-grok-shell": "14 passed; 0 failed (advisor filter)",
+    "xai-grok-pager": "8 passed; 0 failed (advisor filter)"
+  },
+  "blockers": [],
+  "implementation_files_modified": []
+}

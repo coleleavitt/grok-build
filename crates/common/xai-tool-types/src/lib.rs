@@ -1,4 +1,5 @@
 //! Canonical, extensible tool types.
+pub mod advisor;
 mod ext;
 mod schema_utils;
 pub mod serde_lenient;
@@ -8,10 +9,12 @@ mod types;
 pub use ext::Extensions;
 pub use schema_utils::parse_arguments_from_schema_lossy;
 pub use serde_lenient::{
-    deserialize_lenient_bool, deserialize_lenient_option_bool, lenient_bool_from_json,
+    coerce_args_against_schema, deserialize_lenient_bool, deserialize_lenient_option_bool,
+    lenient_bool_from_json,
 };
 pub use task::{
-    BUILTIN_SUBAGENTS, BuiltinSubagent, EXPLORE_PROMPT, EXPLORE_SUBAGENT, GENERAL_PURPOSE_PROMPT,
+    ADVISOR_PROMPT, ADVISOR_SUBAGENT, BUILTIN_SUBAGENTS, BuiltinSubagent, DEEP_RESEARCH_PROMPT,
+    DEEP_RESEARCH_SUBAGENT, EXPLORE_PROMPT, EXPLORE_SUBAGENT, GENERAL_PURPOSE_PROMPT,
     GENERAL_PURPOSE_SUBAGENT, KillTaskOutput, KillTaskResult, KillTaskToolInput,
     KillTaskToolNaming, MAX_MULTI_WAIT_IDS, MAX_WAIT_BLOCK_MS_DEFAULT, MAX_WAIT_MS_PLACEHOLDER,
     MultiTaskOutputResult, PLAN_PROMPT, PLAN_SUBAGENT, SubagentCapabilityMode,

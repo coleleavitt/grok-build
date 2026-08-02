@@ -63,7 +63,7 @@ pub async fn run_cli_auth(args: AuthArgs) -> anyhow::Result<()> {
 pub async fn run_cli_anthropic_auth(args: AnthropicAuthArgs) -> anyhow::Result<()> {
     match args.command {
         AnthropicAuthCommand::Login(login) => login_anthropic(login).await,
-        AnthropicAuthCommand::Status => status_anthropic(),
+        AnthropicAuthCommand::Status => status_anthropic().await,
         AnthropicAuthCommand::Use { name } => use_anthropic(&name),
         AnthropicAuthCommand::Logout { name } => logout_anthropic(name.as_deref()),
     }
@@ -115,10 +115,16 @@ async fn login_anthropic(args: AnthropicLoginArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn status_anthropic() -> anyhow::Result<()> {
-    let store = AccountStore::from_env();
-    let data = store
-        .load()
+async fn status_anthropic() -> anyhow::Result<()> {
+    let manager = xai_grok_anthropic_auth::AnthropicAuthManager::from_env();
+    let store = manager.store();
+    let data = manager
+        .refresh_usage_for_all()
+        .await
+        .or_else(|err| {
+            eprintln!("warning: failed to refresh Anthropic usage: {err}");
+            store.load()
+        })
         .context("failed to load Anthropic account store")?;
     println!("Anthropic account store: {}", store.path().display());
     if data.accounts.is_empty() {
@@ -340,7 +346,32 @@ fn account_status(account: &Account) -> String {
     if let Some(error) = &account.last_auth_error {
         parts.push(format!("last_error={error}"));
     }
+    if let Some(usage) = account.utilization5h {
+        parts.push(format!("usage5h={}", format_usage_percent(usage)));
+    }
+    if let Some(reset) = account.usage_five_hour_resets_at {
+        parts.push(format!("usage5h_reset={}", format_epoch_ms(reset)));
+    }
+    if let Some(usage) = account.utilization7d {
+        parts.push(format!("usage7d={}", format_usage_percent(usage)));
+    }
+    if let Some(reset) = account.usage_seven_day_resets_at {
+        parts.push(format!("usage7d_reset={}", format_epoch_ms(reset)));
+    }
+    if let Some(error) = &account.usage_error {
+        parts.push(format!("usage_error={error}"));
+    }
     parts.join(" ")
+}
+
+fn format_usage_percent(value: f64) -> String {
+    format!("{:.0}%", value * 100.0)
+}
+
+fn format_epoch_ms(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| ms.to_string())
 }
 
 fn validate_account_name(name: &str) -> anyhow::Result<()> {

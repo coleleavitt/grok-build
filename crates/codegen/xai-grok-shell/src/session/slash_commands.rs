@@ -103,6 +103,18 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         },
     },
     BuiltinCommand {
+        name: "brain",
+        description: "Inspect and control durable Brain memories",
+        argument_hint: Some(
+            "status | list | show <id> | sources <id> | related <id> | graph | run --force | forget <id|title> | on|off | connectors on|off | focus set <text>|clear | history <id> | restore <revision_id>",
+        ),
+        aliases: &[],
+        gate: BuiltinGate::AlwaysOn,
+        resolve: |args| BuiltinAction::Brain {
+            args: args.trim().to_string(),
+        },
+    },
+    BuiltinCommand {
         name: "context",
         description: "Show context window usage and session stats",
         argument_hint: None,
@@ -1146,6 +1158,9 @@ pub(super) enum BuiltinAction {
     MemoryToggle {
         enabled: bool,
     },
+    Brain {
+        args: String,
+    },
     GoalSet {
         objective: String,
         token_budget: Option<i64>,
@@ -1191,6 +1206,7 @@ impl BuiltinAction {
             BuiltinAction::Feedback { .. } => "feedback",
             BuiltinAction::MemoryBrowse => "memory",
             BuiltinAction::MemoryToggle { .. } => "memory",
+            BuiltinAction::Brain { .. } => "brain",
             BuiltinAction::GoalSet { .. }
             | BuiltinAction::GoalStatus
             | BuiltinAction::GoalPause
@@ -1225,6 +1241,7 @@ impl BuiltinAction {
             BuiltinAction::Feedback { text } => !text.is_empty(),
             BuiltinAction::MemoryBrowse => false,
             BuiltinAction::MemoryToggle { .. } => true,
+            BuiltinAction::Brain { args } => !args.trim().is_empty(),
             BuiltinAction::GoalSet { .. } => true,
             BuiltinAction::GoalStatus
             | BuiltinAction::GoalPause
@@ -1808,6 +1825,71 @@ mod tests {
         ));
     }
     #[test]
+    fn brain_resolves_to_builtin_and_preserves_args() {
+        for (input, expected) in [
+            ("/brain", ""),
+            ("/brain status", "status"),
+            (
+                "/brain focus set Track ERS deploys",
+                "focus set Track ERS deploys",
+            ),
+            ("/brain run --force", "run --force"),
+        ] {
+            let outcome = resolve(
+                vec![text_block(input)],
+                &[],
+                all_gated(),
+                SkillSlashRewrite::default(),
+            )
+            .unwrap_err();
+            match outcome {
+                SlashCommandOutcome::Builtin(BuiltinAction::Brain { args }) => {
+                    assert_eq!(args, expected, "input {input:?}");
+                }
+                _ => panic!("expected /brain to resolve to BuiltinAction::Brain"),
+            }
+        }
+    }
+
+    #[test]
+    fn brain_is_always_available_and_shadows_same_named_skill() {
+        let default_names = advertised_names_with(CommandAvailability::default());
+        assert!(
+            default_names.iter().any(|name| name == "brain"),
+            "AlwaysOn /brain should be advertised even with default gates closed: {default_names:?}",
+        );
+
+        let skills = vec![make_skill("brain", true)];
+        let outcome = resolve(
+            vec![text_block("/brain list")],
+            &skills,
+            CommandAvailability::default(),
+            SkillSlashRewrite::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            outcome,
+            SlashCommandOutcome::Builtin(BuiltinAction::Brain { ref args }) if args == "list"
+        ));
+    }
+
+    #[test]
+    fn brain_args_provided_tracks_empty_vs_subcommand() {
+        assert!(
+            !BuiltinAction::Brain {
+                args: String::new()
+            }
+            .args_provided()
+        );
+        assert!(
+            BuiltinAction::Brain {
+                args: "status".into()
+            }
+            .args_provided()
+        );
+    }
+
+    #[test]
     fn resolve_parses_skill_with_args() {
         let skills = vec![make_skill("commit", true)];
         let outcome = resolve(
@@ -2044,6 +2126,7 @@ mod tests {
                 "flush",
                 "dream",
                 "memory",
+                "brain",
                 "context",
                 "hooks-trust",
                 "hooks-list",
@@ -2258,7 +2341,14 @@ mod tests {
                 "{forbidden} should be excluded pre-session, got: {names:?}",
             );
         }
-        for required in ["compact", "always-approve", "context", "session-info"] {
+        // Always-on commands are still present.
+        for required in [
+            "compact",
+            "always-approve",
+            "brain",
+            "context",
+            "session-info",
+        ] {
             assert!(
                 names.iter().any(|n| n == required),
                 "{required} should be present, got: {names:?}",
@@ -2575,7 +2665,13 @@ mod tests {
                 "{forbidden} must not be advertised under default fail-closed availability, got: {names:?}",
             );
         }
-        for required in ["compact", "always-approve", "context", "session-info"] {
+        for required in [
+            "compact",
+            "always-approve",
+            "brain",
+            "context",
+            "session-info",
+        ] {
             assert!(
                 names.iter().any(|n| n == required),
                 "AlwaysOn {required} must always be advertised, got: {names:?}",

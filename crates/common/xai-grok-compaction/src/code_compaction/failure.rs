@@ -36,6 +36,77 @@ pub fn is_context_length_error(message: &str) -> bool {
         || (m.contains("current message") && m.contains("exceeds budget"))
 }
 
+/// Provider-reported sizes parsed out of a context-overflow error message,
+/// e.g. Anthropic's `prompt is too long: 1285075 tokens > 1000000 maximum`.
+///
+/// These are the provider's *true* token counts. Clients that shrink their
+/// payload with a byte-heuristic estimator need them to calibrate: when the
+/// estimator undercounts (heavy base64 / non-ASCII histories), an
+/// estimator-budget fit can conclude the payload already fits and re-send the
+/// exact bytes the API just rejected — a deterministic retry loop that ends in
+/// "Compaction failed.".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextOverflowSizes {
+    /// How many tokens the provider counted in the rejected prompt.
+    pub prompt_tokens: u64,
+    /// The provider's hard maximum, when the message states one.
+    pub max_tokens: Option<u64>,
+}
+
+/// Parse provider token counts from a context-overflow message. Returns
+/// `None` when the message carries no usable numbers (e.g. OpenAI's
+/// "maximum context length" phrasing without counts, or non-overflow errors).
+///
+/// Strategy: scan for `<number> tokens` as the prompt size and
+/// `<number> maximum` / `maximum ... <number>` as the limit — covering the
+/// known phrasings without pinning one provider's exact format.
+pub fn parse_context_overflow_sizes(message: &str) -> Option<ContextOverflowSizes> {
+    if !is_context_length_error(message) {
+        return None;
+    }
+    let lower = message.to_ascii_lowercase();
+    let tokens: Vec<(usize, u64)> = number_spans(&lower);
+    if tokens.is_empty() {
+        return None;
+    }
+    // `<n> tokens` → prompt size (first match wins; Anthropic writes
+    // "prompt is too long: <n> tokens > <m> maximum").
+    let prompt_tokens = tokens
+        .iter()
+        .find(|(end, _)| lower[*end..].trim_start().starts_with("token"))
+        .map(|(_, n)| *n)?;
+    let max_tokens = tokens
+        .iter()
+        .find(|(end, n)| *n != prompt_tokens && lower[*end..].trim_start().starts_with("maximum"))
+        .map(|(_, n)| *n);
+    Some(ContextOverflowSizes {
+        prompt_tokens,
+        max_tokens,
+    })
+}
+
+/// All decimal-number runs in `s` as `(end_byte_index, value)` pairs.
+/// Values that overflow `u64` are skipped.
+fn number_spans(s: &str) -> Vec<(usize, u64)> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if let Ok(n) = s[start..i].parse::<u64>() {
+                out.push((i, n));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Classify an HTTP API failure (status + message) for the compaction retry
 /// loop.
 ///
@@ -142,6 +213,42 @@ mod tests {
         assert!(
             classify_stream_event_error(None, "messages.X.content.Y: invalid_request_error: ...")
                 .is_deterministic()
+        );
+    }
+
+    #[test]
+    fn parse_overflow_sizes_reads_anthropic_message() {
+        // Exact production message that broke the input ladder.
+        let sizes = parse_context_overflow_sizes(
+            "API error (status 400 Bad Request): invalid_request_error: \
+             prompt is too long: 1285075 tokens > 1000000 maximum\n\n\
+             Request URL: https://api.anthropic.com/v1/messages",
+        )
+        .expect("counts must parse");
+        assert_eq!(sizes.prompt_tokens, 1_285_075);
+        assert_eq!(sizes.max_tokens, Some(1_000_000));
+    }
+
+    #[test]
+    fn parse_overflow_sizes_ignores_leading_status_number() {
+        // The "(status 400)" number must not be mistaken for a token count.
+        let sizes = parse_context_overflow_sizes("(status 400): prompt is too long: 205000 tokens")
+            .expect("counts must parse");
+        assert_eq!(sizes.prompt_tokens, 205_000);
+        assert_eq!(sizes.max_tokens, None);
+    }
+
+    #[test]
+    fn parse_overflow_sizes_none_for_countless_or_non_overflow_messages() {
+        assert_eq!(
+            parse_context_overflow_sizes("maximum context length exceeded"),
+            None,
+            "no numbers to parse"
+        );
+        assert_eq!(
+            parse_context_overflow_sizes("rate limited, retry after 30 seconds"),
+            None,
+            "not a context-length error at all"
         );
     }
 

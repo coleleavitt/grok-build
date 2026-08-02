@@ -745,6 +745,8 @@ pub async fn run(
     );
     let connect_flags = crate::acp::ConnectFlags {
         subagents: !args.no_subagents,
+        advisor_enabled: args.advisor_enabled(),
+        server_advisor: args.server_advisor,
         experimental_memory: args.experimental_memory,
         no_memory: args.no_memory,
         disable_web_search: args.disable_web_search,

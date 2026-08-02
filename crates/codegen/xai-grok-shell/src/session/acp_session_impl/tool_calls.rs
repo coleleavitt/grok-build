@@ -985,7 +985,6 @@ impl SessionActor {
                     if objects.is_empty() {
                         json!({ "raw": call.function.arguments.clone() })
                     } else {
-                        let best_match = objects[0].clone();
                         let mut selected_index = 0;
                         let mut matched_tool = false;
                         let bridge = self.agent.borrow().tool_bridge().clone();
@@ -1012,7 +1011,7 @@ impl SessionActor {
                             concatenating JSON objects."
                         );
                         concatenated_json_count = total_count;
-                        best_match
+                        objects[selected_index].clone()
                     }
                 } else {
                     tracing::warn!(

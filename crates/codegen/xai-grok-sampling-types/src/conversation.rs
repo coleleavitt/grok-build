@@ -2323,14 +2323,67 @@ fn build_responses_input(req: &ConversationRequest) -> rs::InputParam {
     let items: Vec<rs::InputItem> = req
         .items
         .iter()
-        .flat_map(conversation_item_to_input_items)
+        .enumerate()
+        .filter(|(index, item)| !is_orphaned_reasoning(&req.items, *index, item))
+        .flat_map(|(_, item)| conversation_item_to_input_items(item))
         .collect();
     rs::InputParam::Items(items)
 }
 
-/// Walk a serialized Responses API request body and inject the
-/// `type: "reasoning_text"` discriminator that the API requires on
-/// `reasoning.content[*]` items.
+/// True when `item` is a `Reasoning` sibling whose run of consecutive
+/// reasoning items is not anchored by a wire-visible model output
+/// (assistant text / tool calls, or a backend tool call).
+///
+/// The Responses API requires every replayed `reasoning` item to be followed
+/// by the output item it was generated with, and rejects the request with
+/// `Item 'rs_…' of type 'reasoning' was provided without its required
+/// following item` otherwise. History mutation (compaction budget fitting,
+/// aborted streams, trailing-tool-call truncation) can leave such orphans
+/// behind, so — like codex — we drop them at request-build time instead of
+/// letting the API 400.
+///
+/// An assistant item with no content and no tool calls emits zero wire
+/// items, so it is transparent to the scan; consecutive reasoning items
+/// (parallel `tco_*` blobs) share one anchor.
+fn is_orphaned_reasoning(
+    items: &[ConversationItem],
+    index: usize,
+    item: &ConversationItem,
+) -> bool {
+    if !matches!(item, ConversationItem::Reasoning(_)) {
+        return false;
+    }
+    for follower in &items[index + 1..] {
+        match follower {
+            // Later reasoning items in the same run share this item's fate.
+            ConversationItem::Reasoning(_) => continue,
+            ConversationItem::Assistant(a) => {
+                if a.content.is_empty() && a.tool_calls.is_empty() {
+                    // Emits no wire items — keep scanning.
+                    continue;
+                }
+                return false;
+            }
+            ConversationItem::BackendToolCall(_) => return false,
+            // A user / system / tool-result boundary means the model output
+            // this reasoning belonged to is gone.
+            _ => return true,
+        }
+    }
+    true
+}
+
+/// Walk a serialized Responses API request body and repair small
+/// async-openai / cross-provider wire mismatches on reasoning items:
+///
+/// - inject the `type: "reasoning_text"` discriminator that the API requires
+///   on `reasoning.content[*]` items;
+/// - drop invalid `reasoning.id` values (notably the empty IDs synthesized for
+///   Anthropic / legacy reasoning), because OpenAI requires IDs to contain only
+///   letters, numbers, underscores, or dashes;
+/// - drop `encrypted_content` when there is no valid Responses reasoning id.
+///   Encrypted reasoning blobs are provider-bound; OpenAI rejects Anthropic /
+///   legacy blobs with "could not be decrypted or parsed".
 ///
 /// `async-openai`'s [`rs::ReasoningTextContent`] struct does not carry a
 /// `type` field (only `text`), so its derived `Serialize` emits objects
@@ -2350,6 +2403,18 @@ pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
         if item.get("type").and_then(|t| t.as_str()) != Some("reasoning") {
             continue;
         }
+        if let Some(obj) = item.as_object_mut() {
+            let has_valid_id = obj
+                .get("id")
+                .and_then(|id| id.as_str())
+                .is_some_and(is_responses_input_id);
+            if obj.contains_key("id") && !has_valid_id {
+                obj.remove("id");
+            }
+            if !has_valid_id {
+                obj.remove("encrypted_content");
+            }
+        }
         let Some(content) = item.get_mut("content").and_then(|c| c.as_array_mut()) else {
             continue;
         };
@@ -2360,6 +2425,13 @@ pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
             }
         }
     }
+}
+
+fn is_responses_input_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Convert a ConversationItem to Responses API InputItem(s)
@@ -6172,6 +6244,159 @@ mod tests {
     }
 
     #[test]
+    fn build_responses_input_preserves_multi_turn_ordering() {
+        // 4-turn conversation where each assistant turn carries reasoning.
+        // The wire-level item order must be
+        //     [Sys, U1, R, A1, U2, R, A2, U3, R, A3, U4, R, A4, U5]
+        // and NOT the buggy
+        //     [Sys, U1, U2, U3, U4, U5, R, A1, R, A2, ...]
+        // which would shift the cache prefix every turn.
+        fn r(text: &str) -> ConversationItem {
+            ConversationItem::Reasoning(rs::ReasoningItem {
+                id: text.to_string(),
+                summary: vec![rs::SummaryPart::SummaryText(rs::SummaryTextContent {
+                    text: text.to_string(),
+                })],
+                content: None,
+                encrypted_content: Some(format!("enc_{text}")),
+                status: None,
+            })
+        }
+        let items: Vec<ConversationItem> = vec![
+            ConversationItem::system("you are helpful"),
+            ConversationItem::user("u1"),
+            r("r1"),
+            ConversationItem::assistant("a1"),
+            ConversationItem::user("u2"),
+            r("r2"),
+            ConversationItem::assistant("a2"),
+            ConversationItem::user("u3"),
+            r("r3"),
+            ConversationItem::assistant("a3"),
+            ConversationItem::user("u4"),
+            r("r4"),
+            ConversationItem::assistant("a4"),
+            ConversationItem::user("u5"),
+        ];
+
+        let req = ConversationRequest::from_items(items);
+        let input = build_responses_input(&req);
+        let rs::InputParam::Items(wire_items) = input else {
+            panic!("expected Items input");
+        };
+
+        // Walk the wire items and verify the expected pattern.
+        // Roles per wire item: System, User, Reasoning(role=Assistant),
+        // Assistant, User, Reasoning, Assistant, ...
+        let kinds: Vec<&'static str> = wire_items
+            .iter()
+            .map(|w| match w {
+                rs::InputItem::EasyMessage(m) => match m.role {
+                    rs::Role::System => "Sys",
+                    rs::Role::User => "U",
+                    rs::Role::Assistant => "A",
+                    _ => "other",
+                },
+                rs::InputItem::Item(rs::Item::Reasoning(_)) => "R",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "Sys", "U", "R", "A", "U", "R", "A", "U", "R", "A", "U", "R", "A", "U",
+            ],
+            "multi-turn ordering must preserve interleaved Reasoning ↔ Assistant per turn"
+        );
+    }
+
+    /// Reasoning items with no following model output are rejected by the
+    /// Responses API ("Item 'rs_…' of type 'reasoning' was provided without
+    /// its required following item"). History mutation (aborted streams,
+    /// compaction budget fitting) can orphan them; the input builder must
+    /// drop those instead of letting the API 400 — mirroring codex, which
+    /// only ever replays reasoning immediately ahead of its own output item.
+    #[test]
+    fn build_responses_input_drops_orphaned_reasoning() {
+        fn r(id: &str) -> ConversationItem {
+            ConversationItem::Reasoning(rs::ReasoningItem {
+                id: id.to_string(),
+                summary: vec![rs::SummaryPart::SummaryText(rs::SummaryTextContent {
+                    text: format!("thinking {id}"),
+                })],
+                content: None,
+                encrypted_content: Some(format!("enc_{id}")),
+                status: None,
+            })
+        }
+        fn wire_kinds(req: &ConversationRequest) -> Vec<String> {
+            let rs::InputParam::Items(wire_items) = build_responses_input(req) else {
+                panic!("expected Items input");
+            };
+            wire_items
+                .iter()
+                .map(|w| match w {
+                    rs::InputItem::EasyMessage(m) => format!("{:?}", m.role),
+                    rs::InputItem::Item(rs::Item::Reasoning(item)) => {
+                        format!("R:{}", item.id)
+                    }
+                    rs::InputItem::Item(_) => "Item".to_string(),
+                    _ => "other".to_string(),
+                })
+                .collect()
+        }
+
+        // Trailing orphan (aborted stream): dropped.
+        let req =
+            ConversationRequest::from_items(vec![ConversationItem::user("hi"), r("rs_trailing")]);
+        assert_eq!(wire_kinds(&req), vec!["User"]);
+
+        // Orphan followed by a user boundary (assistant was dropped by
+        // history mutation): dropped; anchored reasoning stays.
+        let req = ConversationRequest::from_items(vec![
+            ConversationItem::user("u1"),
+            r("rs_orphan"),
+            ConversationItem::user("u2"),
+            r("rs_anchored"),
+            ConversationItem::assistant("answer"),
+        ]);
+        assert_eq!(
+            wire_kinds(&req),
+            vec!["User", "User", "R:rs_anchored", "Assistant"],
+        );
+
+        // A run of consecutive reasoning items shares one anchor, and an
+        // empty assistant (zero wire items) is transparent to the scan.
+        let empty_assistant = ConversationItem::Assistant(AssistantItem {
+            content: "".into(),
+            tool_calls: vec![],
+            model_id: None,
+            model_fingerprint: None,
+            reasoning_effort: None,
+        });
+        let req = ConversationRequest::from_items(vec![
+            ConversationItem::user("u1"),
+            r("tco_1"),
+            r("tco_2"),
+            empty_assistant.clone(),
+            ConversationItem::assistant("anchored run"),
+        ]);
+        assert_eq!(
+            wire_kinds(&req),
+            vec!["User", "R:tco_1", "R:tco_2", "Assistant"],
+        );
+
+        // Same run with the anchor gone entirely: the whole run is dropped.
+        let req = ConversationRequest::from_items(vec![
+            ConversationItem::user("u1"),
+            r("tco_1"),
+            r("tco_2"),
+            empty_assistant,
+        ]);
+        assert_eq!(wire_kinds(&req), vec!["User"]);
+    }
+
+    #[test]
     fn conversation_to_chat_messages_folds_reasoning_into_following_assistant() {
         let items = vec![
             ConversationItem::user("hi"),
@@ -6490,6 +6715,422 @@ mod tests {
         });
         let mut seen = std::collections::HashSet::new();
         assert!(upgrade_legacy_reasoning(&raw, &mut seen).is_empty());
+    }
+
+    #[test]
+    fn upgrade_then_fold_through_conversation_to_chat_messages() {
+        // End-to-end: lift legacy `reasoning` to a sibling, then run the
+        // chat-completions wire path. Reasoning must land on the next
+        // assistant's `reasoning_content`. This mirrors what the real
+        // load-then-replay flow does for a legacy session.
+        let raw = serde_json::json!({
+            "type": "assistant",
+            "content": "the answer",
+            "reasoning": {"text": "step-by-step", "id": "rs_x"}
+        });
+        let mut seen = std::collections::HashSet::new();
+        let mut siblings = upgrade_legacy_reasoning(&raw, &mut seen);
+        // Append the assistant (post-strip) by re-deserializing the same
+        // raw value as the new AssistantItem (which silently ignores
+        // `reasoning`).
+        let assistant: ConversationItem = serde_json::from_value(raw).unwrap();
+        siblings.push(assistant);
+
+        let msgs = conversation_to_chat_messages(siblings);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, Role::Assistant);
+        assert_eq!(
+            msgs[0].reasoning_content.as_deref(),
+            Some("step-by-step"),
+            "reconstructed sibling folded onto assistant.reasoning_content"
+        );
+    }
+
+    #[test]
+    fn patch_reasoning_text_types_injects_type_discriminator() {
+        // Build a request body containing a reasoning item whose nested
+        // `content[]` entries lack the `type` field (the async-openai gap).
+        let mut body = serde_json::json!({
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "r1",
+                    "content": [
+                        { "text": "thinking..." },
+                        { "text": "more thinking" }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "hi"
+                }
+            ]
+        });
+        patch_reasoning_text_types(&mut body);
+        let reasoning_content = body
+            .pointer("/input/0/content")
+            .and_then(|v| v.as_array())
+            .expect("reasoning content array");
+        for item in reasoning_content {
+            assert_eq!(
+                item.get("type").and_then(|t| t.as_str()),
+                Some("reasoning_text"),
+                "every nested content item must carry the discriminator"
+            );
+        }
+        // Untouched: the user message stays as-is.
+        assert_eq!(
+            body.pointer("/input/1/content").and_then(|v| v.as_str()),
+            Some("hi")
+        );
+    }
+
+    /// Forward-compat guard for the async-openai gap fix.
+    ///
+    /// `patch_reasoning_text_types` uses `Entry::or_insert_with`, so when
+    /// upstream `ReasoningTextContent` eventually grows its own `type`
+    /// field (and serde starts emitting it), the walker must be a strict
+    /// NO-OP on items that already carry `type` — never clobbering,
+    /// overwriting, or duplicating it. That is what makes the patch safe
+    /// to keep until upstream lands the fix (at which point it can simply
+    /// be deleted). This test pins the conditional-insert semantics so a
+    /// future refactor to an unconditional `insert` (which *would* break
+    /// us by overwriting upstream's value) fails loudly here.
+    #[test]
+    fn patch_reasoning_text_types_preserves_existing_type() {
+        let mut body = serde_json::json!({
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "r1",
+                    "content": [
+                        // Post-upstream-fix shape: discriminator already present.
+                        { "type": "reasoning_text", "text": "already tagged" },
+                        // A hypothetical different discriminator must NOT be clobbered.
+                        { "type": "some_future_variant", "text": "future shape" },
+                        // Current gap: missing type → gets filled in.
+                        { "text": "needs tag" }
+                    ]
+                }
+            ]
+        });
+        patch_reasoning_text_types(&mut body);
+        let content = body
+            .pointer("/input/0/content")
+            .and_then(|v| v.as_array())
+            .expect("reasoning content array");
+
+        // Existing discriminators preserved verbatim (no clobber).
+        assert_eq!(
+            content[0].get("type").and_then(|t| t.as_str()),
+            Some("reasoning_text"),
+        );
+        assert_eq!(
+            content[1].get("type").and_then(|t| t.as_str()),
+            Some("some_future_variant"),
+            "a non-default upstream discriminator must be left untouched",
+        );
+        // Only the type-less item is filled in.
+        assert_eq!(
+            content[2].get("type").and_then(|t| t.as_str()),
+            Some("reasoning_text"),
+        );
+
+        // Object integrity: each item has exactly one `type` and its `text`.
+        for item in content {
+            let obj = item.as_object().expect("content item is an object");
+            assert!(obj.contains_key("type") && obj.contains_key("text"));
+        }
+    }
+
+    #[test]
+    fn patch_reasoning_text_types_removes_invalid_reasoning_ids() {
+        let mut body = serde_json::json!({
+            "input": [
+                { "type": "reasoning", "id": "", "encrypted_content": "CAISbad", "summary": [] },
+                { "type": "reasoning", "id": "bad:id", "encrypted_content": "CAISbad", "summary": [] },
+                { "type": "reasoning", "id": "rs_valid-123", "encrypted_content": "encrypted-ok", "summary": [] },
+                { "type": "message", "role": "user", "content": "hi" }
+            ]
+        });
+
+        patch_reasoning_text_types(&mut body);
+
+        assert!(
+            body.pointer("/input/0/id").is_none(),
+            "empty synthesized reasoning id must be omitted for Responses API"
+        );
+        assert!(
+            body.pointer("/input/0/encrypted_content").is_none(),
+            "provider-bound encrypted content without a valid Responses id must be omitted"
+        );
+        assert!(
+            body.pointer("/input/1/id").is_none(),
+            "invalid reasoning id must be omitted for Responses API"
+        );
+        assert!(
+            body.pointer("/input/1/encrypted_content").is_none(),
+            "provider-bound encrypted content with an invalid id must be omitted"
+        );
+        assert_eq!(
+            body.pointer("/input/2/id").and_then(|v| v.as_str()),
+            Some("rs_valid-123"),
+            "valid upstream Responses ids must survive"
+        );
+        assert_eq!(
+            body.pointer("/input/2/encrypted_content")
+                .and_then(|v| v.as_str()),
+            Some("encrypted-ok"),
+            "valid upstream Responses encrypted content must survive"
+        );
+    }
+
+    #[test]
+    fn synthesized_reasoning_with_empty_id_serializes_without_id_after_patch() {
+        let req = ConversationRequest::from_items(vec![
+            ConversationItem::user("u1"),
+            ConversationItem::Reasoning(synthesized_reasoning_item("thinking from old provider")),
+            ConversationItem::assistant("a1"),
+            ConversationItem::user("u2"),
+        ]);
+
+        let input = input_items_json(&req);
+        let reasoning = input
+            .iter()
+            .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("reasoning"))
+            .expect("reasoning item");
+
+        assert!(
+            reasoning.get("id").is_none(),
+            "empty synthesized id must not be sent to OpenAI Responses"
+        );
+    }
+
+    // ========================================================================
+    // KV Cache Invariant Tests (adapted to sibling-Reasoning)
+    //
+    // These tests enforce prefix stability and correct turn ordering for the
+    // Responses API input construction. Prompt caching (server-side prefix
+    // match) requires that request N's serialised input is a strict prefix
+    // of request N+1's. Any re-ordering of items -- especially reasoning
+    // items -- destroys the prefix and tanks the cache hit rate.
+    //
+    // The invariant asserted is `&input2[..input1.len()] == input1` for
+    // every pair of consecutive turns.
+    //
+    // In the sibling-Reasoning refactor, reasoning rides as
+    // `ConversationItem::Reasoning(rs::ReasoningItem)` siblings in the flat
+    // ordered `items` list. The serialized wire shape is produced by the
+    // `From<&ConversationRequest> for rs::CreateResponse` impl with no
+    // placeholder/splice dance. The old `__RAW_OUTPUT_PLACEHOLDER_`
+    // / `extract_raw_input_items` / `splice_raw_input_items` tests are
+    // structurally obsolete and are not ported; the invariants they pinned
+    // are preserved here in a backend-shape-agnostic form.
+    // ========================================================================
+
+    /// Helper: build a sibling Reasoning item with the given id, summary
+    /// text, and optional encrypted_content. This replaces the old
+    /// `assistant_with_raw_output()` helper.
+    fn reasoning_sibling(
+        id: &str,
+        summary_text: &str,
+        encrypted: Option<&str>,
+    ) -> ConversationItem {
+        ConversationItem::Reasoning(rs::ReasoningItem {
+            id: id.to_string(),
+            summary: vec![rs::SummaryPart::SummaryText(rs::SummaryTextContent {
+                text: summary_text.to_string(),
+            })],
+            content: None,
+            encrypted_content: encrypted.map(str::to_owned),
+            status: None,
+        })
+    }
+
+    /// Helper: serialise the wire `input` array to a Vec of JSON values.
+    fn input_items_json(req: &ConversationRequest) -> Vec<serde_json::Value> {
+        let cr: rs::CreateResponse = req.into();
+        let mut body = serde_json::to_value(&cr).unwrap();
+        patch_reasoning_text_types(&mut body);
+        body["input"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// Helper: one-line "kind:identifier" summary for readable assertions.
+    fn summarise_input(items: &[serde_json::Value]) -> Vec<String> {
+        items
+            .iter()
+            .map(|v| {
+                let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                if let Some(role) = v.get("role").and_then(|r| r.as_str()) {
+                    let text = v
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("<non-text>");
+                    format!("{role}:{text}")
+                } else if ty == "reasoning" {
+                    let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("?");
+                    format!("reasoning:{id}")
+                } else if ty == "function_call" {
+                    let cid = v.get("call_id").and_then(|c| c.as_str()).unwrap_or("?");
+                    format!("function_call:{cid}")
+                } else {
+                    format!("type:{ty}")
+                }
+            })
+            .collect()
+    }
+
+    /// Assert that base request's serialized input is a byte-stable prefix
+    /// of the extended request's.
+    fn assert_prefix_stable(base: &ConversationRequest, extended: &ConversationRequest) {
+        let base_input = input_items_json(base);
+        let ext_input = input_items_json(extended);
+        assert!(
+            ext_input.len() >= base_input.len(),
+            "extended request has fewer input items ({}) than base ({})",
+            ext_input.len(),
+            base_input.len(),
+        );
+        assert_eq!(
+            &ext_input[..base_input.len()],
+            base_input.as_slice(),
+            "serialized input of request N must be a prefix of request N+1.\n\
+             Base ({} items): {:?}\nExtended ({} items): {:?}\n\
+             First divergence at index {}",
+            base_input.len(),
+            summarise_input(&base_input),
+            ext_input.len(),
+            summarise_input(&ext_input),
+            base_input
+                .iter()
+                .zip(ext_input.iter())
+                .position(|(a, b)| a != b)
+                .unwrap_or(base_input.len()),
+        );
+    }
+
+    /// Cache-prefix invariant: with a single Reasoning sibling before an
+    /// Assistant, the wire input must have exactly one typed reasoning
+    /// item at that position -- not a placeholder, not a duplicate, and
+    /// not flattened into the assistant message.
+    #[test]
+    fn build_responses_input_single_reasoning_sibling_lands_inline() {
+        let req = ConversationRequest::from_items(vec![
+            ConversationItem::system("sys"),
+            ConversationItem::user("u1"),
+            reasoning_sibling("r_abc", "thinking", Some("enc1")),
+            ConversationItem::assistant("hi"),
+        ]);
+
+        let input = input_items_json(&req);
+        let summary = summarise_input(&input);
+
+        // Expected: [system, user, reasoning, assistant]
+        assert_eq!(summary.len(), 4, "got: {summary:?}");
+        assert_eq!(summary[0], "system:sys");
+        assert_eq!(summary[1], "user:u1");
+        assert_eq!(summary[2], "reasoning:r_abc");
+        assert_eq!(summary[3], "assistant:hi");
+
+        // No placeholder strings must appear (post-refactor invariant).
+        let body_str = serde_json::to_string(&input).unwrap();
+        assert!(
+            !body_str.contains("__RAW_OUTPUT_PLACEHOLDER_"),
+            "no placeholder strings post-refactor"
+        );
+
+        // The reasoning item must carry encrypted_content verbatim.
+        assert_eq!(
+            input[2].get("encrypted_content").and_then(|v| v.as_str()),
+            Some("enc1"),
+        );
+    }
+
+    /// Cache-prefix regression: with MULTIPLE turns each carrying a Reasoning
+    /// sibling, each reasoning must appear at its own interleaved
+    /// position -- NOT all bunched at the end. This is the exact bug
+    /// class caused by the earlier placeholder design,
+    /// now structurally impossible because reasoning lives in the
+    /// `Vec<ConversationItem>` directly.
+    #[test]
+    fn build_responses_input_multi_turn_reasoning_ordering() {
+        let req = ConversationRequest::from_items(vec![
+            ConversationItem::system("sys"),
+            ConversationItem::user("u1"),
+            reasoning_sibling("r1", "think 1", Some("enc1")),
+            ConversationItem::assistant("a1"),
+            ConversationItem::tool_result("tc1", "result1"),
+            ConversationItem::user("u2"),
+            reasoning_sibling("r2", "think 2", Some("enc2")),
+            ConversationItem::assistant("a2"),
+            ConversationItem::tool_result("tc2", "result2"),
+            ConversationItem::user("u3"),
+            reasoning_sibling("r3", "think 3", Some("enc3")),
+            ConversationItem::assistant("a3"),
+        ]);
+
+        let input = input_items_json(&req);
+        let summary = summarise_input(&input);
+
+        // INVARIANT 1: There must be exactly N reasoning items for N
+        // siblings. The pre-refactor bug produced only 1.
+        let reasoning_count = summary
+            .iter()
+            .filter(|s| s.starts_with("reasoning:"))
+            .count();
+        assert_eq!(
+            reasoning_count, 3,
+            "must have 3 reasoning items, got {reasoning_count}. Items: {summary:?}"
+        );
+
+        // INVARIANT 2: Each reasoning must be BETWEEN its corresponding
+        // user message and the NEXT user message. Without this check,
+        // all reasoning items bunched at the end would still pass count.
+        let user_positions: Vec<usize> = summary
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.starts_with("user:"))
+            .map(|(i, _)| i)
+            .collect();
+        let reasoning_positions: Vec<usize> = summary
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.starts_with("reasoning:"))
+            .map(|(i, _)| i)
+            .collect();
+
+        assert_eq!(user_positions.len(), 3);
+        assert_eq!(reasoning_positions.len(), 3);
+
+        for (i, rp) in reasoning_positions.iter().enumerate() {
+            assert!(
+                *rp > user_positions[i],
+                "reasoning {i} at position {rp} must be after user {i} at position {}. \
+                 Items: {summary:?}",
+                user_positions[i]
+            );
+            if i + 1 < user_positions.len() {
+                assert!(
+                    *rp < user_positions[i + 1],
+                    "reasoning {i} at position {rp} must be before user {} at position {}. \
+                     Items: {summary:?}",
+                    i + 1,
+                    user_positions[i + 1]
+                );
+            }
+        }
+
+        // INVARIANT 3: encrypted_content per item is preserved 1:1.
+        let mut enc_seen: Vec<&str> = Vec::new();
+        for v in &input {
+            if v.get("type").and_then(|t| t.as_str()) == Some("reasoning")
+                && let Some(enc) = v.get("encrypted_content").and_then(|s| s.as_str())
+            {
+                enc_seen.push(enc);
+            }
+        }
+        assert_eq!(enc_seen, vec!["enc1", "enc2", "enc3"]);
     }
 
     /// INVARIANT: prefix stability across turns without reasoning.

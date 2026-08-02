@@ -33,15 +33,31 @@ pub(crate) enum SamplerFailureRecovery {
     /// Compaction ran. The turn loop should rebuild the request from
     /// the compacted conversation and resubmit.
     CompactAndResubmit,
-    /// Auth 401 recovery succeeded; the turn loop should resubmit with the
-    /// fresh token. `credential` is the wire provenance of the rejected
-    /// request: a 401 for a request that carried no credential at all (a
-    /// fail-closed send) must not be charged against the per-incident
-    /// auth-retry budget.
-    RefreshAuthAndResubmit {
-        credential: xai_grok_sampling_types::SentCredential,
-        store: RecoveredStore,
-    },
+    /// Auth/account recovery succeeded. The turn loop should resubmit once
+    /// with the fresh token or rotated provider account.
+    RefreshAuthAndResubmit(SamplerResubmitReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SamplerResubmitReason {
+    pub(crate) status_code: Option<u16>,
+    pub(crate) retry_reason: &'static str,
+}
+
+impl SamplerResubmitReason {
+    pub(crate) fn auth_recovered(status_code: Option<u16>) -> Self {
+        Self {
+            status_code,
+            retry_reason: "Credentials refreshed; retrying request",
+        }
+    }
+
+    pub(crate) fn anthropic_account_rotated(status_code: Option<u16>) -> Self {
+        Self {
+            status_code,
+            retry_reason: "Anthropic account rate-limited; rotated account and retrying request",
+        }
+    }
 }
 
 /// Outcome of a single turn attempt via the sampler-based path.
@@ -55,12 +71,8 @@ pub(crate) enum SamplerTurnOutcome {
         Box<xai_grok_sampler::InferenceLatencyStats>,
     ),
     CompactAndResubmit,
-    /// Auth recovery succeeded; the outer loop should retry. Mirrors
-    /// [`SamplerFailureRecovery::RefreshAuthAndResubmit`].
-    RefreshAuthAndResubmit {
-        credential: xai_grok_sampling_types::SentCredential,
-        store: RecoveredStore,
-    },
+    /// Auth/account recovery succeeded; the outer loop should retry once.
+    RefreshAuthAndResubmit(SamplerResubmitReason),
 }
 
 /// Outcome of `process_conversation_turn`, distinguishing normal completion from cancellation.

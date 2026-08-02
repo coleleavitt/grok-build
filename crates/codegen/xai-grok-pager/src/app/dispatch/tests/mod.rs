@@ -130,6 +130,8 @@ fn test_app() -> AppView {
         #[cfg(feature = "local-workspace")]
         welcome_history_load_as_build: false,
         subagents: false,
+        advisor_enabled: None,
+        server_advisor: false,
         ask_user: false,
         mouse_captured: true,
         new_worktree_dialog: None,

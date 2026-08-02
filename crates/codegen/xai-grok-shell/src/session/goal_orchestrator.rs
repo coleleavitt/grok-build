@@ -40,6 +40,12 @@ impl GoalNotifySender {
         finished_subagent_tokens: i64,
     ) {
         tracker.account_elapsed();
+        // Every goal state transition funnels through here, so this is the
+        // durable-write chokepoint: without it the pager still replays the
+        // goal from the updates JSONL after a restart, but the shell-side
+        // `GoalTracker` restores empty and `/goal resume` answers
+        // "No goal set" while the dashboard shows a paused goal.
+        self.persist_goal_state(tracker);
         let Some(o) = tracker.snapshot() else { return };
         let _ = self
             .persistence_tx
@@ -72,11 +78,27 @@ impl GoalNotifySender {
         finished_subagent_tokens: i64,
     ) {
         tracker.account_elapsed();
+        // Ticks skip the JSONL update append (unbounded growth) but still
+        // refresh the single-file durable state so elapsed/token accounting
+        // survives a restart — this is the `GoalModeState` write the
+        // ephemeral contract in the doc comment above relies on.
+        self.persist_goal_state(tracker);
         let Some(o) = tracker.snapshot() else { return };
         self.dispatch_update(
             build_goal_updated(o, tokens_used, finished_subagent_tokens),
             false,
         );
+    }
+
+    /// Durably persist the tracker's orchestration (single-file
+    /// `goal_mode_state.json` via the persistence actor). A `None` snapshot
+    /// clears the persisted state so a cleared goal does not resurrect on
+    /// session resume. This is what `GoalTracker::from_snapshot` restores
+    /// from when the session is loaded again.
+    pub(crate) fn persist_goal_state(&self, tracker: &GoalTracker) {
+        let _ = self
+            .persistence_tx
+            .send(PersistenceMsg::GoalModeState(tracker.snapshot().cloned()));
     }
 
     /// Persist + fire-and-forget a notification to the gateway. Used for
@@ -284,6 +306,106 @@ pub(crate) fn format_elapsed(ms: u64) -> String {
 mod tests {
     use super::*;
     use crate::session::goal_tracker::make_base_orchestration;
+
+    fn test_sender() -> (
+        GoalNotifySender,
+        tokio::sync::mpsc::UnboundedReceiver<PersistenceMsg>,
+    ) {
+        let (gateway_tx, gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+        // The sender only enqueues; no receiver loop is needed. Leak the
+        // gateway rx so fire-and-forget sends do not log dropped-receiver.
+        std::mem::forget(gateway_rx);
+        let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender = GoalNotifySender::new(
+            agent_client_protocol::SessionId::new("goal-persist-test"),
+            xai_acp_lib::AcpAgentGatewaySender::new(gateway_tx),
+            persistence_tx,
+        );
+        (sender, persistence_rx)
+    }
+
+    fn tracker_with_goal(dir: &std::path::Path) -> GoalTracker {
+        let mut tracker = GoalTracker::new(dir.to_path_buf());
+        tracker.create_goal("g1".into(), "ship it".into(), None, 0, "now".into(), None);
+        tracker
+    }
+
+    fn drain(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<PersistenceMsg>,
+    ) -> (Vec<Option<GoalOrchestration>>, usize) {
+        let mut states = Vec::new();
+        let mut updates = 0usize;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                PersistenceMsg::GoalModeState(state) => states.push(state),
+                PersistenceMsg::Update(_) => updates += 1,
+                _ => {}
+            }
+        }
+        (states, updates)
+    }
+
+    /// Regression: goal state transitions emitted `GoalUpdated` to the pager
+    /// but never sent `PersistenceMsg::GoalModeState`, so after closing and
+    /// resuming a session the pager replayed a paused goal from the updates
+    /// JSONL while the shell's `GoalTracker` restored empty — `/goal resume`
+    /// answered "No goal set" against a dashboard showing Paused (error).
+    /// Every snapshot-derived emit must now persist the durable state.
+    #[test]
+    fn emit_goal_updated_persists_goal_mode_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sender, mut rx) = test_sender();
+        let mut tracker = tracker_with_goal(dir.path());
+
+        sender.emit_goal_updated(&mut tracker, 100, 0);
+
+        let (states, updates) = drain(&mut rx);
+        assert_eq!(
+            updates, 1,
+            "state transition still appends the JSONL update"
+        );
+        assert_eq!(states.len(), 1);
+        let state = states[0].as_ref().expect("active goal persists Some");
+        assert_eq!(state.goal_id, "g1");
+        assert_eq!(state.objective, "ship it");
+    }
+
+    /// Ephemeral ticks skip the JSONL update append but still refresh the
+    /// single-file durable state (elapsed/token accounting must survive a
+    /// restart).
+    #[test]
+    fn emit_goal_updated_ephemeral_persists_state_without_update_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sender, mut rx) = test_sender();
+        let mut tracker = tracker_with_goal(dir.path());
+
+        sender.emit_goal_updated_ephemeral(&mut tracker, 100, 0);
+
+        let (states, updates) = drain(&mut rx);
+        assert_eq!(updates, 0, "ephemeral ticks must not grow the updates log");
+        assert_eq!(states.len(), 1);
+        assert!(states[0].is_some());
+    }
+
+    /// A tracker without orchestration (post-`/goal clear`) persists `None`
+    /// so the on-disk state is removed and the goal cannot resurrect on
+    /// session resume.
+    #[test]
+    fn persist_goal_state_clears_when_no_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sender, mut rx) = test_sender();
+        let mut tracker = tracker_with_goal(dir.path());
+        tracker.clear();
+
+        sender.persist_goal_state(&tracker);
+
+        let (states, _updates) = drain(&mut rx);
+        assert!(
+            matches!(states.as_slice(), [None]),
+            "cleared tracker must persist None, got {} state(s)",
+            states.len()
+        );
+    }
 
     #[test]
     fn format_elapsed_seconds() {

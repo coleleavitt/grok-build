@@ -2218,150 +2218,33 @@ impl SessionActor {
                     auth_retry_schedule.reset_on_success();
                     continue;
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit => {
-                    if let Some((attempt, delay)) = auth_retry_schedule.next_delay() {
-                        let delay_ms = delay.as_millis() as u64;
-                        tracing::warn!(
+                SamplerTurnOutcome::RefreshAuthAndResubmit(reason) => {
+                    let (attempt, delay) = auth_retry_schedule.next_delay();
+                    let delay_ms = delay.as_millis() as u64;
+                    tracing::warn!(
+                        attempt,
+                        delay_ms,
+                        "auth recovery retry: backing off before resubmit"
+                    );
+                    xai_grok_telemetry::unified_log::warn(
+                        "shell.turn.auth_retry_backoff",
+                        Some(self.session_info.id.0.as_ref()),
+                        Some(serde_json::json!(
+                            { "loop_index" : loop_index, "attempt" : attempt,
+                            "max_retries" : null, "unbounded" : true, "delay_ms" :
+                            delay_ms, "status_code" : reason.status_code, }
+                        )),
+                    );
+                    self.send_xai_notification(XaiSessionUpdate::RetryState(
+                        crate::extensions::notification::RetryState::Retrying {
                             attempt,
-                            delay_ms,
-                            "auth recovery retry: backing off before resubmit"
-                        );
-                        xai_grok_telemetry::unified_log::warn(
-                            "shell.turn.auth_retry_backoff",
-                            Some(self.session_info.id.0.as_ref()),
-                            Some(serde_json::json!({ "loop_index": loop_index })),
-                        );
-                        self.send_xai_notification(XaiSessionUpdate::RetryState(
-                            crate::extensions::notification::RetryState::Retrying {
-                                attempt,
-                                max_retries: AuthRetrySchedule::MAX_RETRIES,
-                                reason: "Credentials refreshed or rotated; retrying request"
-                                    .to_string(),
-                            },
-                        ))
-                        .await;
-                        sleep(delay).await;
-                        continue;
-                    }
-                    match auth_retry_schedule.on_recovered_401(credential) {
-                        AuthRetryDecision::UnchargedResubmit { resubmit } => {
-                            tracing::warn!(
-                                resubmit,
-                                "auth 401 retry: no credential was sent; resubmitting uncharged"
-                            );
-                            xai_grok_telemetry::unified_log::warn(
-                                "shell.turn.auth_resubmit_uncharged",
-                                Some(self.session_info.id.0.as_ref()),
-                                Some(serde_json::json!({
-                                    "loop_index": loop_index,
-                                    "resubmit": resubmit,
-                                    "max_resubmits": AuthRetrySchedule::MAX_UNCHARGED_RESUBMITS,
-                                })),
-                            );
-                            self.send_xai_notification(XaiSessionUpdate::RetryState(
-                                crate::extensions::notification::RetryState::Retrying {
-                                    attempt: resubmit,
-                                    max_retries: AuthRetrySchedule::MAX_UNCHARGED_RESUBMITS,
-                                    reason: "Re-authenticated after 401 (request carried no \
-                                             credential); retrying request"
-                                        .to_string(),
-                                },
-                            ))
-                            .await;
-                            pace_uncharged_resubmit(store, self.auth_manager.as_ref()).await;
-                            continue;
-                        }
-                        AuthRetryDecision::Backoff { attempt, delay } => {
-                            let delay_ms = delay.as_millis() as u64;
-                            tracing::warn!(
-                                attempt,
-                                delay_ms,
-                                "auth 401 retry: backing off before resubmit"
-                            );
-                            xai_grok_telemetry::unified_log::warn(
-                                "shell.turn.auth_retry_backoff",
-                                Some(self.session_info.id.0.as_ref()),
-                                Some(serde_json::json!({
-                                    "loop_index": loop_index,
-                                    "attempt": attempt,
-                                    "max_retries": AuthRetrySchedule::MAX_RETRIES,
-                                    "delay_ms": delay_ms,
-                                })),
-                            );
-                            self.send_xai_notification(XaiSessionUpdate::RetryState(
-                                crate::extensions::notification::RetryState::Retrying {
-                                    attempt,
-                                    max_retries: AuthRetrySchedule::MAX_RETRIES,
-                                    reason: "Re-authenticated after 401; retrying request"
-                                        .to_string(),
-                                },
-                            ))
-                            .await;
-                            sleep(delay).await;
-                            continue;
-                        }
-                        decision @ (AuthRetryDecision::Exhausted
-                        | AuthRetryDecision::RunawayGuard { .. }) => {
-                            let (awake, wall, suspended) = conv_turn_clock.elapsed_split();
-                            let duration_note = if suspended >= std::time::Duration::from_secs(1) {
-                                format!(
-                                    " Turn ran {} wall-clock, {} of it suspended.",
-                                    human_duration(wall),
-                                    human_duration(suspended)
-                                )
-                            } else {
-                                format!(" Turn ran {} wall-clock.", human_duration(wall))
-                            };
-                            let (rejections, authenticated) = auth_retry_schedule.incident_counts();
-                            let uncharged = auth_retry_schedule.uncharged_rejections();
-                            let msg = match decision {
-                                AuthRetryDecision::RunawayGuard { rejections } => {
-                                    format!(
-                                        "Auth recovery kept succeeding but {rejections} requests \
-                                     were rejected (401) before a credential could be sent, \
-                                     with no successful response in between; stopping as a \
-                                     runaway guard.{duration_note}"
-                                    )
-                                }
-                                _ if authenticated == rejections => {
-                                    format!(
-                                        "Auth recovery succeeded but {rejections} authenticated \
-                                     inference requests were still rejected (401); giving up \
-                                     after {} retries.{duration_note}",
-                                        AuthRetrySchedule::MAX_RETRIES
-                                    )
-                                }
-                                _ => {
-                                    format!(
-                                        "Auth retry budget exhausted after {rejections} \
-                                     post-recovery 401s ({authenticated} provably carried a \
-                                     credential).{duration_note}"
-                                    )
-                                }
-                            };
-                            tracing::error!(msg);
-                            xai_grok_telemetry::unified_log::error(
-                                "shell.turn.auth_retry_exhausted",
-                                Some(self.session_info.id.0.as_ref()),
-                                Some(serde_json::json!({
-                                    "loop_index": loop_index,
-                                    "decision": match decision {
-                                        AuthRetryDecision::RunawayGuard { .. } => "runaway_guard",
-                                        _ => "exhausted",
-                                    },
-                                    "rejections": rejections,
-                                    "authenticated": authenticated,
-                                    "uncharged": uncharged,
-                                    "wall_secs": wall.as_secs(),
-                                    "awake_secs": awake.as_secs(),
-                                    "suspended_secs": suspended.as_secs(),
-                                })),
-                            );
-                            return Err(acp::Error::internal_error().data(
-                                crate::sampling::error::error_data_with_status(msg, Some(401)),
-                            ));
-                        }
-                    }
+                            max_retries: AuthRetrySchedule::UNBOUNDED_RETRY_SENTINEL,
+                            reason: reason.retry_reason.to_string(),
+                        },
+                    ))
+                    .await;
+                    sleep(delay).await;
+                    continue;
                 }
             };
             auth_retry_schedule.reset_on_success();
@@ -2745,6 +2628,90 @@ impl SessionActor {
                 continue;
             }
         }
+    }
+}
+/// Backoff schedule for resubmits after a *successful* 401 auth recovery
+/// (fresh token minted, request to be re-sent).
+///
+/// Two hard-won invariants, both regressions from the silent-hang incident
+/// where a turn froze 16m40s and then 11.6 days (user-cancelled at 27min):
+///
+/// - **Delays must be 1s/2s/4s.** `tokio_retry::ExponentialBackoff::
+///   from_millis(base)` raises `base` to the attempt number, so the base must
+///   stay small: `from_millis(1000)` yields 1000ⁿ ms = 1s → 16m40s → 11.57
+///   days. `from_millis(2).factor(500)` yields 2ⁿ × 500ms = 1s, 2s, 4s.
+/// - **The schedule is per-incident, not per-turn.** A long turn can span
+///   several hourly gateway token rotations; each rotation is an independent
+///   401→refresh→retry event. Without `reset()` after a successful response,
+///   a later independent rotation would inherit the previous incident's
+///   attempt number and delay.
+struct AuthRetrySchedule {
+    delays: ExponentialBackoff,
+    attempt: u32,
+}
+impl AuthRetrySchedule {
+    /// Legacy ACP field is a `u32`; use max-value to mean "unbounded".
+    const UNBOUNDED_RETRY_SENTINEL: u32 = u32::MAX;
+    fn new() -> Self {
+        Self {
+            delays: ExponentialBackoff::from_millis(2)
+                .factor(500)
+                .max_delay(std::time::Duration::from_secs(10)),
+            attempt: 0,
+        }
+    }
+    /// Next `(attempt_number, delay)` (1-indexed). Never exhausts; user
+    /// cancellation is the stop condition.
+    fn next_delay(&mut self) -> (u32, std::time::Duration) {
+        let delay = self
+            .delays
+            .next()
+            .unwrap_or_else(|| std::time::Duration::from_secs(10));
+        self.attempt = self.attempt.saturating_add(1);
+        (self.attempt, delay)
+    }
+    /// A successful model response closes the incident: restart the schedule
+    /// so the next token rotation starts back at the shortest delay.
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+#[cfg(test)]
+mod auth_retry_schedule_tests {
+    use super::AuthRetrySchedule;
+    use std::time::Duration;
+    /// Pins the exact schedule. Guards against the `from_millis(1000)`
+    /// footgun (baseⁿ semantics): that spelling produced sleeps of 1s,
+    /// 16m40s, and 11.57 days, observed in the field as a silent
+    /// ~27-minute hang in `waiting_model` that the user had to cancel.
+    #[test]
+    fn schedule_is_one_two_four_then_caps_without_exhaustion() {
+        let mut schedule = AuthRetrySchedule::new();
+        let steps: Vec<_> = (0..8).map(|_| schedule.next_delay()).collect();
+        assert_eq!(
+            steps,
+            vec![
+                (1, Duration::from_secs(1)),
+                (2, Duration::from_secs(2)),
+                (3, Duration::from_secs(4)),
+                (4, Duration::from_secs(8)),
+                (5, Duration::from_secs(10)),
+                (6, Duration::from_secs(10)),
+                (7, Duration::from_secs(10)),
+                (8, Duration::from_secs(10)),
+            ],
+        );
+    }
+    /// Each successful response must restart the schedule: hourly token
+    /// rotations within one long turn are independent incidents, so they
+    /// must not escalate toward exhaustion (turn failure).
+    #[test]
+    fn reset_restarts_delays_and_attempt_numbering() {
+        let mut schedule = AuthRetrySchedule::new();
+        schedule.next_delay();
+        schedule.next_delay();
+        schedule.reset();
+        assert_eq!(schedule.next_delay(), (1, Duration::from_secs(1)));
     }
 }
 const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: u32 = 16;

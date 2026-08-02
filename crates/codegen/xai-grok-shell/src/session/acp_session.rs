@@ -667,6 +667,13 @@ pub(crate) struct SessionActor {
     /// `reconstruct_full_config` threads it into the sampler config, and the
     /// sampler itself sends the matching `x-grok-doom-loop-check` header.
     pub(crate) doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    /// Opt-in to server-side advisor execution (`--server-advisor` /
+    /// session meta `serverAdvisor`), resolved once at spawn. Threaded
+    /// into `reconstruct_full_config`'s `advisor_server_model`, which
+    /// only actually attaches the beta + tool on the Anthropic Messages
+    /// OAuth (Bearer) path -- this flag alone does not gate anything by
+    /// itself on non-Anthropic / non-Messages / non-OAuth sessions.
+    pub(crate) server_advisor: bool,
     /// Telemetry-only per-turn doom-loop recovery tally (attempts, whether a
     /// budget-spent accept happened, tightest trigger label). Accumulated by
     /// the event drainer, taken at turn end for the per-turn analytics event.
@@ -828,6 +835,11 @@ pub(crate) struct SessionActor {
         xai_grok_tools::implementations::grok_build::workflow::WorkflowLaunchEnvelope,
     >,
     pub(crate) goal_classifier_enabled: bool,
+    /// Resolved master switch for the automatic post-change adversarial review
+    /// stage. Default off for safe rollout; when enabled it runs before the
+    /// skeptic panel and feeds confirmed findings into the existing verifier
+    /// completion gate.
+    pub(crate) goal_review_enabled: bool,
     /// Master switch for the goal planner subagent.
     pub(crate) goal_planner_enabled: bool,
     /// Master switch for the one-shot goal summarizer (the closing

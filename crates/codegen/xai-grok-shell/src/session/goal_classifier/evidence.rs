@@ -144,12 +144,32 @@ const CHANGED_FILES_MAX: usize = 300;
 /// pre-truncation diff, so the list stays complete even when the
 /// rendered patch is byte-capped.
 pub(crate) fn extract_changed_files(diff: &str) -> Vec<String> {
-    let mut files: Vec<String> = diff
-        .lines()
-        .filter_map(|l| l.strip_prefix("diff --git "))
-        .filter_map(|rest| rest.rsplit_once(" b/").map(|(_, p)| p.to_string()))
-        .filter(|p| !p.is_empty())
-        .collect();
+    let mut files = Vec::new();
+    for line in diff.lines() {
+        if let Some(path) = line
+            .strip_prefix("diff --git ")
+            .and_then(|rest| rest.rsplit_once(" b/").map(|(_, p)| p.to_string()))
+            .filter(|p| !p.is_empty())
+        {
+            files.push(path);
+            continue;
+        }
+
+        // Some local git wrappers render compact file headers like
+        // `src/lib.rs --- Rust` instead of raw unified-diff `diff --git`
+        // lines. Keep the verifier's changed-file anchor robust in those
+        // environments too.
+        if let Some((path, _language)) = line.split_once(" --- ") {
+            let path = path.trim();
+            if !path.is_empty()
+                && !path.starts_with(['+', '-', '@', '#'])
+                && !path.contains(char::is_whitespace)
+                && (path.contains('/') || path.contains('.'))
+            {
+                files.push(path.to_owned());
+            }
+        }
+    }
     files.sort();
     files.dedup();
     files
@@ -468,6 +488,8 @@ pub(crate) async fn capture_plan_changes(
     };
     let mut cmd = git_command(cmd_cwd);
     cmd.arg("diff")
+        .arg("--no-ext-diff")
+        .arg("--no-color")
         .arg("--no-index")
         .arg("--no-prefix")
         .arg(baseline_arg)
@@ -510,7 +532,10 @@ async fn run_git_diff_against_baseline(
     workspace_root: &Path,
 ) -> Result<String, ChangesCaptureError> {
     let mut cmd = git_command(workspace_root);
-    cmd.arg("diff").arg(baseline);
+    cmd.arg("diff")
+        .arg("--no-ext-diff")
+        .arg("--no-color")
+        .arg(baseline);
     let output = match tokio::time::timeout(DIFF_COMMAND_TIMEOUT, cmd.output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(err)) => return Err(ChangesCaptureError::DiffCommandFailed(err.to_string())),
@@ -562,11 +587,12 @@ async fn lazy_git_baseline_diff(
     // the initial commit's additions). Hash derived dynamically to
     // support SHA-256 repos.
     let mut cmd = git_command(workspace_root);
+    cmd.arg("diff").arg("--no-ext-diff").arg("--no-color");
     if git_has_parent(workspace_root, &oldest).await {
-        cmd.arg("diff").arg(format!("{oldest}^..{head}"));
+        cmd.arg(format!("{oldest}^..{head}"));
     } else {
         let empty_tree = derive_empty_tree_sha(workspace_root).await;
-        cmd.arg("diff").arg(format!("{empty_tree}..{head}"));
+        cmd.arg(format!("{empty_tree}..{head}"));
     }
 
     let output = match tokio::time::timeout(DIFF_COMMAND_TIMEOUT, cmd.output()).await {
@@ -1389,6 +1415,15 @@ mod tests {
                 "js/b.js".to_string(),
                 "new/name.rs".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn extract_changed_files_parses_compact_git_wrapper_headers() {
+        let diff = "src/lib.rs --- Rust\n1 old  1 new\nREADME.md --- Markdown\n";
+        assert_eq!(
+            extract_changed_files(diff),
+            vec!["README.md".to_string(), "src/lib.rs".to_string()],
         );
     }
 

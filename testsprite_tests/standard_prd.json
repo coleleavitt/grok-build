@@ -1,61 +1,81 @@
 {
   "core_goals": [
-    "Ensure missing active account index does not implicitly pin selection to account 0.",
-    "Preserve explicit sticky selection when an active account index is manually set and healthy.",
-    "On Anthropic rate limits, mark the selected account as cooled down/rejected with retry-after semantics and rotate to the next usable account.",
-    "Clear process-local cached bearer credentials when rate limits are recorded to prevent reuse of exhausted tokens.",
-    "Route Anthropic sampler rate-limit failures through rotation and existing resubmit recovery instead of immediate terminal exhaustion."
+    "Durable page store: CRUD with derived titles, persistence across store close/reopen.",
+    "Graph parity: undirected relations deduped via ordered pairs, self-edges rejected, related pages grouped by category, graph query with per-node degree including degree-0 nodes.",
+    "Provenance parity: typed source citations (chat_session, document, connector, file, manual) with drift-tolerant source-ref normalization ([s1]/S1/[D3]/d4).",
+    "Settings parity: enabled/use-connectors flags, clearable focus instructions, last-run timestamp with run-completion stamping.",
+    "Engine parity: self-improvement run gated on the enabled flag, transcript built with [S#]/[D#] refs (documents only when use_connectors), focus instructions passed to the provider, pages auto-categorized with update-over-duplicate title matching, sources attached via normalized refs, related pages linked, last_run_at stamped.",
+    "Expose Onyx /memory list-shape parity helpers for category_counts and category-filtered listing so portable integration tests can assert the same list semantics as the Onyx stack.",
+    "Wire Brain into Grok Build’s real prompt/request path so normal user requests can create durable Brain records and later requests receive recalled context through the shipped request builder.",
+    "Fully port the portable Onyx Python Brain data/run logic, not just direct remember prompts, including bounded session-history backfill from Grok JSONL sessions."
   ],
   "features": [
     {
-      "description": "Account selection logic distinguishes between absent and explicit active index. Sticky behavior applies only when active_index is explicitly set; otherwise, normal ordering (health/tier/name) determines selection.",
-      "name": "Correct Account Selection Stickiness",
-      "user_flows": [
-        "With multiple ready accounts and active_index=None, user request resolves account via standard ranking, not forced index 0.",
-        "With active_index=Some(i) and account healthy, user request stays pinned to account i."
-      ]
+      "description": "Create, read, list (newest-updated first), update, and delete memory pages with title derivation from the first sentence when absent; data persists across closing and reopening the store file.",
+      "name": "Memory page store",
+      "user_flows": []
     },
     {
-      "description": "When selected Anthropic account is rate-limited, manager marks it rejected, applies retry-after cooldown (or 5-minute fallback if header absent), and resolves the next ready credential without network dependency for selection.",
-      "name": "Rate-Limit Marking and Credential Rotation",
-      "user_flows": [
-        "User request hits Anthropic rate limit; system records rate limit on currently selected account.",
-        "Account unified_status becomes Rejected and rate_limit_reset_time is set to a future timestamp.",
-        "Next credential resolution skips cooled-down account and uses another ready account."
-      ]
+      "description": "Undirected page-to-page edges stored once per ordered pair (dedup in either direction), self-edge and unknown-page rejection, edge removal, related-pages query grouped by category, and a graph query returning all nodes with degrees (degree-0 nodes included) plus edges.",
+      "name": "Relations and memory graph",
+      "user_flows": []
     },
     {
-      "description": "Live credential layer clears cached process-local bearer token immediately after recording account rate limit, ensuring subsequent sampler configs cannot reuse exhausted bearer values.",
-      "name": "Live Bearer Cache Invalidation on Rate Limit",
-      "user_flows": [
-        "User request uses cached bearer token.",
-        "Rate limit is recorded for selected account.",
-        "Cached bearer is invalidated before next sampling attempt."
-      ]
+      "description": "Typed citations (chat_session, document, connector, file, manual) attach to and list for a page with label capping, and source-ref normalization tolerates bracket/case drift without silently dropping citations.",
+      "name": "Source citations",
+      "user_flows": []
     },
     {
-      "description": "Sampler handling for Anthropic `RateLimited` errors triggers credential mark/rotate/refresh logic, then returns existing resubmit recovery behavior rather than immediate exhausted failure; exhaustion is returned only if no replacement account remains.",
-      "name": "Sampler Rate-Limit Recovery via Existing Resubmit Path",
-      "user_flows": [
-        "Sampler returns RateLimited for Anthropic adapter during a turn.",
-        "Session invokes Anthropic live credential rotation workflow.",
-        "Session retries using existing resubmit mechanism with refreshed/rotated credentials.",
-        "If no usable account is available, session returns exhausted outcome."
-      ]
+      "description": "Enabled flag, use-connectors flag, optional focus-instructions text (whitespace clears), and last-run timestamp round-trip through get/update; a run-completion operation stamps the timestamp; settings persist across reopen.",
+      "name": "Brain settings",
+      "user_flows": []
     },
     {
-      "description": "Implementation avoids introducing new balancing infrastructure, keeps unit tests offline from live Anthropic APIs, and prevents token/refresh-secret leakage in logs and artifacts.",
-      "name": "Security and Test Constraints",
-      "user_flows": [
-        "Developer runs auth package tests without live API calls.",
-        "Developer runs shell package checks for integration safety.",
-        "Generated artifacts and logs omit secrets."
-      ]
+      "description": "run_self_improvement builds an [S#]/[D#]-tagged transcript from session/document context (documents only when use_connectors), passes focus instructions and existing titles to a pluggable ExtractionProvider, applies extracted pages into the four categories with update-over-duplicate title matching, attaches per-page sources via normalized refs, links related pages, skips entirely when disabled, and stamps last_run_at on completed runs.",
+      "name": "Self-improvement run engine",
+      "user_flows": []
+    },
+    {
+      "description": "The ported Onyx test suite (test_memory_recall_and_graph.py, the suite behind the Onyx testsprite brain-graph script) passes against the Rust crate with the same seed data, topology, and assertions.",
+      "name": "Onyx behavioral parity",
+      "user_flows": []
+    },
+    {
+      "description": "Library equivalent of Onyx's testsprite memory_demo_populate.py: populate memories across all four categories, report total and per-category counts, expose all nodes in the graph as degree-0 before linking, run the self-improvement pipeline to refresh/recall the codename page without duplicating it, attach a chat-session citation via normalized refs, link related pages, then clean up and verify the store is empty.",
+      "name": "Portable live-demo lifecycle parity",
+      "user_flows": []
+    },
+    {
+      "description": "The xai-grok-shell prompt path opens the durable Grok Brain store, processes user-originated remember requests before model sampling, persists a Brain page with title/category/source citation, and injects recalled Brain context into the real ChatStateActor request-building memory reminder path for later fresh requests.",
+      "name": "Grok Build request-path Brain wiring",
+      "user_flows": []
+    },
+    {
+      "description": "The wired service respects disabled settings (no create/no recall), initializes a normal Grok store enabled only when unconfigured, and exposes deterministic-provider self-improvement through the Grok Build service boundary for tests without network LLM calls.",
+      "name": "Brain integration settings and deterministic self-improvement",
+      "user_flows": []
+    },
+    {
+      "description": "Port the portable behavior of Onyx brain.py and brain/tasks.py into Grok Build: bounded recent-session selection with last-run cutoff, max session/message/transcript/document/page/source caps, persisted Grok session JSONL parsing, connector/document toggle, focus instructions, source-ref normalization, update-not-duplicate by title, source dedup, relation linking, and last-run stamping.",
+      "name": "Full Onyx Brain Python run/backfill parity",
+      "user_flows": []
     }
   ],
   "meta": {
-    "prepared_by": "TestSprite PRD Normalizer",
-    "project": "Anthropic OAuth Account Rotation After Fable Rate Limits"
+    "prepared_by": "TestSprite (local)",
+    "project": "xai-grok-brain"
   },
-  "product_overview": "Improve Anthropic provider reliability by fixing account selection and rate-limit recovery so that rate-limited requests rotate to another usable OAuth account instead of repeatedly using an exhausted credential or failing terminally. The system should mark affected accounts as temporarily rejected, clear cached bearer tokens, refresh sampler configuration, and retry via the existing resubmit path without introducing new scheduling systems."
+  "product_overview": "xai-grok-brain is a Rust library crate in the grok-build workspace providing a durable, single-user 'Brain': a SQLite-backed graph of memory pages with four categories (notes, concepts, entities, workstreams), undirected page-to-page relations, typed source citations, per-store brain settings, and a self-improvement run engine behind a pluggable extraction provider. It ports the Onyx/Perplexity Brain domain layer with parity semantics; HTTP endpoints, UI, and scheduling are out of scope.",
+  "requirements": [
+    "cargo build -p xai-grok-brain compiles with no errors and cargo clippy -p xai-grok-brain reports no warnings.",
+    "The crate's full cargo test suite (unit + consumer + onyx_parity integration tests) passes deterministically on repeated runs.",
+    "Graph invariants hold: duplicate edges collapse, self-edges error, degree-0 nodes appear in the graph query output.",
+    "Drifted source refs [s1], S1, [D3], d4 all resolve to their canonical S#/D# keys.",
+    "A disabled store never invokes the extraction provider and never stamps last_run_at; an enabled run stamps it even when no pages are produced.",
+    "The portable live-demo lifecycle test passes: category counts match the populated all-category seed set, graph nodes appear before linking, the self-improvement run updates rather than duplicates the codename page, sources and relations are attached, and cleanup leaves an empty store.",
+    "Shell integration tests pass: process_brain_request_at_path creates a page/source for a remember request, reopens the store, recalls the value for a later fresh request, and the recalled context is injected via ChatStateActor::build_request.",
+    "Integration settings tests pass: disabled Brain blocks create/recall, and deterministic-provider self-improvement through BrainService creates/updates categorized pages, sources, relations, and last-run timestamp.",
+    "Backfill launch test passes: fake persisted Grok sessions are parsed, bounded, converted to [S#]/[D#] context, passed to a deterministic provider, applied to the durable store, and later recalled through the public request service.",
+    "Adversarial backfill tests pass for recent-window/last-run cutoff, max sessions/messages/docs, connector toggling, source-ref drift, unknown refs, repeated run update-not-duplicate, relation/source dedup, and empty/no-session stamping."
+  ]
 }

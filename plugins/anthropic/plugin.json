@@ -15,19 +15,40 @@
         "anthropic-version": "2023-06-01"
       },
       "models": {
+        "claude-opus-4-6": {
+          "model": "claude-opus-4-6",
+          "name": "Claude Opus 4.6",
+          "description": "Anthropic Opus model. 1M context, 128K max output.",
+          "contextWindow": 1000000,
+          "maxCompletionTokens": 128000
+        },
+        "claude-opus-4-7": {
+          "model": "claude-opus-4-7",
+          "name": "Claude Opus 4.7",
+          "description": "Anthropic Opus model. Native 1M context, 128K max output.",
+          "contextWindow": 1000000,
+          "maxCompletionTokens": 128000
+        },
         "claude-opus-4-8": {
           "model": "claude-opus-4-8",
           "name": "Claude Opus 4.8",
           "description": "Anthropic's Opus-tier flagship. 1M context, 128K max output.",
           "contextWindow": 1000000,
-          "maxCompletionTokens": 64000
+          "maxCompletionTokens": 128000
+        },
+        "claude-sonnet-4-6": {
+          "model": "claude-sonnet-4-6",
+          "name": "Claude Sonnet 4.6",
+          "description": "Anthropic Sonnet model. 1M context, 128K max output.",
+          "contextWindow": 1000000,
+          "maxCompletionTokens": 128000
         },
         "claude-sonnet-5": {
           "model": "claude-sonnet-5",
           "name": "Claude Sonnet 5",
-          "description": "Balanced intelligence and speed. 1M context.",
+          "description": "Balanced intelligence and speed. 1M context, 128K max output.",
           "contextWindow": 1000000,
-          "maxCompletionTokens": 64000
+          "maxCompletionTokens": 128000
         },
         "claude-haiku-4-5": {
           "model": "claude-haiku-4-5",
@@ -41,7 +62,7 @@
           "name": "Claude Fable 5",
           "description": "Anthropic's most capable model. 1M context; thinking always on.",
           "contextWindow": 1000000,
-          "maxCompletionTokens": 64000
+          "maxCompletionTokens": 128000
         }
       }
     }

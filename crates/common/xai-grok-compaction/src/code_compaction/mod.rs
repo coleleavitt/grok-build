@@ -42,7 +42,8 @@ pub use config::{
     DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT, FullReplaceConfig, MIN_SUMMARY_SEED_CHARS,
 };
 pub use failure::{
-    FailureKind, classify_http_status, classify_stream_event_error, is_context_length_error,
+    ContextOverflowSizes, FailureKind, classify_http_status, classify_stream_event_error,
+    is_context_length_error, parse_context_overflow_sizes,
 };
 pub use observer::{FullReplaceAttemptOutcome, FullReplaceObserver};
 pub use prompt::{

@@ -18,6 +18,7 @@
 
 pub mod actor;
 pub mod attribution;
+pub mod auth_trace;
 pub mod client;
 pub mod commands;
 pub mod config;

@@ -153,6 +153,7 @@ xai-system-power = { workspace = true }
 xai-grok-workspace = { workspace = true }
 xai-grok-subagent-resolution = { path = "../xai-grok-subagent-resolution" }
 xai-grok-agent = { path = "../xai-grok-agent" }
+xai-grok-economy = { path = "../xai-grok-economy" }
 xai-grok-brain = { workspace = true }
 xai-grok-config = { workspace = true }
 xai-grok-config-types = { workspace = true }

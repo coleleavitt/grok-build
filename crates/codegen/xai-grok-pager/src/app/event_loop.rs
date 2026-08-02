@@ -821,6 +821,8 @@ pub(crate) async fn run(
     app.require_plan_approval = xai_grok_shell::util::config::load_require_plan_approval();
     app.plan_mode = !args.no_plan;
     app.subagents = !args.no_subagents;
+    app.advisor_enabled = args.advisor_enabled();
+    app.server_advisor = args.server_advisor;
     app.ask_user = !args.no_ask_user;
     app.chat_mode = args.chat();
     #[cfg(feature = "local-workspace")]
@@ -3724,6 +3726,8 @@ pub(crate) fn session_flags_for_effects(
     effects::SessionFlags {
         plan_mode: app.plan_mode,
         subagents: app.subagents,
+        advisor_enabled: app.advisor_enabled,
+        server_advisor: app.server_advisor,
         ask_user: app.ask_user,
         restore_code: app.restore_code,
         agent_override: app.agent_override.clone(),

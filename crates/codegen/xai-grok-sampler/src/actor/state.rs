@@ -110,6 +110,7 @@ mod tests {
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             provider_request_adapter: None,
+            advisor_server_model: None,
             header_injector: None,
         }
     }

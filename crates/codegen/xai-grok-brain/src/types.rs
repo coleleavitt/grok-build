@@ -97,6 +97,34 @@ impl MemorySourceType {
     }
 }
 
+/// Scope kind for a Brain page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryScopeKind {
+    /// User-global memory, available in every workspace.
+    Global,
+    /// Workspace/repo-scoped memory, preferred only when the active workspace matches.
+    Workspace,
+}
+
+impl MemoryScopeKind {
+    /// Stable lowercase DB/wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Workspace => "workspace",
+        }
+    }
+
+    /// Parse a stored value. Unknown values fall back to global for compatibility.
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "workspace" => Self::Workspace,
+            _ => Self::Global,
+        }
+    }
+}
+
 /// A stored Brain memory page (Onyx `Memory` row).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryPage {
@@ -108,6 +136,10 @@ pub struct MemoryPage {
     pub memory_text: String,
     /// One of the four Brain categories.
     pub category: MemoryCategory,
+    /// Scope kind (`global` or `workspace`).
+    pub scope_kind: MemoryScopeKind,
+    /// Opaque scope id when scoped (e.g. normalized workspace path).
+    pub scope_id: Option<String>,
     /// Provenance tag (e.g. `"brain"` for engine-created pages).
     pub source: Option<String>,
     /// Creation timestamp.
@@ -222,6 +254,74 @@ pub struct MemoryGraph {
     pub nodes: Vec<MemoryGraphNode>,
     /// All undirected edges between those pages.
     pub edges: Vec<MemoryGraphEdge>,
+}
+
+/// Aggregated Brain store status for slash-command/TUI display.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BrainStatus {
+    /// Current settings row.
+    pub settings: BrainSettings,
+    /// Total pages in the store.
+    pub page_count: usize,
+    /// Total relation rows.
+    pub relation_count: usize,
+    /// Total source citation rows.
+    pub source_count: usize,
+    /// Per-category page counts.
+    pub category_counts: std::collections::BTreeMap<MemoryCategory, usize>,
+    /// Number of global pages.
+    pub global_count: usize,
+    /// Number of workspace-scoped pages.
+    pub workspace_count: usize,
+    /// Total revision rows.
+    pub revision_count: usize,
+}
+
+/// One recorded page revision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryRevision {
+    /// Revision row id.
+    pub id: i64,
+    /// Memory page id.
+    pub memory_id: i64,
+    /// Snapshot title.
+    pub title: String,
+    /// Snapshot body.
+    pub memory_text: String,
+    /// Snapshot category.
+    pub category: MemoryCategory,
+    /// Snapshot scope kind.
+    pub scope_kind: MemoryScopeKind,
+    /// Snapshot scope id.
+    pub scope_id: Option<String>,
+    /// Snapshot provenance tag.
+    pub source: Option<String>,
+    /// Why this revision was recorded (`create`, `update`, `restore`, etc.).
+    pub revision_source: String,
+    /// Revision timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Recall configuration used by query-aware Brain context building.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecallOptions {
+    /// Natural-language query to rank against.
+    pub query: String,
+    /// Active workspace/repo scope id, when known.
+    pub workspace_scope: Option<String>,
+    /// Maximum pages to return.
+    pub limit: usize,
+}
+
+/// A recalled page plus score metadata and source labels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecalledMemoryPage {
+    /// The page.
+    pub page: MemoryPage,
+    /// Ranking score.
+    pub score: i64,
+    /// Human-readable source labels for prompt display.
+    pub source_labels: Vec<String>,
 }
 
 /// Related pages for one page, grouped by category (Onyx

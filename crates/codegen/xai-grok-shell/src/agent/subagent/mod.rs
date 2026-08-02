@@ -811,6 +811,9 @@ async fn read_parent_sampling_config(
                     .model_compaction_at_tokens(ctx.model_id.0.as_ref()),
                 doom_loop_recovery: ctx.sampling_config.doom_loop_recovery,
                 provider_request_adapter: ctx.sampling_config.provider_request_adapter.clone(),
+                // Server advisor is gated on the primary session's Anthropic
+                // Messages OAuth path only; subagents never inherit it.
+                advisor_server_model: None,
                 header_injector: ctx.sampling_config.header_injector.clone(),
             };
             let model_id = ctx.model_id.clone();
@@ -1086,6 +1089,84 @@ fn verbatim_or_normalize_fork(
         conversation,
         verbatim_fork: false,
     }
+}
+
+fn estimate_advisor_fork_tokens_for_items(
+    items: Vec<xai_grok_sampling_types::conversation::ConversationItem>,
+    request_prompt: &str,
+    child_context_window: u64,
+) -> u64 {
+    let fork_context = verbatim_or_normalize_fork(items, child_context_window);
+    let fork_tokens = xai_chat_state::estimate_conversation_tokens(&fork_context.conversation);
+    let prompt_tokens = xai_tool_types::advisor::estimate_advisor_tokens("", request_prompt);
+    fork_tokens.saturating_add(prompt_tokens).max(1)
+}
+
+fn estimate_advisor_resume_tokens_for_source(
+    source: &ResumeSourceData,
+    request_prompt: &str,
+) -> u64 {
+    let prompt_tokens = xai_tool_types::advisor::estimate_advisor_tokens("", request_prompt);
+    let transcript_tokens = if source.tokens_used > 0 {
+        source.tokens_used
+    } else {
+        let source_session_info = SessionInfo {
+            id: acp::SessionId::new(source.child_session_id.clone()),
+            cwd: source.child_cwd.clone(),
+        };
+        let storage = crate::session::storage::jsonl::JsonlStorageAdapter::with_root(
+            crate::util::grok_home::grok_home(),
+        );
+        storage
+            .load_chat_history_from_dir(&session::persistence::session_dir(&source_session_info))
+            .ok()
+            .filter(|items| !items.is_empty())
+            .map(|items| xai_chat_state::estimate_conversation_tokens(&items))
+            .unwrap_or(0)
+    };
+    transcript_tokens.saturating_add(prompt_tokens).max(1)
+}
+
+/// Validate advisor launch policy against the exact effective initial context
+/// the child will receive.
+///
+/// This is the shared shipped-path preflight used by the model-facing TaskTool
+/// (through `SubagentEvent::ValidateAdvisor`) and by the coordinator fallback
+/// for any non-TaskTool advisor spawn. It avoids charging only the task prompt
+/// when `fork_context=true` attaches the parent transcript, and avoids letting
+/// `resume_from` bypass budget when resume wins over fork during bootstrap.
+pub(crate) async fn validate_advisor_effective_context_budget(
+    parent_session_id: &str,
+    request_prompt: &str,
+    ctx: &SubagentSpawnContext,
+    resume_source: Option<&ResumeSourceData>,
+) -> Result<(), xai_tool_types::advisor::AdvisorError> {
+    let estimated_tokens = if let Some(source) = resume_source {
+        estimate_advisor_resume_tokens_for_source(source, request_prompt)
+    } else {
+        let items = match ctx.parent_chat_state.as_ref() {
+            Some(chat_state) => chat_state.get_conversation().await,
+            None => Vec::new(),
+        };
+        estimate_advisor_fork_tokens_for_items(
+            items,
+            request_prompt,
+            ctx.sampling_config.context_window,
+        )
+    };
+    xai_tool_types::advisor::validate_advisor_subagent_spawn_with_estimate(
+        parent_session_id,
+        request_prompt,
+        estimated_tokens,
+    )
+}
+
+pub(crate) async fn validate_advisor_fork_snapshot_budget(
+    parent_session_id: &str,
+    request_prompt: &str,
+    ctx: &SubagentSpawnContext,
+) -> Result<(), xai_tool_types::advisor::AdvisorError> {
+    validate_advisor_effective_context_budget(parent_session_id, request_prompt, ctx, None).await
 }
 /// `true` only when the fork actually summarized (ran `normalize_forked_context`).
 /// A verbatim mirror-fork inherits items as-is and never normalizes, so it reports

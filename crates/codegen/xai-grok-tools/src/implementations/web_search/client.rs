@@ -3,6 +3,25 @@ use crate::attribution::{SharedAttributionCallback, ToolConsumer};
 use crate::types::SharedApiKeyProvider;
 use async_openai::types::responses as rs;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+
+fn native_default_from_env() -> bool {
+    native_default_from_env_value(
+        std::env::var("GROK_WEB_SEARCH_NATIVE_DEFAULT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn native_default_from_env_value(value: Option<&str>) -> bool {
+    value
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
+}
 /// A minimal, purpose-built HTTP client for calling the Responses API
 /// with web search capability.
 #[derive(Clone)]
@@ -15,6 +34,10 @@ pub struct WebSearchClient {
     /// from the Responses API emits an `auth_401_attribution` event
     /// with `consumer == "WebSearch"`.
     attribution_callback: Option<SharedAttributionCallback>,
+    /// Whether unprefixed searches should use the native provider classifier
+    /// before falling back to the Responses API. Explicit prefixes always use
+    /// native providers.
+    native_default: bool,
 }
 impl WebSearchClient {
     /// Create a new web search client from `WebSearchConfig::Enabled`.
@@ -80,6 +103,7 @@ impl WebSearchClient {
             model: model.clone(),
             api_key_provider,
             attribution_callback: None,
+            native_default: native_default_from_env(),
         })
     }
     /// Wire a 401-attribution callback into this client. Idempotent;
@@ -89,6 +113,11 @@ impl WebSearchClient {
         callback: Option<SharedAttributionCallback>,
     ) -> Self {
         self.attribution_callback = callback;
+        self
+    }
+    #[cfg(test)]
+    fn with_native_provider_default(mut self, enabled: bool) -> Self {
+        self.native_default = enabled;
         self
     }
     async fn current_bearer(&self) -> Option<String> {
@@ -101,6 +130,28 @@ impl WebSearchClient {
             sent_bearer,
         );
     }
+
+    async fn try_native_provider_search(
+        &self,
+        query: &str,
+        allowed_domains: Option<&[String]>,
+    ) -> Result<Option<super::providers::ProviderSearchOutput>, xai_tool_runtime::ToolError> {
+        let explicit = super::providers::has_backend_prefix(query);
+        if !explicit && !self.native_default {
+            return Ok(None);
+        }
+        match super::providers::search(query, 10, allowed_domains).await {
+            Ok(output) => Ok(Some(output)),
+            Err(err) if explicit => Err(xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                err,
+            )),
+            Err(err) => {
+                tracing::debug!(error = %err, "native web-search providers failed; falling back to Responses API");
+                Ok(None)
+            }
+        }
+    }
     /// Perform a web search query using the Responses API.
     ///
     /// Returns `(content, citations)` where content is the assistant's text
@@ -110,6 +161,13 @@ impl WebSearchClient {
         query: &str,
         allowed_domains: Option<Vec<String>>,
     ) -> Result<(String, Vec<String>), xai_tool_runtime::ToolError> {
+        if let Some(output) = self
+            .try_native_provider_search(query, allowed_domains.as_deref())
+            .await?
+        {
+            return Ok((output.content, output.citations));
+        }
+
         let web_search = rs::WebSearchToolArgs::default()
             .filters(rs::WebSearchToolFilters { allowed_domains })
             .build()
@@ -201,6 +259,18 @@ impl WebSearchClient {
         query: &str,
         allowed_domains: Option<Vec<String>>,
     ) -> Result<(String, Vec<(String, String)>), xai_tool_runtime::ToolError> {
+        if let Some(output) = self
+            .try_native_provider_search(query, allowed_domains.as_deref())
+            .await?
+        {
+            let pairs = output
+                .citations
+                .iter()
+                .map(|url| (String::new(), url.clone()))
+                .collect();
+            return Ok((output.content, pairs));
+        }
+
         let web_search = rs::WebSearchToolArgs::default()
             .filters(rs::WebSearchToolFilters { allowed_domains })
             .build()
@@ -345,10 +415,47 @@ fn extract_citation_pairs(response: &rs::Response) -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use indexmap::IndexMap;
+
+    static PROVIDER_ENV_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn provider_env_lock() -> &'static tokio::sync::Mutex<()> {
+        PROVIDER_ENV_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        name: &'static str,
+        previous: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.name, value) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
+    fn unset_env(name: &'static str) -> EnvGuard {
+        let previous = std::env::var(name).ok();
+        unsafe { std::env::remove_var(name) };
+        EnvGuard { name, previous }
+    }
+
     /// Helper to create a Response from JSON for testing.
     fn response_from_json(json: serde_json::Value) -> rs::Response {
         serde_json::from_value(json).expect("Failed to parse test Response JSON")
     }
+    #[test]
+    fn native_provider_default_is_on_unless_env_explicitly_disables() {
+        assert!(native_default_from_env_value(None));
+        assert!(native_default_from_env_value(Some("1")));
+        assert!(native_default_from_env_value(Some("true")));
+        assert!(!native_default_from_env_value(Some("0")));
+        assert!(!native_default_from_env_value(Some("false")));
+    }
+
     #[test]
     fn test_new_client_uses_configured_model() {
         let config = WebSearchConfig::Enabled {
@@ -416,6 +523,76 @@ mod tests {
         client.record_401_attribution(Some("any-bearer"));
         client.record_401_attribution(None);
     }
+    #[tokio::test]
+    async fn explicit_native_provider_error_does_not_fall_back_to_responses_api() {
+        let config = WebSearchConfig::Enabled {
+            api_key: "test-key".to_string(),
+            base_url: "http://127.0.0.1:1".to_string(),
+            model: "test-model".to_string(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        let err = client
+            .search("primo: compilers", None)
+            .await
+            .expect_err("explicit provider setup errors should surface directly")
+            .to_string();
+        assert!(err.contains("primo:"), "unexpected error: {err}");
+        assert!(
+            err.contains("arxiv:") && err.contains("papers:"),
+            "should suggest key-free academic alternatives: {err}"
+        );
+        assert!(
+            !err.contains("openalex:, edu:, or papers: for key-free"),
+            "primo guidance must not advertise edu: as key-free: {err}"
+        );
+        assert!(
+            err.contains("Use edu: only when Google CSE credentials are configured"),
+            "primo guidance must call out edu: as Google CSE-gated: {err}"
+        );
+        assert!(
+            !err.contains("Responses API"),
+            "explicit native provider errors must not fall back: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_key_gated_provider_missing_key_is_clear_and_not_misleading() {
+        let _guard = provider_env_lock().lock().await;
+        let _brave = unset_env("BRAVE_API_KEY");
+        let config = WebSearchConfig::Enabled {
+            api_key: "test-key".to_string(),
+            base_url: "http://127.0.0.1:1".to_string(),
+            model: "test-model".to_string(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        let err = client
+            .search("brave: rust async", None)
+            .await
+            .expect_err("missing Brave key should be a clear provider setup error")
+            .to_string();
+        assert!(err.contains("BRAVE_API_KEY"), "unexpected error: {err}");
+        assert!(
+            err.contains("wiki:"),
+            "should suggest real key-free alternatives: {err}"
+        );
+        assert!(
+            !err.contains("such as wiki:, ddg:, arxiv:, openalex:, crossref:, pubmed:, doaj:, dblp:, papers:, edu:"),
+            "edu must not be listed among key-free alternatives: {err}"
+        );
+        assert!(
+            err.contains("edu:, gov:, cn:, and google: prefixes use Google CSE"),
+            "scoped Google prefixes should be called out as key-gated: {err}"
+        );
+        assert!(
+            !err.contains("Responses API"),
+            "explicit provider setup errors must not fall back to Responses API: {err}"
+        );
+    }
+
     #[test]
     fn test_extract_citations_empty_response() {
         let response = response_from_json(serde_json::json!({
@@ -666,7 +843,9 @@ mod tests {
             alpha_test_key: None,
         };
         let provider: SharedApiKeyProvider = std::sync::Arc::new(NoneProvider);
-        let client = WebSearchClient::new(&config, Some(provider)).expect("client should build");
+        let client = WebSearchClient::new(&config, Some(provider))
+            .expect("client should build")
+            .with_native_provider_default(false);
         let (content, _citations) = client
             .search("test query", None)
             .await
@@ -716,7 +895,9 @@ mod tests {
             alpha_test_key: None,
         };
         let provider: SharedApiKeyProvider = std::sync::Arc::new(FreshProvider);
-        let client = WebSearchClient::new(&config, Some(provider)).expect("client should build");
+        let client = WebSearchClient::new(&config, Some(provider))
+            .expect("client should build")
+            .with_native_provider_default(false);
         let (content, _citations) = client
             .search("test query", None)
             .await

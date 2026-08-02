@@ -18,8 +18,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use xai_grok_sampling_types::{
-    ConversationRequest, ConversationResponse, EmptyResponseContext, SamplingError, SentCredential,
-    error::Result as SamplingResult,
+    ConversationRequest, ConversationResponse, EmptyResponseContext, ProviderRequestAdapter,
+    SamplingError, error::Result as SamplingResult,
 };
 
 use crate::client::{ApiBackend, SamplingClient};
@@ -330,11 +330,7 @@ async fn apply_retry_decision(
     cancel_token: &CancellationToken,
     completion_tx: &mut Option<oneshot::Sender<CompletionResult>>,
 ) -> bool {
-    let rate_limit_threshold = if retry_policy.rate_limit_retry_threshold == 0 {
-        retry_mod::RATE_LIMIT_RETRY_THRESHOLD
-    } else {
-        retry_policy.rate_limit_retry_threshold
-    };
+    let rate_limit_threshold = rate_limit_retry_threshold(config, retry_policy);
     let decision = classify_error(err, *retry_count, max_retries, rate_limit_threshold);
 
     // Connection-reset / broken-pipe on body upload often means nginx
@@ -453,11 +449,18 @@ async fn apply_retry_decision(
     }
 }
 
-async fn sleep_or_cancel(duration: Duration, cancel_token: &CancellationToken) -> bool {
-    tokio::select! {
-        biased;
-        _ = cancel_token.cancelled() => false,
-        _ = tokio::time::sleep(duration) => true,
+fn rate_limit_retry_threshold(config: &SamplerConfig, retry_policy: &RetryPolicy) -> u32 {
+    if matches!(
+        config.provider_request_adapter.as_ref(),
+        Some(ProviderRequestAdapter::Anthropic { .. })
+    ) && config.bearer_resolver.is_some()
+    {
+        return 1;
+    }
+    if retry_policy.rate_limit_retry_threshold == 0 {
+        retry_mod::RATE_LIMIT_RETRY_THRESHOLD
+    } else {
+        retry_policy.rate_limit_retry_threshold
     }
 }
 

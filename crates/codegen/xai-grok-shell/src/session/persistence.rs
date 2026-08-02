@@ -341,17 +341,9 @@ pub enum PersistenceMsg {
     Signals(SessionSignals),
     /// Persist announcement tracking state (MCP + skill announcement dedup).
     AnnouncementState(crate::session::announcement_state::AnnouncementState),
-    /// Persist goal mode orchestration state.
-    GoalModeState(crate::session::goal_tracker::GoalOrchestration),
-    DeleteGoalModeState {
-        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
-    },
-    WorkflowRunState(crate::session::workflow::store::WorkflowRunManifest),
-    WorkflowRunStateAndAck {
-        manifest: crate::session::workflow::store::WorkflowRunManifest,
-        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
-    },
-    DeleteWorkflowRunState(String),
+    /// Persist goal mode orchestration state (`None` clears it, so a
+    /// cleared goal does not resurrect on session resume).
+    GoalModeState(Option<crate::session::goal_tracker::GoalOrchestration>),
     /// Persist a local feedback entry (user feedback)
     Feedback(LocalFeedbackEntry),
     /// Persist a /btw side question entry
@@ -1994,7 +1986,11 @@ impl SessionPersistence {
                     }
                 }
                 PersistenceMsg::GoalModeState(state) => {
-                    if let Err(e) = self.storage.write_goal_mode_state(&self.info, &state).await {
+                    if let Err(e) = self
+                        .storage
+                        .write_goal_mode_state(&self.info, state.as_ref())
+                        .await
+                    {
                         tracing::warn!(?e, "failed to write goal mode state");
                     }
                 }

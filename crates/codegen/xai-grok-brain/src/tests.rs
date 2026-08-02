@@ -11,8 +11,8 @@ use crate::engine::{
     RunOutcome, SessionSource, normalize_source_ref, run_self_improvement,
 };
 use crate::{
-    BrainError, BrainSettingsUpdate, BrainStore, MemoryCategory, MemorySourceType, NewPage,
-    PageUpdate,
+    BrainError, BrainSettingsUpdate, BrainStore, MemoryCategory, MemoryScopeKind, MemorySourceType,
+    NewPage, PageUpdate, RecallOptions,
 };
 
 fn page(store: &BrainStore, title: &str, category: MemoryCategory) -> i64 {
@@ -617,4 +617,191 @@ fn empty_context_stamps_run_without_calling_provider() {
         store.settings().unwrap().last_run_at.is_some(),
         "empty runs still stamp (Onyx parity)"
     );
+}
+#[test]
+fn status_scopes_revisions_and_query_recall_work() {
+    let store = BrainStore::open_in_memory().unwrap();
+    store
+        .update_settings(BrainSettingsUpdate {
+            enabled: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let global_pref = store
+        .create_page(NewPage {
+            title: Some("User Shell Path Preference".to_owned()),
+            memory_text: "The user prefers relative paths in Linux Bash.".to_owned(),
+            category: MemoryCategory::Notes,
+            source: Some("manual".to_owned()),
+        })
+        .unwrap();
+    let repo_page = store
+        .create_page_scoped(
+            NewPage {
+                title: Some("ERS Deploy Script".to_owned()),
+                memory_text: "The ERS deploy script preflights HTTP signing keys.".to_owned(),
+                category: MemoryCategory::Workstreams,
+                source: Some("brain".to_owned()),
+            },
+            Some("/repo/ers-rs/"),
+        )
+        .unwrap();
+    store
+        .add_source(
+            repo_page.id,
+            MemorySourceType::ChatSession,
+            "ERS API Request Signing",
+            Some("sess-ers"),
+            Some("grok://session/sess-ers"),
+        )
+        .unwrap();
+
+    assert_eq!(repo_page.scope_kind, MemoryScopeKind::Workspace);
+    assert_eq!(repo_page.scope_id.as_deref(), Some("/repo/ers-rs"));
+
+    let status = store.status().unwrap();
+    assert_eq!(status.page_count, 2);
+    assert_eq!(status.global_count, 1);
+    assert_eq!(status.workspace_count, 1);
+    assert_eq!(status.source_count, 1);
+    assert_eq!(status.revision_count, 2, "create records revisions");
+
+    let recall = store
+        .recall_pages(RecallOptions {
+            query: "deploy signing keys".to_owned(),
+            workspace_scope: Some("/repo/ers-rs".to_owned()),
+            limit: 10,
+        })
+        .unwrap();
+    assert_eq!(
+        recall[0].page.id, repo_page.id,
+        "workspace + query match ranks first"
+    );
+    assert_eq!(recall[0].source_labels, vec!["ERS API Request Signing"]);
+    assert!(
+        recall.iter().any(|r| r.page.id == global_pref.id),
+        "global preference remains visible in scoped recall"
+    );
+
+    let updated = store
+        .update_page(
+            repo_page.id,
+            PageUpdate {
+                memory_text: Some("Updated deployment memory.".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(updated.memory_text, "Updated deployment memory.");
+    let revisions = store.revisions(repo_page.id).unwrap();
+    assert!(revisions.len() >= 2);
+    let original = revisions
+        .iter()
+        .find(|revision| revision.memory_text.contains("preflights HTTP signing"))
+        .unwrap();
+    let restored = store.restore_revision(original.id).unwrap();
+    assert!(restored.memory_text.contains("preflights HTTP signing"));
+}
+
+#[test]
+fn recall_keeps_global_preferences_even_when_scope_pages_fill_limit() {
+    let store = BrainStore::open_in_memory().unwrap();
+    let preference = store
+        .create_page(NewPage {
+            title: Some("User Path Preference".to_owned()),
+            memory_text: "The user prefers relative paths in shell commands.".to_owned(),
+            category: MemoryCategory::Notes,
+            source: None,
+        })
+        .unwrap();
+    for idx in 0..5 {
+        store
+            .create_page_scoped(
+                NewPage {
+                    title: Some(format!("Workspace Task {idx}")),
+                    memory_text: "Repo-specific implementation detail.".to_owned(),
+                    category: MemoryCategory::Workstreams,
+                    source: None,
+                },
+                Some("/repo/grok-build"),
+            )
+            .unwrap();
+    }
+
+    let recalled = store
+        .recall_pages(RecallOptions {
+            query: "implementation detail".to_owned(),
+            workspace_scope: Some("/repo/grok-build".to_owned()),
+            limit: 2,
+        })
+        .unwrap();
+    assert_eq!(recalled.len(), 2);
+    assert!(
+        recalled.iter().any(|page| page.page.id == preference.id),
+        "global preference must survive even when workspace pages fill the limit: {recalled:?}",
+    );
+}
+
+#[test]
+fn opens_old_schema_and_migrates_without_losing_data() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("old-brain.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                memory_text TEXT NOT NULL,
+                category TEXT NOT NULL,
+                source TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE memory_relation (
+                memory_id_low INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+                memory_id_high INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (memory_id_low, memory_id_high),
+                CHECK (memory_id_low < memory_id_high)
+            );
+            CREATE TABLE memory_source (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+                source_type TEXT NOT NULL,
+                source_id TEXT,
+                label TEXT NOT NULL,
+                url TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE brain_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER NOT NULL DEFAULT 0,
+                use_connectors INTEGER NOT NULL DEFAULT 0,
+                focus_instructions TEXT,
+                last_run_at TEXT
+            );
+            INSERT INTO memory (title, memory_text, category, source, created_at, updated_at)
+            VALUES ('Old Page', 'Old text', 'notes', 'manual', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+            INSERT INTO brain_settings (id, enabled, use_connectors) VALUES (1, 1, 0);",
+        )
+        .unwrap();
+    }
+
+    let store = BrainStore::open(&db).unwrap();
+    let page = store.get_page_by_title("Old Page").unwrap().unwrap();
+    assert_eq!(page.scope_kind, MemoryScopeKind::Global);
+    assert_eq!(page.memory_text, "Old text");
+    let updated = store
+        .update_page(
+            page.id,
+            PageUpdate {
+                memory_text: Some("Migrated update".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(updated.memory_text, "Migrated update");
+    assert!(!store.revisions(page.id).unwrap().is_empty());
 }

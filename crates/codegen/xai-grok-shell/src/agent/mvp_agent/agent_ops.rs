@@ -4469,6 +4469,22 @@ impl MvpAgent {
             .initialize_request
             .get()
             .and_then(|init| init.meta.as_ref());
+        // Mirrors the ask_user_question gate resolution (meta override
+        // outranks env/config, default on) — kept in sync with the
+        // `<advisor>` prompt section in `build_spawn_system_prompt` so
+        // the advertised toolset and the prompt never disagree. The actual
+        // strip now happens once, authoritatively, inside
+        // `AgentBuilder::build` (both initial spawn and rebuild), so this
+        // is just the value computation threaded down to the builder.
+        let advisor_enabled = resolve_advisor_enabled(session_meta, init_meta);
+        // Server-side advisor opt-in (`--server-advisor` / session meta
+        // `serverAdvisor`). Resolved once here (mirrors `advisor_enabled`)
+        // and threaded down to `SessionActor::server_advisor`, which
+        // `reconstruct_full_config` combines with the live-resolved
+        // Anthropic Messages OAuth state every turn.
+        let server_advisor =
+            read_session_or_init_meta_bool(session_meta, init_meta, "serverAdvisor")
+                .unwrap_or(false);
         if let Some(override_prompt) = system_prompt_override_from_meta(
             session_meta,
             init_meta,
@@ -4657,6 +4673,8 @@ impl MvpAgent {
                     subagents_enabled,
                     subagents_max_depth,
                     ask_user_question_enabled,
+                    advisor_enabled,
+                    server_advisor,
                     client_hooks,
                     prompt_display_cwd,
                     subagent_toggle,

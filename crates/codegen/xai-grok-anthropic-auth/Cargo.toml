@@ -7,8 +7,11 @@ description = "Anthropic OAuth/PKCE authentication: token exchange, refresh, cre
 authors = ["xAI"]
 
 [dependencies]
+# Shared Anthropic SDK: endpoint constants, PKCE, token types, OAuth client, and store path knobs.
+anthropic = { path = "../../../../../active/anthropic", default-features = false, features = ["client", "store"] }
 base64 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+linkscope = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

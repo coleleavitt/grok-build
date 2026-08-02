@@ -732,6 +732,7 @@ impl SessionActor {
                     .await;
                 ok_end_turn(0, None)
             }
+            BuiltinAction::Brain { args } => self.execute_brain_slash_command(args).await,
             BuiltinAction::MemoryToggle { enabled } => {
                 tracing::info!(
                     session_id = %self.session_info.id.0,
@@ -947,6 +948,13 @@ impl SessionActor {
                     return ok_end_turn(0, None);
                 }
                 self.goal_tracker.lock().clear();
+                // Clear the durable snapshot too, or the cleared goal
+                // resurrects from `goal_mode_state.json` on session resume.
+                self.goal_notify_sender()
+                    .persist_goal_state(&self.goal_tracker.lock());
+                // `/goal clear` is a deliberate user reset — drop both
+                // streaks so stale counters from the previous goal
+                // can't leak into the next one.
                 self.goal_continuation_streak
                     .store(0, std::sync::atomic::Ordering::Relaxed);
                 self.goal_blocked_streak

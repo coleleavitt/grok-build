@@ -132,6 +132,17 @@ pub struct SamplerConfig {
     #[serde(default)]
     pub provider_request_adapter: Option<ProviderRequestAdapter>,
 
+    /// Server-side advisor tool model, gated end-to-end on this carrier.
+    /// `Some(model)` attaches the Anthropic Messages OAuth `advisor-tool`
+    /// beta header and injects the non-`ToolParam` `advisor_20260301` raw
+    /// tool (`{"type":"advisor_20260301","name":"advisor","model":...}`)
+    /// into the serialized request body; `None` attaches neither. Only
+    /// meaningful on the Anthropic Messages OAuth (Bearer) path -- see
+    /// `SamplingClient::apply_anthropic_cli_headers` and the Messages
+    /// send/stream paths.
+    #[serde(default)]
+    pub advisor_server_model: Option<String>,
+
     /// Per-request header injector (e.g. OTel traceparent). Called in `post()`.
     #[serde(skip)]
     pub header_injector: Option<SharedHeaderInjector>,
@@ -171,6 +182,7 @@ impl Default for SamplerConfig {
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             provider_request_adapter: None,
+            advisor_server_model: None,
             header_injector: None,
         }
     }

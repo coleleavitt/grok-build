@@ -640,6 +640,17 @@ pub struct PagerArgs {
     /// Disable structured question prompts from the agent.
     #[arg(long = "no-ask-user", hide = true)]
     pub no_ask_user: bool,
+    /// Enable the advisor tool for this session (default on unless disabled
+    /// via `--no-advisor` / `GROK_ADVISOR_DISABLED` / `GROK_DISABLE_ADVISOR`).
+    #[arg(long = "advisor", conflicts_with = "no_advisor")]
+    pub advisor: bool,
+    /// Disable the advisor tool and its prompt section for this session.
+    #[arg(long = "no-advisor", conflicts_with = "advisor")]
+    pub no_advisor: bool,
+    /// Opt in to server-side advisor execution (provider consumption lands
+    /// in a later milestone; for now this only threads the flag through).
+    #[arg(long = "server-advisor")]
+    pub server_advisor: bool,
     /// Enable cross-session memory.
     #[arg(long = "experimental-memory", conflicts_with = "no_memory")]
     pub experimental_memory: bool,
@@ -852,20 +863,21 @@ impl PagerArgs {
     pub fn chat(&self) -> bool {
         false
     }
-    /// `--local-workspace[=cwd]` own-mode flag.
-    #[cfg(feature = "local-workspace")]
-    pub fn local_workspace(&self) -> Option<Option<&std::path::Path>> {
-        self.local_workspace.as_ref().map(|inner| inner.as_deref())
-    }
-    /// `--local-workspace-attach=<server_id>`.
-    #[cfg(feature = "local-workspace")]
-    pub fn local_workspace_attach(&self) -> Option<&str> {
-        self.local_workspace_attach.as_deref()
-    }
-    /// `--local-workspace-cwd=<path>`.
-    #[cfg(feature = "local-workspace")]
-    pub fn local_workspace_cwd(&self) -> Option<&std::path::Path> {
-        self.local_workspace_cwd.as_deref()
+    /// Resolve `--advisor` / `--no-advisor` to a single tri-state override.
+    ///
+    /// `Some(false)` when `--no-advisor` was passed, `Some(true)` when
+    /// `--advisor` was passed, `None` when neither was passed (default-on,
+    /// resolved later against `GROK_ADVISOR_DISABLED` / `GROK_DISABLE_ADVISOR`
+    /// / `GROK_ADVISOR_ENABLED` env overrides). The two flags are mutually
+    /// exclusive at the clap level (`conflicts_with`), so at most one is ever set.
+    pub fn advisor_enabled(&self) -> Option<bool> {
+        if self.no_advisor {
+            Some(false)
+        } else if self.advisor {
+            Some(true)
+        } else {
+            None
+        }
     }
     /// Get the session ID to resume, from either --resume or --load (hidden alias).
     ///
@@ -1147,6 +1159,38 @@ mod tests {
                 .unwrap()
                 .resume_target(),
             ResumeTarget::SessionId("old".to_string())
+        );
+    }
+    #[test]
+    fn advisor_flags_resolve_tri_state() {
+        assert_eq!(
+            PagerArgs::try_parse_from(["grok"])
+                .unwrap()
+                .advisor_enabled(),
+            None
+        );
+        assert_eq!(
+            PagerArgs::try_parse_from(["grok", "--advisor"])
+                .unwrap()
+                .advisor_enabled(),
+            Some(true)
+        );
+        assert_eq!(
+            PagerArgs::try_parse_from(["grok", "--no-advisor"])
+                .unwrap()
+                .advisor_enabled(),
+            Some(false)
+        );
+        let err = PagerArgs::try_parse_from(["grok", "--advisor", "--no-advisor"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+    #[test]
+    fn server_advisor_flag_parses() {
+        assert!(!PagerArgs::try_parse_from(["grok"]).unwrap().server_advisor);
+        assert!(
+            PagerArgs::try_parse_from(["grok", "--server-advisor"])
+                .unwrap()
+                .server_advisor
         );
     }
     /// The screen-mode flags are mutually exclusive: the pair exists so one

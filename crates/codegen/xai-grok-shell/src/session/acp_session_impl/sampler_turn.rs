@@ -61,6 +61,21 @@ impl SessionTokenAuthGate {
     }
 }
 
+/// Write the linkscope auth trace (JSON snapshot) to
+/// `~/.grok/logs/auth-trace-<pid>.json` when `GROK_AUTH_TRACE=1`.
+/// Returns the path on success; best-effort otherwise.
+pub(crate) fn dump_auth_trace_if_enabled() -> Option<std::path::PathBuf> {
+    if !xai_grok_sampler::auth_trace::trace_enabled() {
+        return None;
+    }
+    let json = linkscope::to_json_string().ok()?;
+    let dir = crate::util::grok_home::grok_home().join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("auth-trace-{}.json", std::process::id()));
+    std::fs::write(&path, json).ok()?;
+    Some(path)
+}
+
 fn anthropic_live_credential() -> &'static xai_grok_anthropic_auth::LiveCredential {
     static LIVE: std::sync::OnceLock<xai_grok_anthropic_auth::LiveCredential> =
         std::sync::OnceLock::new();
@@ -544,6 +559,17 @@ impl SessionActor {
                 extra_headers.insert("x-compaction-at".to_string(), value.to_string());
             }
         }
+        // Server-side advisor tool: gated end-to-end on `advisor_server_model`
+        // in the sampler (beta header + raw `advisor_20260301` tool
+        // injection on the Anthropic Messages OAuth path only). `server_advisor`
+        // is the user's opt-in (`--server-advisor` / session meta
+        // `serverAdvisor`); it only takes effect when this session is
+        // actually on the Anthropic Messages API over OAuth (Bearer).
+        let advisor_server_model = (self.server_advisor
+            && cfg.api_backend == xai_grok_sampler::ApiBackend::Messages
+            && uses_anthropic_adapter
+            && auth_scheme == xai_grok_sampler::AuthScheme::Bearer)
+            .then(|| cfg.model.clone());
         SamplingConfig {
             api_key,
             base_url: cfg.base_url,
@@ -580,6 +606,7 @@ impl SessionActor {
             compactions_remaining: self.compactions_remaining.get(),
             compaction_at_tokens: self.compaction_at_tokens.get(),
             doom_loop_recovery: self.doom_loop_recovery,
+            advisor_server_model,
             provider_request_adapter: cfg.provider_request_adapter,
             header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
         }
@@ -823,8 +850,18 @@ impl SessionActor {
         }
     }
 
-    async fn rotate_anthropic_after_rate_limit(
-        self: &Arc<Self>,
+    /// Per-account diagnostics for auth failure logs: `Some(json)` when the
+    /// active model uses the Anthropic adapter, `None` otherwise.
+    pub(crate) async fn anthropic_accounts_debug(&self) -> Option<serde_json::Value> {
+        let cfg = self.chat_state_handle.get_sampling_config().await?;
+        if !is_anthropic_adapter(&cfg.provider_request_adapter) {
+            return None;
+        }
+        serde_json::to_value(anthropic_live_credential().debug_snapshot()).ok()
+    }
+
+    pub(crate) async fn rotate_anthropic_after_rate_limit(
+        &self,
         error: &xai_grok_sampler::SamplingErrorInfo,
     ) -> bool {
         let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
@@ -857,10 +894,31 @@ impl SessionActor {
             }
         }
         if !live.has_usable_accounts() {
+            xai_grok_telemetry::unified_log::warn(
+                "anthropic rotation: no usable accounts remain",
+                Some(self.session_info.id.0.as_ref()),
+                Some(serde_json::json!({
+                    "accounts": live.debug_snapshot(),
+                })),
+            );
             return false;
         }
         match live.ensure_fresh().await {
             Ok(_) => {
+                let rotated_to = live.current_account_name();
+                tracing::info!(
+                    target: xai_grok_sampler::auth_trace::TRACE_TARGET,
+                    rotated_to = rotated_to.as_deref().unwrap_or("<unknown>"),
+                    "anthropic rotation: resolved replacement account"
+                );
+                xai_grok_telemetry::unified_log::info(
+                    "anthropic rotation: resolved replacement account",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "rotated_to": rotated_to,
+                        "accounts": live.debug_snapshot(),
+                    })),
+                );
                 self.prepare_sampler_for_turn().await;
                 true
             }
@@ -975,7 +1033,9 @@ impl SessionActor {
         }
         if matches!(error.kind, SamplingErrorKind::RateLimited) {
             if self.rotate_anthropic_after_rate_limit(&error).await {
-                return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit);
+                return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit(
+                    SamplerResubmitReason::anthropic_account_rotated(error.status_code),
+                ));
             }
             self.log_terminal_failure("rate_limited", error.status_code, &detailed_message);
             self.send_xai_notification(XaiSessionUpdate::RetryState(
@@ -1060,10 +1120,9 @@ impl SessionActor {
                         "auth recovery: sampler 401, devbox re-mint, retrying"
                     );
                     self.prepare_sampler_for_turn().await;
-                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
-                        credential: error.credential,
-                        store: RecoveredStore::SessionToken,
-                    });
+                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit(
+                        SamplerResubmitReason::auth_recovered(error.status_code),
+                    ));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1091,10 +1150,9 @@ impl SessionActor {
                     None,
                 );
                 self.prepare_sampler_for_turn().await;
-                return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
-                    credential: error.credential,
-                    store: RecoveredStore::SessionToken,
-                });
+                return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit(
+                    SamplerResubmitReason::auth_recovered(error.status_code),
+                ));
             }
             tracing::warn!(session_id = %self.session_info.id.0, "auth recovery: sampler 401, refresh failed");
             xai_grok_telemetry::unified_log::warn(
@@ -1264,8 +1322,8 @@ impl SessionActor {
     /// * `Ok(SamplerTurnOutcome::Response(_))` - model responded.
     /// * `Ok(SamplerTurnOutcome::CompactAndResubmit)` - compaction
     ///    ran, the outer turn loop should `continue`.
-    /// * `Ok(SamplerTurnOutcome::RefreshAuthAndResubmit)` - auth 401
-    ///    recovery succeeded, credentials refreshed, retry once.
+    /// * `Ok(SamplerTurnOutcome::RefreshAuthAndResubmit)` - auth/account
+    ///    recovery succeeded, credentials refreshed or account rotated, retry once.
     /// * `Err(acp::Error)` - terminal failure already reported via
     ///    `send_xai_notification(RetryState::Failed)`.
     pub(crate) async fn run_turn_via_sampler(
@@ -1316,8 +1374,8 @@ impl SessionActor {
                     SamplerFailureRecovery::CompactAndResubmit => {
                         Ok(SamplerTurnOutcome::CompactAndResubmit)
                     }
-                    SamplerFailureRecovery::RefreshAuthAndResubmit { credential, store } => {
-                        Ok(SamplerTurnOutcome::RefreshAuthAndResubmit { credential, store })
+                    SamplerFailureRecovery::RefreshAuthAndResubmit(reason) => {
+                        Ok(SamplerTurnOutcome::RefreshAuthAndResubmit(reason))
                     }
                 }
             }

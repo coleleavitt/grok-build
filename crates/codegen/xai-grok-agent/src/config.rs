@@ -273,6 +273,9 @@ fn default_grok_build_toolset() -> ToolServerConfig {
             task_output_tool_config(),
             wait_tasks_tool_config(),
             task_tool_config(),
+            (&grok_build::AdvisorTool).into(),
+            (&grok_build::ResearchTool).into(),
+            (&grok_build::BountyTool).into(),
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
@@ -323,6 +326,8 @@ pub fn grok_build_hashline_toolset(
         task_output_tool_config(),
         wait_tasks_tool_config(),
         task_tool_config(),
+        (&grok_build::ResearchTool).into(),
+        (&grok_build::BountyTool).into(),
         (&grok_build::WebSearchTool).into(),
         (&grok_build::SchedulerCreateTool).into(),
         (&grok_build::SchedulerDeleteTool).into(),
@@ -390,6 +395,33 @@ fn plan_toolset() -> ToolServerConfig {
         behavior_preset: None,
     }
 }
+/// Advisor toolset — strictly read-only and no subagent spawning. The advisor
+/// can inspect files when the caller points it at evidence, but cannot mutate
+/// workspace state or recursively delegate.
+fn advisor_toolset() -> ToolServerConfig {
+    ToolServerConfig {
+        tools: vec![
+            (&grok_build::ReadFileTool).into(),
+            (&grok_build::ListDirTool).into(),
+            (&grok_build::GrepTool).into(),
+        ],
+        behavior_preset: None,
+    }
+}
+/// Deep-research toolset — read/search plus web search/fetch. No edit/execute
+/// tools; research returns a cited report instead of modifying the workspace.
+fn deep_research_toolset() -> ToolServerConfig {
+    ToolServerConfig {
+        tools: vec![
+            (&grok_build::ReadFileTool).into(),
+            (&grok_build::ListDirTool).into(),
+            (&grok_build::GrepTool).into(),
+            (&grok_build::WebSearchTool).into(),
+            (&grok_build::WebFetchTool).into(),
+        ],
+        behavior_preset: None,
+    }
+}
 /// Grok Build + plan mode toolset.
 ///
 /// Extends the default `grok-build` toolset with plan mode tools:
@@ -409,6 +441,7 @@ fn grok_build_plan_toolset() -> ToolServerConfig {
             (&grok_build::TodoWriteTool).into(),
             task_output_tool_config(),
             task_tool_config(),
+            (&grok_build::AdvisorTool).into(),
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
@@ -527,6 +560,7 @@ fn grok_build_ask_user_toolset() -> ToolServerConfig {
             task_output_tool_config(),
             wait_tasks_tool_config(),
             task_tool_config(),
+            (&grok_build::AdvisorTool).into(),
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
@@ -673,9 +707,9 @@ where
 /// are defined in exactly one place. The enum covers all built-in
 /// agents for centralized name management and `by_name()` dispatch.
 ///
-/// `subagent_variants()` returns only the 3 that are exposed to the LLM
-/// via the `TaskTool` description. The remaining 6 are top-level agent
-/// profiles resolvable by name but not advertised as subagent types.
+/// `subagent_variants()` returns only the built-ins exposed to the LLM
+/// via the `TaskTool` description. The remaining variants are top-level
+/// agent profiles resolvable by name but not advertised as subagent types.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter, AsRefStr, IntoStaticStr,
 )]
@@ -691,6 +725,8 @@ pub enum BuiltinAgentName {
     GeneralPurpose,
     Explore,
     Plan,
+    Advisor,
+    DeepResearch,
     BrowserUse,
     #[strum(serialize = "grok-build-orchestrator")]
     GrokBuildOrchestrator,
@@ -720,13 +756,21 @@ impl BuiltinAgentName {
             Self::GeneralPurpose => AgentDefinition::general_purpose(),
             Self::Explore => AgentDefinition::explore(),
             Self::Plan => AgentDefinition::plan(),
+            Self::Advisor => AgentDefinition::advisor(),
+            Self::DeepResearch => AgentDefinition::deep_research(),
             Self::BrowserUse => AgentDefinition::browser_use(),
             Self::GrokBuildOrchestrator => AgentDefinition::grok_build_orchestrator(),
         }
     }
     /// Built-in agents available as subagents via the Task tool.
     pub fn subagent_variants() -> &'static [Self] {
-        &[Self::GeneralPurpose, Self::Explore, Self::Plan]
+        &[
+            Self::GeneralPurpose,
+            Self::Explore,
+            Self::Plan,
+            Self::Advisor,
+            Self::DeepResearch,
+        ]
     }
 }
 /// Portable agent identity — parsed from .grok/agents/*.md.
@@ -1616,6 +1660,34 @@ impl AgentDefinition {
             ..Self::base(BuiltinAgentName::Plan, "")
         }
     }
+    /// Advisor subagent — read-only side reviewer.
+    pub fn advisor() -> Self {
+        use crate::prompt::subagent_prompts;
+        Self {
+            description: xai_tool_types::ADVISOR_SUBAGENT.description.to_string(),
+            tool_config: advisor_toolset(),
+            permission_mode: PermissionMode::Plan,
+            prompt_body: Some(subagent_prompts::ADVISOR_PROMPT.to_string()),
+            inherit_skills: false,
+            inject_default_tools: false,
+            ..Self::base(BuiltinAgentName::Advisor, "")
+        }
+    }
+    /// Deep research subagent — read/search plus web research surfaces.
+    pub fn deep_research() -> Self {
+        use crate::prompt::subagent_prompts;
+        Self {
+            description: xai_tool_types::DEEP_RESEARCH_SUBAGENT
+                .description
+                .to_string(),
+            tool_config: deep_research_toolset(),
+            permission_mode: PermissionMode::Plan,
+            prompt_body: Some(subagent_prompts::DEEP_RESEARCH_PROMPT.to_string()),
+            inherit_skills: false,
+            inject_default_tools: false,
+            ..Self::base(BuiltinAgentName::DeepResearch, "")
+        }
+    }
     /// Browser Use agent definition.
     pub fn browser_use() -> Self {
         Self {
@@ -1722,6 +1794,44 @@ mod tests {
         let explore = toolset_for_preset("explore").unwrap();
         assert!(explore.tools.len() < plan.tools.len());
         assert!(plan.tools.len() < gb.tools.len());
+    }
+    #[test]
+    fn default_grok_build_toolset_exposes_research_and_bounty_flows() {
+        let gb = toolset_for_preset("grok-build").unwrap();
+        let ids: std::collections::HashSet<&str> =
+            gb.tools.iter().map(|tool| tool.id.as_str()).collect();
+        assert!(ids.contains("GrokBuild:research"));
+        assert!(ids.contains("GrokBuild:bounty"));
+    }
+    #[test]
+    fn default_grok_build_toolset_exposes_advisor_tool() {
+        let gb = toolset_for_preset("grok-build").unwrap();
+        let ids: std::collections::HashSet<&str> =
+            gb.tools.iter().map(|tool| tool.id.as_str()).collect();
+        assert!(ids.contains(ToolConfig::from(&grok_build::AdvisorTool).id.as_str()));
+    }
+    #[test]
+    fn grok_build_plan_no_subagents_omits_advisor_tool() {
+        let plan_no_subagents = grok_build_plan_no_subagents_toolset();
+        let ids: std::collections::HashSet<&str> = plan_no_subagents
+            .tools
+            .iter()
+            .map(|tool| tool.id.as_str())
+            .collect();
+        assert!(!ids.contains(ToolConfig::from(&grok_build::AdvisorTool).id.as_str()));
+        assert!(!ids.contains(ToolConfig::from(&grok_build::TaskTool).id.as_str()));
+    }
+    #[test]
+    fn grok_build_concise_toolset_omits_advisor_tool() {
+        // Adversarial case 3 (no-subagents leak): the concise toolset has no
+        // subagent backend wired up either — an advisor entry here would
+        // crash at runtime with no SubagentBackendResource, same as the
+        // plan-no-subagents preset.
+        let concise = toolset_for_preset("grok-build-concise").unwrap();
+        let ids: std::collections::HashSet<&str> =
+            concise.tools.iter().map(|tool| tool.id.as_str()).collect();
+        assert!(!ids.contains(ToolConfig::from(&grok_build::AdvisorTool).id.as_str()));
+        assert!(!ids.contains(ToolConfig::from(&grok_build::TaskTool).id.as_str()));
     }
     fn grok_computer_exclusive_ids() -> Vec<String> {
         #[allow(unused_mut)]
@@ -1839,6 +1949,8 @@ mod tests {
             | BuiltinAgentName::GeneralPurpose
             | BuiltinAgentName::Explore
             | BuiltinAgentName::Plan
+            | BuiltinAgentName::Advisor
+            | BuiltinAgentName::DeepResearch
             | BuiltinAgentName::Opencode
             | BuiltinAgentName::BrowserUse => false,
         }
@@ -2552,10 +2664,78 @@ description: Test default tool config
     #[test]
     fn test_builtin_agent_name_subagent_variants() {
         let variants = BuiltinAgentName::subagent_variants();
-        assert_eq!(variants.len(), 3);
+        assert_eq!(variants.len(), 5);
         assert!(variants.contains(&BuiltinAgentName::GeneralPurpose));
         assert!(variants.contains(&BuiltinAgentName::Explore));
         assert!(variants.contains(&BuiltinAgentName::Plan));
+        assert!(variants.contains(&BuiltinAgentName::Advisor));
+        assert!(variants.contains(&BuiltinAgentName::DeepResearch));
+    }
+    #[test]
+    fn advisor_and_deep_research_resolve_from_builtin_names() {
+        use std::str::FromStr;
+        let advisor = BuiltinAgentName::from_str("advisor").unwrap().definition();
+        assert_eq!(advisor.name, "advisor");
+        assert_eq!(
+            advisor.description,
+            xai_tool_types::ADVISOR_SUBAGENT.description
+        );
+        assert!(
+            advisor
+                .prompt_body
+                .as_deref()
+                .unwrap()
+                .contains("Advisor duties")
+        );
+
+        let research = BuiltinAgentName::from_str("deep-research")
+            .unwrap()
+            .definition();
+        assert_eq!(research.name, "deep-research");
+        assert_eq!(
+            research.description,
+            xai_tool_types::DEEP_RESEARCH_SUBAGENT.description
+        );
+        assert!(
+            research
+                .prompt_body
+                .as_deref()
+                .unwrap()
+                .contains("Artifacts")
+        );
+    }
+
+    #[test]
+    fn advisor_and_deep_research_toolsets_are_restricted() {
+        let advisor = AgentDefinition::advisor();
+        let advisor_ids: Vec<&str> = advisor
+            .tool_config
+            .tools
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        let has = |ids: &[&str], suffix: &str| ids.iter().any(|id| id.ends_with(suffix));
+        assert!(has(&advisor_ids, ":read_file"));
+        assert!(has(&advisor_ids, ":list_dir"));
+        assert!(has(&advisor_ids, ":grep"));
+        assert!(!has(&advisor_ids, ":search_replace"));
+        assert!(!has(&advisor_ids, ":task"));
+        assert!(!has(&advisor_ids, ":run_terminal_cmd"));
+
+        let research = AgentDefinition::deep_research();
+        let research_ids: Vec<&str> = research
+            .tool_config
+            .tools
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        assert!(has(&research_ids, ":read_file"));
+        assert!(has(&research_ids, ":grep"));
+        assert!(has(&research_ids, ":web_search"));
+        assert!(has(&research_ids, ":web_fetch"));
+        assert!(!has(&research_ids, ":search_replace"));
+        assert!(!has(&research_ids, ":task"));
+        assert!(!has(&research_ids, ":run_terminal_cmd"));
     }
     #[test]
     fn test_all_builtins_have_inherit_model() {

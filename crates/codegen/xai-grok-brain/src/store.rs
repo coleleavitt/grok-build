@@ -13,9 +13,10 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::types::{
-    BrainSettings, BrainSettingsUpdate, MemoryCategory, MemoryGraph, MemoryGraphEdge,
-    MemoryGraphNode, MemoryPage, MemorySource, MemorySourceType, NewPage, PageUpdate, RelatedPages,
-    memory_title_for_content, truncate_chars,
+    BrainSettings, BrainSettingsUpdate, BrainStatus, MemoryCategory, MemoryGraph, MemoryGraphEdge,
+    MemoryGraphNode, MemoryPage, MemoryRevision, MemoryScopeKind, MemorySource, MemorySourceType,
+    NewPage, PageUpdate, RecallOptions, RecalledMemoryPage, RelatedPages, memory_title_for_content,
+    truncate_chars,
 };
 use crate::{BrainError, Result};
 
@@ -55,6 +56,7 @@ impl BrainStore {
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        migrate_schema(&conn)?;
         Ok(Self { conn })
     }
 
@@ -62,46 +64,98 @@ impl BrainStore {
     // Page CRUD
     // -----------------------------------------------------------------------
 
-    /// Create a page and return it. Title falls back to the first sentence of
+    /// Create a global page and return it. Title falls back to the first sentence of
     /// the text when absent (Onyx `memory_title_for_content`).
     pub fn create_page(&self, page: NewPage) -> Result<MemoryPage> {
+        self.create_page_scoped(page, None)
+    }
+
+    /// Create a page scoped to `scope_id` when provided; otherwise global.
+    pub fn create_page_scoped(&self, page: NewPage, scope_id: Option<&str>) -> Result<MemoryPage> {
         let title = memory_title_for_content(&page.memory_text, page.title.as_deref());
         let now = Utc::now();
+        let scope_kind = scope_id
+            .filter(|scope| !scope.trim().is_empty())
+            .map_or(MemoryScopeKind::Global, |_| MemoryScopeKind::Workspace);
+        let scope_id = scope_id.and_then(normalize_scope_id);
         self.conn.execute(
-            "INSERT INTO memory (title, memory_text, category, source, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO memory (title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 title,
                 page.memory_text,
                 page.category.as_str(),
+                scope_kind.as_str(),
+                scope_id,
                 page.source,
                 now.to_rfc3339(),
                 now.to_rfc3339(),
             ],
         )?;
         let id = self.conn.last_insert_rowid();
-        self.get_page(id)?.ok_or(BrainError::PageNotFound(id))
+        let created = self.get_page(id)?.ok_or(BrainError::PageNotFound(id))?;
+        self.record_revision(&created, "create")?;
+        Ok(created)
     }
 
-    /// Fetch one page by exact normalized title (case-insensitive).
+    /// Fetch one page by exact normalized title (case-insensitive), across scopes.
     pub fn get_page_by_title(&self, title: &str) -> Result<Option<MemoryPage>> {
+        self.get_page_by_title_scoped(title, None, false)
+    }
+
+    /// Fetch one page by title in the requested scope. When `strict_scope` is
+    /// false, workspace lookups may fall back to a global page with the same title.
+    pub fn get_page_by_title_scoped(
+        &self,
+        title: &str,
+        scope_id: Option<&str>,
+        strict_scope: bool,
+    ) -> Result<Option<MemoryPage>> {
         let key = title.trim().to_lowercase();
+        let scope_id = scope_id.and_then(normalize_scope_id);
+        let (sql, params): (&str, Vec<Box<dyn rusqlite::ToSql>>) = match (scope_id.as_deref(), strict_scope) {
+            (Some(scope), true) => (
+                "SELECT id, title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at
+                 FROM memory WHERE lower(trim(title)) = ?1 AND scope_kind = 'workspace' AND scope_id = ?2
+                 ORDER BY updated_at DESC, id DESC LIMIT 1",
+                vec![Box::new(key), Box::new(scope.to_owned())],
+            ),
+            (Some(scope), false) => (
+                "SELECT id, title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at
+                 FROM memory WHERE lower(trim(title)) = ?1
+                   AND ((scope_kind = 'workspace' AND scope_id = ?2) OR scope_kind = 'global')
+                 ORDER BY CASE WHEN scope_kind = 'workspace' AND scope_id = ?2 THEN 0 ELSE 1 END,
+                          updated_at DESC, id DESC LIMIT 1",
+                vec![Box::new(key), Box::new(scope.to_owned())],
+            ),
+            (None, _) => (
+                "SELECT id, title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at
+                 FROM memory WHERE lower(trim(title)) = ?1 AND scope_kind = 'global'
+                 ORDER BY updated_at DESC, id DESC LIMIT 1",
+                vec![Box::new(key)],
+            ),
+        };
+        let params_ref = params.iter().map(|p| p.as_ref()).collect::<Vec<_>>();
         self.conn
-            .query_row(
-                "SELECT id, title, memory_text, category, source, created_at, updated_at
-                 FROM memory WHERE lower(trim(title)) = ?1 ORDER BY updated_at DESC, id DESC LIMIT 1",
-                params![key],
-                row_to_page,
-            )
+            .query_row(sql, rusqlite::params_from_iter(params_ref), row_to_page)
             .optional()
             .map_err(Into::into)
     }
 
-    /// Create a page or update the existing page with the same normalized title,
+    /// Create a global page or update the existing page with the same normalized title,
     /// matching Onyx Brain's create-or-update-by-title run behavior.
     pub fn create_or_update_page_by_title(&self, page: NewPage) -> Result<MemoryPage> {
+        self.create_or_update_page_by_title_scoped(page, None)
+    }
+
+    /// Create or update a page within the requested scope.
+    pub fn create_or_update_page_by_title_scoped(
+        &self,
+        page: NewPage,
+        scope_id: Option<&str>,
+    ) -> Result<MemoryPage> {
         let title = memory_title_for_content(&page.memory_text, page.title.as_deref());
-        if let Some(existing) = self.get_page_by_title(&title)? {
+        if let Some(existing) = self.get_page_by_title_scoped(&title, scope_id, true)? {
             return self.update_page(
                 existing.id,
                 PageUpdate {
@@ -112,17 +166,20 @@ impl BrainStore {
                 },
             );
         }
-        self.create_page(NewPage {
-            title: Some(title),
-            ..page
-        })
+        self.create_page_scoped(
+            NewPage {
+                title: Some(title),
+                ..page
+            },
+            scope_id,
+        )
     }
 
     /// Fetch one page by id.
     pub fn get_page(&self, id: i64) -> Result<Option<MemoryPage>> {
         self.conn
             .query_row(
-                "SELECT id, title, memory_text, category, source, created_at, updated_at
+                "SELECT id, title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at
                  FROM memory WHERE id = ?1",
                 params![id],
                 row_to_page,
@@ -142,12 +199,28 @@ impl BrainStore {
         self.list_pages_inner(Some(category))
     }
 
+    /// List global pages plus pages matching the active workspace scope.
+    pub fn list_pages_for_scope(&self, scope_id: Option<&str>) -> Result<Vec<MemoryPage>> {
+        let Some(scope_id) = scope_id.and_then(normalize_scope_id) else {
+            return self.list_pages();
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at
+             FROM memory WHERE scope_kind = 'global' OR (scope_kind = 'workspace' AND scope_id = ?1)
+             ORDER BY CASE WHEN scope_kind = 'workspace' AND scope_id = ?1 THEN 0 ELSE 1 END,
+                      updated_at DESC, id DESC",
+        )?;
+        stmt.query_map(params![scope_id], row_to_page)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     fn list_pages_inner(&self, category: Option<MemoryCategory>) -> Result<Vec<MemoryPage>> {
         let sql = if category.is_some() {
-            "SELECT id, title, memory_text, category, source, created_at, updated_at
+            "SELECT id, title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at
              FROM memory WHERE category = ?1 ORDER BY updated_at DESC, id DESC"
         } else {
-            "SELECT id, title, memory_text, category, source, created_at, updated_at
+            "SELECT id, title, memory_text, category, scope_kind, scope_id, source, created_at, updated_at
              FROM memory ORDER BY updated_at DESC, id DESC"
         };
         let mut stmt = self.conn.prepare(sql)?;
@@ -204,7 +277,35 @@ impl BrainStore {
                 id
             ],
         )?;
-        self.get_page(id)?.ok_or(BrainError::PageNotFound(id))
+        let updated = self.get_page(id)?.ok_or(BrainError::PageNotFound(id))?;
+        self.record_revision(&updated, "update")?;
+        Ok(updated)
+    }
+
+    /// Restore a page from a recorded revision and record the restored state.
+    pub fn restore_revision(&self, revision_id: i64) -> Result<MemoryPage> {
+        let revision = self
+            .get_revision(revision_id)?
+            .ok_or(BrainError::PageNotFound(revision_id))?;
+        self.conn.execute(
+            "UPDATE memory SET title = ?1, memory_text = ?2, category = ?3,
+             scope_kind = ?4, scope_id = ?5, source = ?6, updated_at = ?7 WHERE id = ?8",
+            params![
+                revision.title,
+                revision.memory_text,
+                revision.category.as_str(),
+                revision.scope_kind.as_str(),
+                revision.scope_id,
+                revision.source,
+                Utc::now().to_rfc3339(),
+                revision.memory_id,
+            ],
+        )?;
+        let restored = self
+            .get_page(revision.memory_id)?
+            .ok_or(BrainError::PageNotFound(revision.memory_id))?;
+        self.record_revision(&restored, "restore")?;
+        Ok(restored)
     }
 
     /// Delete a page and (via cascade) its relations and sources.
@@ -368,6 +469,63 @@ impl BrainStore {
     }
 
     // -----------------------------------------------------------------------
+    // Revisions
+    // -----------------------------------------------------------------------
+
+    /// Record the current page state as a revision.
+    pub fn record_revision(
+        &self,
+        page: &MemoryPage,
+        revision_source: &str,
+    ) -> Result<MemoryRevision> {
+        let now = Utc::now();
+        self.conn.execute(
+            "INSERT INTO memory_revision
+             (memory_id, title, memory_text, category, scope_kind, scope_id, source, revision_source, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                page.id,
+                page.title,
+                page.memory_text,
+                page.category.as_str(),
+                page.scope_kind.as_str(),
+                page.scope_id,
+                page.source,
+                revision_source,
+                now.to_rfc3339(),
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.get_revision(id)?.ok_or(BrainError::PageNotFound(id))
+    }
+
+    /// List all revisions for a page, newest first.
+    pub fn revisions(&self, memory_id: i64) -> Result<Vec<MemoryRevision>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, memory_id, title, memory_text, category, scope_kind, scope_id,
+                    source, revision_source, created_at
+             FROM memory_revision WHERE memory_id = ?1 ORDER BY created_at DESC, id DESC",
+        )?;
+        stmt.query_map(params![memory_id], row_to_revision)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Get one revision by id.
+    pub fn get_revision(&self, revision_id: i64) -> Result<Option<MemoryRevision>> {
+        self.conn
+            .query_row(
+                "SELECT id, memory_id, title, memory_text, category, scope_kind, scope_id,
+                        source, revision_source, created_at
+                 FROM memory_revision WHERE id = ?1",
+                params![revision_id],
+                row_to_revision,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    // -----------------------------------------------------------------------
     // Graph query
     // -----------------------------------------------------------------------
 
@@ -417,6 +575,126 @@ impl BrainStore {
             })
             .collect();
         Ok(MemoryGraph { nodes, edges })
+    }
+
+    // -----------------------------------------------------------------------
+    // Status + recall
+    // -----------------------------------------------------------------------
+
+    /// Aggregated store status for TUI/slash-command output.
+    pub fn status(&self) -> Result<BrainStatus> {
+        let settings = self.settings()?;
+        let category_counts = self.category_counts()?;
+        let page_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory", [], |row| row.get(0))?;
+        let relation_count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM memory_relation", [], |row| row.get(0))?;
+        let source_count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM memory_source", [], |row| row.get(0))?;
+        let revision_count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM memory_revision", [], |row| row.get(0))?;
+        let global_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory WHERE scope_kind = 'global'",
+            [],
+            |row| row.get(0),
+        )?;
+        let workspace_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory WHERE scope_kind = 'workspace'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(BrainStatus {
+            settings,
+            page_count: page_count as usize,
+            relation_count: relation_count as usize,
+            source_count: source_count as usize,
+            category_counts,
+            global_count: global_count as usize,
+            workspace_count: workspace_count as usize,
+            revision_count: revision_count as usize,
+        })
+    }
+
+    /// Query-aware recall over global + active workspace pages.
+    pub fn recall_pages(&self, options: RecallOptions) -> Result<Vec<RecalledMemoryPage>> {
+        let limit = if options.limit == 0 {
+            20
+        } else {
+            options.limit
+        };
+        let pages = self.list_pages_for_scope(options.workspace_scope.as_deref())?;
+        let query_terms = tokenize_query(&options.query);
+        let workspace = options
+            .workspace_scope
+            .and_then(|scope| normalize_scope_id(&scope));
+        let mut scored = Vec::new();
+        for (recency_rank, page) in pages.into_iter().enumerate() {
+            let source_labels = self
+                .sources(page.id)?
+                .into_iter()
+                .map(|source| source.label)
+                .filter(|label| !label.trim().is_empty())
+                .collect::<Vec<_>>();
+            let mut score = 0i64;
+            let title = page.title.to_ascii_lowercase();
+            let body = page.memory_text.to_ascii_lowercase();
+            let category = page.category.as_str();
+            for term in &query_terms {
+                if title.contains(term) {
+                    score += 12;
+                }
+                if category.contains(term) {
+                    score += 6;
+                }
+                if body.contains(term) {
+                    score += 3;
+                }
+            }
+            if let Some(scope) = workspace.as_deref()
+                && page.scope_kind == MemoryScopeKind::Workspace
+                && page.scope_id.as_deref() == Some(scope)
+            {
+                score += 40;
+            }
+            if always_include_global_preference(&page) {
+                score += 25;
+            }
+            score += (100 - recency_rank.min(100)) as i64;
+            scored.push(RecalledMemoryPage {
+                page,
+                score,
+                source_labels,
+            });
+        }
+        sort_recalled_pages(&mut scored);
+        let always_include = scored
+            .iter()
+            .filter(|recalled| always_include_global_preference(&recalled.page))
+            .cloned()
+            .collect::<Vec<_>>();
+        if scored.len() > limit {
+            scored.truncate(limit);
+            for recalled in always_include {
+                if scored
+                    .iter()
+                    .any(|selected| selected.page.id == recalled.page.id)
+                {
+                    continue;
+                }
+                if let Some(replace_idx) = scored
+                    .iter()
+                    .rposition(|selected| !always_include_global_preference(&selected.page))
+                {
+                    scored[replace_idx] = recalled;
+                }
+            }
+            sort_recalled_pages(&mut scored);
+        }
+        Ok(scored)
     }
 
     // -----------------------------------------------------------------------
@@ -511,14 +789,17 @@ fn ordered_pair(a: i64, b: i64) -> (i64, i64) {
 
 fn row_to_page(row: &Row<'_>) -> rusqlite::Result<MemoryPage> {
     let category_raw: String = row.get(3)?;
+    let scope_raw: String = row.get(4)?;
     Ok(MemoryPage {
         id: row.get(0)?,
         title: row.get(1)?,
         memory_text: row.get(2)?,
         category: MemoryCategory::parse(&category_raw).unwrap_or(MemoryCategory::Notes),
-        source: row.get(4)?,
-        created_at: parse_ts(row.get::<_, String>(5)?),
-        updated_at: parse_ts(row.get::<_, String>(6)?),
+        scope_kind: MemoryScopeKind::parse(&scope_raw),
+        scope_id: row.get(5)?,
+        source: row.get(6)?,
+        created_at: parse_ts(row.get::<_, String>(7)?),
+        updated_at: parse_ts(row.get::<_, String>(8)?),
     })
 }
 
@@ -533,6 +814,106 @@ fn row_to_source(row: &Row<'_>) -> rusqlite::Result<MemorySource> {
         url: row.get(5)?,
         created_at: parse_ts(row.get::<_, String>(6)?),
     })
+}
+
+fn row_to_revision(row: &Row<'_>) -> rusqlite::Result<MemoryRevision> {
+    let category_raw: String = row.get(4)?;
+    let scope_raw: String = row.get(5)?;
+    Ok(MemoryRevision {
+        id: row.get(0)?,
+        memory_id: row.get(1)?,
+        title: row.get(2)?,
+        memory_text: row.get(3)?,
+        category: MemoryCategory::parse(&category_raw).unwrap_or(MemoryCategory::Notes),
+        scope_kind: MemoryScopeKind::parse(&scope_raw),
+        scope_id: row.get(6)?,
+        source: row.get(7)?,
+        revision_source: row.get(8)?,
+        created_at: parse_ts(row.get::<_, String>(9)?),
+    })
+}
+
+fn sort_recalled_pages(pages: &mut [RecalledMemoryPage]) {
+    pages.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.page.updated_at.cmp(&a.page.updated_at))
+            .then_with(|| b.page.id.cmp(&a.page.id))
+    });
+}
+
+fn normalize_scope_id(scope_id: &str) -> Option<String> {
+    let trimmed = scope_id.trim();
+    (!trimmed.is_empty()).then(|| trimmed.trim_end_matches('/').to_owned())
+}
+
+fn tokenize_query(query: &str) -> Vec<String> {
+    query
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|term| term.len() >= 3)
+        .take(24)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn always_include_global_preference(page: &MemoryPage) -> bool {
+    if page.scope_kind != MemoryScopeKind::Global {
+        return false;
+    }
+    let text = format!("{} {}", page.title, page.memory_text).to_ascii_lowercase();
+    page.category == MemoryCategory::Notes
+        || text.contains("user preference")
+        || text.contains("the user prefers")
+        || text.contains("shell")
+        || text.contains("path preference")
+}
+
+fn migrate_schema(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "memory",
+        "scope_kind",
+        "TEXT NOT NULL DEFAULT 'global'",
+    )?;
+    add_column_if_missing(conn, "memory", "scope_id", "TEXT")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_revision (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            memory_text TEXT NOT NULL,
+            category TEXT NOT NULL,
+            scope_kind TEXT NOT NULL DEFAULT 'global',
+            scope_id TEXT,
+            source TEXT,
+            revision_source TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_memory_scope ON memory(scope_kind, scope_id);
+        CREATE INDEX IF NOT EXISTS ix_memory_revision_memory ON memory_revision(memory_id);",
+    )?;
+    Ok(())
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|name| name == column);
+    if !exists {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+        ))?;
+    }
+    Ok(())
 }
 
 fn parse_ts(raw: String) -> DateTime<Utc> {
@@ -551,6 +932,8 @@ CREATE TABLE IF NOT EXISTS memory (
     title TEXT NOT NULL,
     memory_text TEXT NOT NULL,
     category TEXT NOT NULL,
+    scope_kind TEXT NOT NULL DEFAULT 'global',
+    scope_id TEXT,
     source TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -575,6 +958,20 @@ CREATE TABLE IF NOT EXISTS memory_source (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_memory_source_memory ON memory_source(memory_id);
+
+CREATE TABLE IF NOT EXISTS memory_revision (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    memory_text TEXT NOT NULL,
+    category TEXT NOT NULL,
+    scope_kind TEXT NOT NULL DEFAULT 'global',
+    scope_id TEXT,
+    source TEXT,
+    revision_source TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_memory_revision_memory ON memory_revision(memory_id);
 
 CREATE TABLE IF NOT EXISTS brain_settings (
     id INTEGER PRIMARY KEY CHECK (id = 1),

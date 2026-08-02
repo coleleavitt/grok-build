@@ -61,6 +61,10 @@ pub struct ResumeSourceData {
     /// Used by the shell for resume model pinning (model overrides on
     /// resume are soft-ignored, not identity-gated).
     pub model_id: Option<String>,
+    /// Best known token footprint of the completed source transcript.
+    /// Used by advisor preflight so `resume_from` cannot bypass per-session
+    /// budget before the source transcript is copied into the new child.
+    pub tokens_used: u64,
     /// Effective cwd the source child used. Consumed by the shell's
     /// spawn orchestration to reconstruct `SessionInfo` for raw
     /// transcript continuation and worktree reuse.

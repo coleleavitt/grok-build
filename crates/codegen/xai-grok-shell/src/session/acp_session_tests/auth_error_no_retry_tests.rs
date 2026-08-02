@@ -199,12 +199,10 @@ async fn sampler_401_recovery_returns_refresh_and_retry() {
             assert!(
                 matches!(
                     result,
-                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
-                        store: RecoveredStore::SessionToken,
-                        ..
-                    })
+                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit(reason))
+                        if reason.status_code == Some(401)
                 ),
-                "session-based auth with a working refresher must return RefreshAuthAndResubmit"
+                "session-based auth with a working refresher must return RefreshAuthAndResubmit with 401 status"
             );
             assert!(called.load(Ordering::SeqCst), "refresher must be invoked");
         })
@@ -745,10 +743,10 @@ fn session_token_auth_gate_truth_table() {
         assert!(!gate(false, ModelByok::NotByok, fp));
         assert!(!gate(false, ModelByok::Byok, fp));
         assert!(!gate(false, ModelByok::Unknown, fp));
-        // Session method: a definite classification ignores the endpoint —
-        // NotByok always refreshes (only ever routes to the session endpoint),
-        // a genuine per-model Byok never does.
-        assert!(gate(true, ModelByok::NotByok, fp));
+        // Session method: refresh only on first-party endpoints. A missing
+        // plugin model lookup can look like NotByok; never leak the session
+        // token to third-party provider URLs.
+        assert_eq!(gate(true, ModelByok::NotByok, fp), fp);
         assert!(!gate(true, ModelByok::Byok, fp));
     }
     // Session method + Unknown BYOK: refresh only against a first-party xAI
@@ -785,7 +783,8 @@ async fn sampler_401_session_method_with_stale_api_key_auth_type_still_recovers(
             assert!(
                 matches!(
                     result,
-                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit { .. })
+                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit(reason))
+                        if reason.status_code == Some(401)
                 ),
                 "session-based method must recover even when auth_type transiently reads ApiKey"
             );
@@ -822,7 +821,8 @@ async fn sampler_401_oidc_method_with_stale_api_key_auth_type_still_recovers() {
             assert!(
                 matches!(
                     result,
-                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit { .. })
+                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit(reason))
+                        if reason.status_code == Some(401)
                 ),
                 "oidc method must recover even when auth_type transiently reads ApiKey"
             );
@@ -1171,6 +1171,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 compactions_remaining: None,
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
+                advisor_server_model: None,
                 provider_request_adapter: None,
                 header_injector: None,
             };
@@ -1186,339 +1187,188 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
         })
         .await;
 }
+// ---------------------------------------------------------------------------
+// G002 adversarial QA: `reconstruct_full_config`'s `advisor_server_model` wiring
+// ---------------------------------------------------------------------------
+//
+// `advisor_server_model` is `(server_advisor && Messages && anthropic-adapter &&
+// auth_scheme==Bearer).then(|| cfg.model.clone())` (sampler_turn.rs). `Bearer`
+// is `AuthScheme`'s `#[default]` variant, so a fresh `ModelAuthFacts` memo
+// (unknown model / no auth_manager, as `create_test_actor` builds) already
+// resolves `auth_scheme == Bearer` without any live Anthropic OAuth
+// credential -- `anthropic_live_credential()` (a process-global `OnceLock`
+// seeded from real env/disk state) only ever *overrides* `auth_scheme` to
+// `XApiKey` (static key) when reachable; absent, it leaves the default
+// `Bearer` untouched. That makes the positive leg genuinely reachable
+// end-to-end here. The `auth_scheme != Bearer` leg is instead forced
+// hermetically via the `model_auth_facts` test-only memo (mirroring
+// `model_auth_facts_memo_serves_cached_status_and_keys_on_model` above),
+// since flipping it via the live-credential branch is not test-controllable
+// without touching the (frozen) implementation. These four tests cover the
+// full AND end-to-end through the real `SessionActor::reconstruct_full_config`,
+// cross-checked against the sampler-side `advisor_probe` matrix in
+// `xai-grok-sampler`'s `client.rs`.
 
-use crate::auth::test_counting_provider as counting_provider;
-
-/// Seed the per-model memo so `model_auth_provider` resolves without a
-/// config load.
-async fn seed_provider_memo(actor: &Arc<SessionActor>, provider: crate::auth::AuthProviderRef) {
-    let model = actor
-        .chat_state_handle
-        .get_sampling_config()
-        .await
-        .map(|c| c.model)
-        .unwrap_or_default();
-    actor
-        .model_auth_memo
-        .replace(Some(crate::session::acp_session::ModelAuthMemo {
-            model_id: model,
-            facts: crate::agent::config::ModelAuthFacts {
-                byok: crate::agent::auth_method::ModelByok::Byok,
-                auth_scheme: Default::default(),
-            },
-            provider: Some(provider),
-        }));
-}
-
-/// Regression: switching from a provider-backed model to a first-party model
-/// must drop the minted provider token from the chat credentials, so it can
-/// never ride a later request to `api.x.ai`. Mirrors the forward direction in
-/// `set_session_model_invalidates_byok_memo_for_same_model_id`.
+/// Positive: `server_advisor: true` + `Messages` + anthropic adapter + the
+/// default (`Bearer`) auth scheme together produce `advisor_server_model ==
+/// Some(model)` -- the model must be threaded through, not hardcoded.
 #[tokio::test(flavor = "current_thread")]
-async fn switch_to_first_party_model_drops_minted_provider_token() {
+async fn advisor_server_model_present_when_all_axes_align() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let dir = tempfile::tempdir().unwrap();
-            let provider = counting_provider("hall-pass", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
-            assert_eq!(token, "tok-1");
-
-            let (actor, _rx) =
-                make_actor_with_auth_and_credentials(None, xai_chat_state::AuthType::ApiKey, token)
-                    .await;
-            seed_provider_memo(&actor, provider).await;
-
-            let model = actor
+            let (mut actor, _rx) = {
+                let (gateway_tx, _) = mpsc::unbounded_channel();
+                let (persistence_tx, persistence_rx) = mpsc::unbounded_channel();
+                let actor =
+                    create_test_actor(50_000, 100_000, 85, gateway_tx, persistence_tx).await;
+                (actor, persistence_rx)
+            };
+            actor.server_advisor = true;
+            let mut slim = actor
                 .chat_state_handle
                 .get_sampling_config()
                 .await
-                .map(|c| c.model)
-                .unwrap_or_default();
+                .expect("test actor has a sampling config");
+            slim.api_backend = xai_grok_sampler::ApiBackend::Messages;
+            slim.provider_request_adapter =
+                Some(xai_grok_sampling_types::ProviderRequestAdapter::Anthropic {
+                    tool_name_prefix: "mcp__".to_string(),
+                    command: None,
+                });
+            actor.chat_state_handle.update_sampling_config(slim.clone());
 
-            let cfg = xai_grok_sampler::SamplerConfig {
-                api_key: Some("session-jwt".to_string()),
-                base_url: "https://api.x.ai/v1".to_string(),
-                model,
-                max_completion_tokens: None,
-                temperature: None,
-                top_p: None,
-                api_backend: crate::sampling::ApiBackend::ChatCompletions,
-                auth_scheme: Default::default(),
-                extra_headers: Default::default(),
-                query_params: Default::default(),
-                env_http_headers: Default::default(),
-                context_window: 256_000,
-                client_version: None,
-                force_http1: false,
-                max_retries: None,
-                stream_tool_calls: false,
-                idle_timeout_secs: None,
-                client_identifier: None,
-                reasoning_effort: None,
-                deployment_id: None,
-                user_id: None,
-                origin_client: None,
-                attribution_callback: None,
-                bearer_resolver: None,
-                supports_backend_search: false,
-                compactions_remaining: None,
-                compaction_at_tokens: None,
-                doom_loop_recovery: None,
-                header_injector: None,
+            let cfg = actor.reconstruct_full_config().await;
+
+            assert_eq!(
+                cfg.advisor_server_model,
+                Some(slim.model.clone()),
+                "server_advisor + Messages + anthropic adapter + default Bearer scheme \
+                 must produce advisor_server_model = Some(the active model)"
+            );
+        })
+        .await;
+}
+
+/// `server_advisor: false` must suppress `advisor_server_model` even when the
+/// backend/adapter shape would otherwise be eligible.
+#[tokio::test(flavor = "current_thread")]
+async fn advisor_server_model_none_when_server_advisor_flag_is_false() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut actor, _rx) = {
+                let (gateway_tx, _) = mpsc::unbounded_channel();
+                let (persistence_tx, persistence_rx) = mpsc::unbounded_channel();
+                let actor = create_test_actor(50_000, 100_000, 85, gateway_tx, persistence_tx).await;
+                (actor, persistence_rx)
             };
-            let _ = actor
-                .handle_set_session_model(cfg, false, false, true, 85)
-                .await;
+            actor.server_advisor = false;
+            let mut slim = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor has a sampling config");
+            slim.api_backend = xai_grok_sampler::ApiBackend::Messages;
+            slim.provider_request_adapter = Some(xai_grok_sampling_types::ProviderRequestAdapter::Anthropic {
+                tool_name_prefix: "mcp__".to_string(),
+                command: None,
+            });
+            actor.chat_state_handle.update_sampling_config(slim);
 
-            let creds = actor.chat_state_handle.get_credentials().await;
+            let cfg = actor.reconstruct_full_config().await;
+
             assert_eq!(
-                creds.api_key.as_deref(),
-                Some("session-jwt"),
-                "switching to a first-party model must install the session credential, \
-                 not the minted provider token"
+                cfg.advisor_server_model, None,
+                "server_advisor=false must suppress advisor_server_model regardless of backend/adapter shape"
             );
         })
         .await;
 }
 
-/// Arm 4c: a 401 on a provider-backed model re-mints once and resubmits.
+/// A non-`Messages` backend must suppress `advisor_server_model` even with
+/// `server_advisor: true` and an anthropic adapter configured.
 #[tokio::test(flavor = "current_thread")]
-async fn sampler_401_on_provider_model_remints_and_resubmits() {
+async fn advisor_server_model_none_when_backend_is_not_messages() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let dir = tempfile::tempdir().unwrap();
-            let provider = counting_provider("test-4c-recover", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
-            assert_eq!(token, "tok-1");
+            let (mut actor, _rx) = {
+                let (gateway_tx, _) = mpsc::unbounded_channel();
+                let (persistence_tx, persistence_rx) = mpsc::unbounded_channel();
+                let actor = create_test_actor(50_000, 100_000, 85, gateway_tx, persistence_tx).await;
+                (actor, persistence_rx)
+            };
+            actor.server_advisor = true;
+            let mut slim = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor has a sampling config");
+            slim.api_backend = xai_grok_sampler::ApiBackend::ChatCompletions;
+            slim.provider_request_adapter = Some(xai_grok_sampling_types::ProviderRequestAdapter::Anthropic {
+                tool_name_prefix: "mcp__".to_string(),
+                command: None,
+            });
+            actor.chat_state_handle.update_sampling_config(slim);
 
-            let (actor, _rx) =
-                make_actor_with_auth_and_credentials(None, xai_chat_state::AuthType::ApiKey, token)
-                    .await;
-            seed_provider_memo(&actor, provider).await;
-            crate::auth::test_backdate_provider_mint(
-                "test-4c-recover",
-                std::time::Duration::from_secs(60),
-            );
+            let cfg = actor.reconstruct_full_config().await;
 
-            let result = actor.handle_sampling_failure(auth_error()).await;
-            assert!(
-                matches!(
-                    result,
-                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
-                        store: RecoveredStore::AuthProvider,
-                        ..
-                    })
-                ),
-                "provider 401 must re-mint and resubmit via the provider store"
-            );
-            let creds = actor.chat_state_handle.get_credentials().await;
             assert_eq!(
-                creds.api_key.as_deref(),
-                Some("tok-2"),
-                "chat-state credentials must carry the re-minted token"
+                cfg.advisor_server_model, None,
+                "a non-Messages backend must suppress advisor_server_model even with server_advisor=true"
             );
         })
         .await;
 }
 
-/// Arm 4c also fires for a bare 401 that did not classify as `Auth`-kind.
+/// Negative: forcing `auth_scheme: XApiKey` via the `model_auth_facts` memo
+/// (the one axis the live-credential branch would otherwise flip, made
+/// hermetic here) must suppress `advisor_server_model` even with
+/// `server_advisor: true`, `Messages`, and an anthropic adapter all set --
+/// a single wrong axis suppresses the whole gate.
 #[tokio::test(flavor = "current_thread")]
-async fn sampler_non_auth_kind_401_on_provider_model_still_recovers() {
+async fn advisor_server_model_none_when_auth_scheme_is_not_bearer() {
+    use crate::agent::auth_method::ModelByok;
+    use crate::agent::config::ModelAuthFacts;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let dir = tempfile::tempdir().unwrap();
-            let provider = counting_provider("test-4c-non-auth-kind", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
-
-            let (actor, _rx) =
-                make_actor_with_auth_and_credentials(None, xai_chat_state::AuthType::ApiKey, token)
-                    .await;
-            seed_provider_memo(&actor, provider).await;
-            crate::auth::test_backdate_provider_mint(
-                "test-4c-non-auth-kind",
-                std::time::Duration::from_secs(60),
-            );
-
-            let mut error = auth_error();
-            error.kind = xai_grok_sampler::SamplingErrorKind::Api;
-            let result = actor.handle_sampling_failure(error).await;
-            assert!(
-                matches!(
-                    result,
-                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit { .. })
-                ),
-                "a non-Auth-kind 401 on a provider model must still recover via 4c"
-            );
-            let creds = actor.chat_state_handle.get_credentials().await;
-            assert_eq!(creds.api_key.as_deref(), Some("tok-2"));
-        })
-        .await;
-}
-
-/// A 401 on a request that went out with no key mints instead of
-/// recovering.
-#[tokio::test(flavor = "current_thread")]
-async fn sampler_401_with_no_key_on_provider_model_mints_and_resubmits() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let dir = tempfile::tempdir().unwrap();
-            let provider = counting_provider("test-4c-no-key", dir.path());
-
-            let (actor, _rx) = make_actor_with_auth_and_credentials(
-                None,
-                xai_chat_state::AuthType::ApiKey,
-                "placeholder".to_string(),
-            )
-            .await;
-            let mut creds = actor.chat_state_handle.get_credentials().await;
-            creds.api_key = None;
-            actor.chat_state_handle.update_credentials(creds);
-            seed_provider_memo(&actor, provider).await;
-
-            let result = actor.handle_sampling_failure(auth_error()).await;
-            assert!(
-                matches!(
-                    result,
-                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit { .. })
-                ),
-                "an unauthenticated 401 on a provider model must mint and resubmit"
-            );
-            let creds = actor.chat_state_handle.get_credentials().await;
-            assert_eq!(creds.api_key.as_deref(), Some("tok-1"));
-        })
-        .await;
-}
-
-/// A provider model's 401 goes through the provider, never the session
-/// refresher (4a/4b vs 4c exclusivity). The actor uses a session-based method,
-/// so the gate would be active for a non-BYOK model; the BYOK memo is what
-/// shadows it, which is the invariant under test.
-#[tokio::test(flavor = "current_thread")]
-async fn sampler_401_on_provider_model_never_refreshes_session() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let dir = tempfile::tempdir().unwrap();
-            let provider = counting_provider("test-4c-exclusive", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
-
-            let called = Arc::new(AtomicBool::new(false));
-            let refresher: Arc<dyn crate::auth::refresh::TokenRefresher> =
-                Arc::new(AlwaysSucceedRefresher {
-                    called: called.clone(),
+            let (mut actor, _rx) = {
+                let (gateway_tx, _) = mpsc::unbounded_channel();
+                let (persistence_tx, persistence_rx) = mpsc::unbounded_channel();
+                let actor =
+                    create_test_actor(50_000, 100_000, 85, gateway_tx, persistence_tx).await;
+                (actor, persistence_rx)
+            };
+            actor.server_advisor = true;
+            let mut slim = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor has a sampling config");
+            slim.api_backend = xai_grok_sampler::ApiBackend::Messages;
+            slim.provider_request_adapter =
+                Some(xai_grok_sampling_types::ProviderRequestAdapter::Anthropic {
+                    tool_name_prefix: "mcp__".to_string(),
+                    command: None,
                 });
-            let (_dir, am) = auth_manager_with_refresher(refresher);
-            let (actor, _rx) = make_actor_with_method_and_credentials(
-                Some(am),
-                "cached_token",
-                xai_chat_state::AuthType::SessionToken,
-                token,
-            )
-            .await;
-            seed_provider_memo(&actor, provider).await;
-            crate::auth::test_backdate_provider_mint(
-                "test-4c-exclusive",
-                std::time::Duration::from_secs(60),
-            );
+            let model = slim.model.clone();
+            actor.chat_state_handle.update_sampling_config(slim);
+            actor.model_auth_facts.replace(Some((
+                model,
+                ModelAuthFacts {
+                    byok: ModelByok::Byok,
+                    auth_scheme: xai_grok_sampler::AuthScheme::XApiKey,
+                },
+            )));
 
-            let result = actor.handle_sampling_failure(auth_error()).await;
-            assert!(
-                matches!(
-                    result,
-                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit { .. })
-                ),
-                "the provider arm must recover"
-            );
-            assert!(
-                !called.load(Ordering::SeqCst),
-                "session refresh must never fire for a provider-backed model"
-            );
-            let creds = actor.chat_state_handle.get_credentials().await;
-            assert_eq!(creds.api_key.as_deref(), Some("tok-2"));
-        })
-        .await;
-}
+            let cfg = actor.reconstruct_full_config().await;
 
-/// The pre-turn mirror of the exclusivity test: a cold cache mints the
-/// provider token into chat-state, and the session refresher never fires. The
-/// actor uses a session-based method, so the gate would be active for a
-/// non-BYOK model; the BYOK memo is what keeps the refresher silent.
-#[tokio::test(flavor = "current_thread")]
-async fn pre_turn_on_provider_model_never_installs_session_token() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let dir = tempfile::tempdir().unwrap();
-            let provider = counting_provider("test-preturn-exclusive", dir.path());
-
-            let called = Arc::new(AtomicBool::new(false));
-            let refresher: Arc<dyn crate::auth::refresh::TokenRefresher> =
-                Arc::new(AlwaysSucceedRefresher {
-                    called: called.clone(),
-                });
-            let (_dir, am) = auth_manager_with_refresher(refresher);
-            let (actor, _rx) = make_actor_with_method_and_credentials(
-                Some(am),
-                "cached_token",
-                xai_chat_state::AuthType::SessionToken,
-                "placeholder".to_string(),
-            )
-            .await;
-            // Cold cache: no key on the wire yet.
-            let mut creds = actor.chat_state_handle.get_credentials().await;
-            creds.api_key = None;
-            actor.chat_state_handle.update_credentials(creds);
-            seed_provider_memo(&actor, provider).await;
-
-            actor.refresh_token_if_expired().await;
-
-            let creds = actor.chat_state_handle.get_credentials().await;
             assert_eq!(
-                creds.api_key.as_deref(),
-                Some("tok-1"),
-                "the cold pre-turn hook must mint the provider token"
-            );
-            assert!(
-                !called.load(Ordering::SeqCst),
-                "the session refresher must never fire for a provider-backed model"
-            );
-        })
-        .await;
-}
-
-/// A token rejected moments after mint surfaces the 401 (fresh-mint
-/// guard).
-#[tokio::test(flavor = "current_thread")]
-async fn sampler_401_on_fresh_provider_token_surfaces_error() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let dir = tempfile::tempdir().unwrap();
-            let provider = counting_provider("test-4c-guard", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
-
-            let (actor, _rx) = make_actor_with_auth_and_credentials(
-                None,
-                xai_chat_state::AuthType::ApiKey,
-                token.clone(),
-            )
-            .await;
-            seed_provider_memo(&actor, provider).await;
-
-            let result = actor.handle_sampling_failure(auth_error()).await;
-            assert!(
-                result.is_err(),
-                "a fresh-minted rejected token must surface the 401, not loop"
-            );
-            let creds = actor.chat_state_handle.get_credentials().await;
-            assert_eq!(
-                creds.api_key.as_deref(),
-                Some(token.as_str()),
-                "credentials must be unchanged when the guard blocks the re-mint"
+                cfg.advisor_server_model, None,
+                "auth_scheme=XApiKey must suppress advisor_server_model even with \
+                 server_advisor/Messages/anthropic-adapter all set"
             );
         })
         .await;

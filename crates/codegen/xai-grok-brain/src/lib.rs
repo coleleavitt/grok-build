@@ -20,24 +20,29 @@ mod tests;
 mod types;
 
 pub use backfill::{
-    BackfillSelection, PersistedBrainSession, BRAIN_LOOKBACK_DAYS, BRAIN_MAX_CHARS_PER_MESSAGE,
-    BRAIN_MAX_DOCS, BRAIN_MAX_MESSAGES_PER_SESSION, BRAIN_MAX_SESSIONS_PER_RUN,
-    BRAIN_MAX_TRANSCRIPT_CHARS, build_bounded_run_context, read_bounded_run_context,
+    BRAIN_LOOKBACK_DAYS, BRAIN_MAX_CHARS_PER_MESSAGE, BRAIN_MAX_DOCS,
+    BRAIN_MAX_MESSAGES_PER_SESSION, BRAIN_MAX_SESSIONS_PER_RUN, BRAIN_MAX_TRANSCRIPT_CHARS,
+    BackfillSelection, PersistedBrainSession, build_bounded_run_context, read_bounded_run_context,
     read_persisted_sessions,
 };
-pub use service::{BrainBackfillOutcome, BrainRequest, BrainRequestOutcome, BrainService, default_store_path};
+pub use service::{
+    BrainBackfillOutcome, BrainRequest, BrainRequestOutcome, BrainService, default_store_path,
+};
 pub use store::BrainStore;
 pub use types::{
-    BrainSettings, BrainSettingsUpdate, MemoryCategory, MemoryGraph, MemoryGraphEdge,
-    MemoryGraphNode, MemoryPage, MemorySource, MemorySourceType, NewPage, PageUpdate, RelatedPages,
+    BrainSettings, BrainSettingsUpdate, BrainStatus, MemoryCategory, MemoryGraph, MemoryGraphEdge,
+    MemoryGraphNode, MemoryPage, MemoryRevision, MemoryScopeKind, MemorySource, MemorySourceType,
+    NewPage, PageUpdate, RecallOptions, RecalledMemoryPage, RelatedPages,
 };
 
 pub mod engine {
     //! Self-improvement run: context building, extraction, and application.
     pub use crate::engine_impl::{
         BRAIN_MAX_PAGES_PER_RUN, BRAIN_MAX_SOURCES_PER_PAGE, BRAIN_SOURCE, DocumentSource,
-        ExtractedPage, ExtractionInput, ExtractionProvider, RunContext, RunOutcome, SessionSource,
-        SourceRef, normalize_source_ref, run_self_improvement,
+        ExtractedPage, ExtractionInput, ExtractionProvider, PreparedRunOutcome,
+        PreparedSelfImprovementRun, RunContext, RunOutcome, SessionSource, SourceRef,
+        complete_self_improvement, normalize_source_ref, prepare_self_improvement,
+        run_self_improvement,
     };
 }
 

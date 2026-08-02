@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 /// (sticky) rather than re-sorting the pool.
 const STICKY_HEALTH_THRESHOLD: i32 = 3;
 
-/// Environment overrides for the store path, in precedence order.
-const PATH_ENV_VARS: [&str; 2] = ["ANTHROPIC_ACCOUNTS_PATH", "JFC_ANTHROPIC_ACCOUNTS_PATH"];
+/// The opencode-compatible account file Grok/JFC share inside the neutral
+/// Anthropic account directory.
+const SHARED_STORE_FILE_NAME: &str = "anthropic-accounts.json";
 
 /// The root of the persisted credential file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,12 +81,11 @@ impl AccountData {
         if pool.is_empty() {
             return None;
         }
-        if let Some(active) = self.active_index.and_then(|_| self.active()) {
-            if active.health_score() >= STICKY_HEALTH_THRESHOLD
-                && pool.iter().any(|a| a.name == active.name)
-            {
-                return Some(active);
-            }
+        if let Some(active) = self.active_index.and_then(|_| self.active())
+            && active.health_score() >= STICKY_HEALTH_THRESHOLD
+            && pool.iter().any(|a| a.name == active.name)
+        {
+            return Some(active);
         }
         // Prefer higher health, then higher tier, then lexicographically
         // smaller name. `max_by` treats "greater" as preferred, so the name
@@ -111,8 +111,8 @@ impl AccountStore {
         Self { path: path.into() }
     }
 
-    /// Store at the path resolved from the environment, falling back to
-    /// `$XDG_CONFIG_HOME/jfc/anthropic-accounts.json` (then `$HOME/.config/…`).
+    /// Store at the shared Anthropic account path, adopting a live legacy
+    /// Grok/JFC/opencode store first when the shared file is missing or dead.
     pub fn from_env() -> Self {
         Self {
             path: resolve_store_path(),
@@ -147,18 +147,17 @@ impl AccountStore {
     /// symlink or to wipe the last account.
     pub fn save(&self, data: &AccountData) -> Result<()> {
         // Auth-loss guard: never turn a non-empty store into an empty one.
-        if data.accounts.is_empty() {
-            if let Ok(existing) = self.load() {
-                if !existing.accounts.is_empty() {
-                    return Err(AnthropicAuthError::WouldDeleteAllAccounts);
-                }
-            }
+        if data.accounts.is_empty()
+            && let Ok(existing) = self.load()
+            && !existing.accounts.is_empty()
+        {
+            return Err(AnthropicAuthError::WouldDeleteAllAccounts);
         }
         // Symlink guard on an existing target.
-        if let Ok(meta) = std::fs::symlink_metadata(&self.path) {
-            if meta.file_type().is_symlink() {
-                return Err(AnthropicAuthError::StoreIsSymlink);
-            }
+        if let Ok(meta) = std::fs::symlink_metadata(&self.path)
+            && meta.file_type().is_symlink()
+        {
+            return Err(AnthropicAuthError::StoreIsSymlink);
         }
         if let Some(parent) = self.path.parent() {
             create_dir_private(parent)?;
@@ -198,27 +197,109 @@ impl AccountStore {
     }
 }
 
-/// Resolve the store path from the environment, then the XDG/HOME default.
+/// Resolve the store path from the shared SDK env override, then the neutral
+/// `$HOME/.anthropic-accounts/anthropic-accounts.json` location.
 fn resolve_store_path() -> PathBuf {
-    for var in PATH_ENV_VARS {
-        if let Ok(value) = std::env::var(var) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return PathBuf::from(value);
-            }
-        }
+    if let Some(explicit) =
+        std::env::var_os(anthropic::store::STORE_FILE_ENV).filter(|v| !v.is_empty())
+    {
+        return PathBuf::from(explicit);
     }
-    let config_base = std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+    let home = home_dir();
+    migrate_legacy_store(&home);
+    shared_store_path(&home)
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".config"))
+            std::env::var_os("USERPROFILE")
+                .filter(|h| !h.is_empty())
+                .map(PathBuf::from)
         })
-        .unwrap_or_else(|| PathBuf::from(".config"));
-    config_base.join("jfc").join("anthropic-accounts.json")
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn shared_store_path(home: &Path) -> PathBuf {
+    home.join(anthropic::store::STORE_DIR_NAME)
+        .join(SHARED_STORE_FILE_NAME)
+}
+
+fn legacy_store_paths(home: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(grok_home) = std::env::var_os("GROK_HOME").filter(|v| !v.is_empty()) {
+        paths.push(PathBuf::from(grok_home).join(SHARED_STORE_FILE_NAME));
+    }
+    paths.push(home.join(".grok").join(SHARED_STORE_FILE_NAME));
+    paths.push(
+        home.join(".config")
+            .join("jfc")
+            .join(SHARED_STORE_FILE_NAME),
+    );
+    paths.push(
+        home.join(".config")
+            .join("opencode")
+            .join(SHARED_STORE_FILE_NAME),
+    );
+    paths
+}
+
+fn store_usable_account_count(path: &Path) -> usize {
+    AccountStore::at(path)
+        .load()
+        .map(|data| {
+            data.accounts
+                .iter()
+                .filter(|a| a.is_enabled() && !a.refresh_token.expose().is_empty())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn migrate_legacy_store(home: &Path) {
+    let shared = shared_store_path(home);
+    if store_usable_account_count(&shared) > 0 {
+        return;
+    }
+
+    let Some((usable, source)) = legacy_store_paths(home)
+        .into_iter()
+        .filter(|path| path != &shared)
+        .map(|path| (store_usable_account_count(&path), path))
+        .filter(|(usable, _)| *usable > 0)
+        .max_by_key(|(usable, _)| *usable)
+    else {
+        return;
+    };
+
+    if shared.exists() {
+        let backup = shared.with_extension(format!(
+            "json.bak-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default()
+        ));
+        if std::fs::copy(&shared, backup).is_err() {
+            return;
+        }
+    }
+
+    copy_store_into_shared(&source, &shared, usable);
+}
+
+fn copy_store_into_shared(source: &Path, shared: &Path, _usable: usize) {
+    let Some(parent) = shared.parent() else {
+        return;
+    };
+    if create_dir_private(parent).is_err() {
+        return;
+    }
+    if std::fs::copy(source, shared).is_ok() {
+        set_file_private(shared);
+    }
 }
 
 #[cfg(unix)]
@@ -294,6 +375,19 @@ mod tests {
         a
     }
 
+    fn temp_home(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "grok-anthropic-auth-home-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn select_prefers_request_ready_and_is_sticky_when_healthy() {
         let mut data = AccountData::default();
@@ -314,6 +408,22 @@ mod tests {
             chosen.name, "a",
             "implicit index 0 is a display fallback, not a rotation pin"
         );
+    }
+
+    #[test]
+    fn select_deprioritizes_recent_rate_limited_account() {
+        let mut data = AccountData::default();
+        let mut rate_limited = ready_account("a-rate-limited");
+        rate_limited.unified_status = Some(RoutingStatus::Rejected);
+        rate_limited.rate_limit_reset_time = Some(0);
+        rate_limited.last_auth_error = Some("429 rate_limit_error".to_owned());
+        let mut clean = ready_account("b-clean");
+        clean.unified_status = Some(RoutingStatus::Rejected);
+        clean.rate_limit_reset_time = Some(0);
+        data.accounts.push(rate_limited);
+        data.accounts.push(clean);
+
+        assert_eq!(data.select(now()).unwrap().name, "b-clean");
     }
 
     #[test]
@@ -366,5 +476,63 @@ mod tests {
         let data = store.load().unwrap();
         assert!(data.accounts.is_empty());
         assert_eq!(data.version, 1);
+    }
+
+    #[test]
+    fn shared_store_path_uses_neutral_anthropic_dir() {
+        assert_eq!(
+            shared_store_path(Path::new("/tmp/home")),
+            PathBuf::from("/tmp/home/.anthropic-accounts/anthropic-accounts.json")
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_store_adopts_existing_grok_login() {
+        let home = temp_home("migrate-grok");
+        let legacy = home.join(".grok").join("anthropic-accounts.json");
+        let mut data = AccountData::default();
+        data.accounts.push(ready_account("from-grok"));
+        AccountStore::at(&legacy).save(&data).unwrap();
+
+        migrate_legacy_store(&home);
+
+        let shared = shared_store_path(&home);
+        let loaded = AccountStore::at(&shared).load().unwrap();
+        assert_eq!(loaded.accounts[0].name, "from-grok");
+        assert!(legacy.exists(), "migration copies, never moves");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn migrate_legacy_store_replaces_dead_shared_with_live_sibling() {
+        let home = temp_home("migrate-dead");
+        let shared = shared_store_path(&home);
+        let mut dead = AccountData::default();
+        let mut dead_account = ready_account("dead");
+        dead_account.enabled = Some(false);
+        dead.accounts.push(dead_account);
+        AccountStore::at(&shared).save(&dead).unwrap();
+
+        let sibling = home
+            .join(".config")
+            .join("jfc")
+            .join("anthropic-accounts.json");
+        let mut live = AccountData::default();
+        live.accounts.push(ready_account("live-a"));
+        live.accounts.push(ready_account("live-b"));
+        AccountStore::at(&sibling).save(&live).unwrap();
+
+        migrate_legacy_store(&home);
+
+        let loaded = AccountStore::at(&shared).load().unwrap();
+        assert_eq!(loaded.accounts.len(), 2);
+        assert_eq!(loaded.accounts[0].name, "live-a");
+        let backups: Vec<_> = std::fs::read_dir(shared.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

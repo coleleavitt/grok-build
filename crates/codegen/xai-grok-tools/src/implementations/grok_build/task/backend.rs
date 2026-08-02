@@ -13,12 +13,10 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use super::types::{
-    SpawnedSubagentRef, SubagentCancelOutcome, SubagentCancelRequest, SubagentCancelTarget,
-    SubagentDescribeOutcome, SubagentDescribeRequest, SubagentEvent, SubagentInspectRequest,
-    SubagentInspection, SubagentListRunningRequest, SubagentQueryRequest, SubagentRegistryCounts,
-    SubagentRegistryCountsRequest, SubagentRequest, SubagentResult, SubagentSnapshot,
-    SubagentSpawnRequest, SubagentSpawnedRefsRequest, SubagentValidateTypeOutcome,
-    SubagentValidateTypeRequest,
+    SubagentAdvisorPreflightOutcome, SubagentAdvisorPreflightRequest, SubagentCancelOutcome,
+    SubagentCancelRequest, SubagentCancelTarget, SubagentDescribeOutcome, SubagentDescribeRequest,
+    SubagentEvent, SubagentQueryRequest, SubagentRequest, SubagentResult, SubagentSnapshot,
+    SubagentValidateTypeOutcome, SubagentValidateTypeRequest,
 };
 use crate::register_resource;
 use xai_tool_runtime::ToolError;
@@ -58,6 +56,20 @@ pub trait SubagentBackend: Send + Sync + 'static {
         subagent_type: &str,
         parent_session_id: &str,
     ) -> SubagentValidateTypeOutcome;
+
+    /// Validate advisor-specific launch policy before spawning.
+    ///
+    /// The coordinator owns the parent conversation and therefore computes the
+    /// exact fork-context budget estimate that the child would receive. TaskTool
+    /// awaits this before returning a background task id, so disabled/budget
+    /// advisor failures are clear pre-spawn errors.
+    async fn validate_advisor_spawn(
+        &self,
+        subagent_type: &str,
+        parent_session_id: &str,
+        prompt: &str,
+        resume_from: Option<&str>,
+    ) -> SubagentAdvisorPreflightOutcome;
 
     /// Describe a subagent type's resolved toolset (tool names + capability
     /// flags) before spawning. Read-only: builds the agent definition and
@@ -412,6 +424,54 @@ impl SubagentBackend for ChannelBackend {
         }
     }
 
+    async fn validate_advisor_spawn(
+        &self,
+        subagent_type: &str,
+        parent_session_id: &str,
+        prompt: &str,
+        resume_from: Option<&str>,
+    ) -> SubagentAdvisorPreflightOutcome {
+        let (respond_to, response_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(SubagentEvent::ValidateAdvisor(
+                SubagentAdvisorPreflightRequest {
+                    subagent_type: subagent_type.to_string(),
+                    parent_session_id: parent_session_id.to_string(),
+                    prompt: prompt.to_string(),
+                    resume_from: resume_from.map(str::to_string),
+                    respond_to,
+                },
+            ))
+            .is_err()
+        {
+            tracing::warn!(
+                parent_session_id,
+                "coordinator advisor preflight channel closed, treating as ValidationUnavailable",
+            );
+            return SubagentAdvisorPreflightOutcome::ValidationUnavailable;
+        }
+        let timeout = validate_type_timeout();
+        match tokio::time::timeout(timeout, response_rx).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => {
+                tracing::warn!(
+                    parent_session_id,
+                    "coordinator advisor preflight responder dropped, treating as ValidationUnavailable",
+                );
+                SubagentAdvisorPreflightOutcome::ValidationUnavailable
+            }
+            Err(_) => {
+                tracing::warn!(
+                    parent_session_id,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "coordinator advisor preflight timed out, treating as ValidationUnavailable",
+                );
+                SubagentAdvisorPreflightOutcome::ValidationUnavailable
+            }
+        }
+    }
+
     async fn describe_subagent_type(
         &self,
         subagent_type: &str,
@@ -480,12 +540,552 @@ pub(crate) fn parse_timeout_ms(value: Option<&str>) -> Option<u64> {
     value?.parse::<u64>().ok().filter(|&ms| ms > 0)
 }
 
-/// Resolve a `Duration` from a positive-millisecond env override, falling back
-/// to `default` when the var is unset / non-numeric / zero.
-pub fn env_duration_or(env_var: &str, default: std::time::Duration) -> std::time::Duration {
-    parse_timeout_ms(std::env::var(env_var).ok().as_deref())
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(default)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    /// Helper: receive the next event, match the expected variant, or panic.
+    macro_rules! recv_event {
+        ($rx:expr, Spawn) => {{
+            let event = $rx.recv().await.unwrap();
+            match event {
+                SubagentEvent::Spawn(inner) => *inner,
+                _ => panic!("Expected SubagentEvent::Spawn, got different variant"),
+            }
+        }};
+        ($rx:expr, $variant:ident) => {{
+            let event = $rx.recv().await.unwrap();
+            match event {
+                SubagentEvent::$variant(inner) => inner,
+                _ => panic!(
+                    "Expected SubagentEvent::{}, got different variant",
+                    stringify!($variant)
+                ),
+            }
+        }};
+    }
+
+    #[tokio::test]
+    async fn channel_backend_spawn_success() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = ChannelBackend::new(tx);
+
+        let handle = tokio::spawn(async move {
+            let req = recv_event!(rx, Spawn);
+            assert_eq!(req.id, "test-id");
+            assert_eq!(req.prompt, "do something");
+            req.result_tx
+                .send(SubagentResult {
+                    success: true,
+                    output: Arc::from("done"),
+                    subagent_id: "test-id".to_string(),
+                    child_session_id: "test-id".to_string(),
+                    tool_calls: 3,
+                    turns: 1,
+                    duration_ms: 500,
+                    ..Default::default()
+                })
+                .unwrap();
+        });
+
+        let (dummy_tx, _dummy_rx) = oneshot::channel();
+        let request = SubagentRequest {
+            id: "test-id".to_string(),
+            prompt: "do something".to_string(),
+            description: "test".to_string(),
+            subagent_type: "general-purpose".to_string(),
+            parent_session_id: "parent".to_string(),
+            parent_prompt_id: None,
+            resume_from: None,
+            cwd: None,
+            runtime_overrides: Default::default(),
+            run_in_background: false,
+            surface_completion: true,
+            fork_context: false,
+            advisor_gate_prevalidated: false,
+            result_tx: dummy_tx,
+        };
+
+        let result = backend.spawn(request).await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.subagent_id, "test-id");
+        assert_eq!(result.tool_calls, 3);
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_backend_spawn_closed_channel() {
+        let (tx, rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        drop(rx);
+
+        let backend = ChannelBackend::new(tx);
+
+        let (dummy_tx, _dummy_rx) = oneshot::channel();
+        let request = SubagentRequest {
+            id: "test-id".to_string(),
+            prompt: "do something".to_string(),
+            description: "test".to_string(),
+            subagent_type: "general-purpose".to_string(),
+            parent_session_id: "parent".to_string(),
+            parent_prompt_id: None,
+            resume_from: None,
+            cwd: None,
+            runtime_overrides: Default::default(),
+            run_in_background: false,
+            surface_completion: true,
+            fork_context: false,
+            advisor_gate_prevalidated: false,
+            result_tx: dummy_tx,
+        };
+
+        let err = backend.spawn(request).await.unwrap_err();
+        assert!(err.to_string().contains("channel closed"));
+    }
+
+    #[tokio::test]
+    async fn channel_backend_query_found() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = ChannelBackend::new(tx);
+
+        let handle = tokio::spawn(async move {
+            let req = recv_event!(rx, Query);
+            assert_eq!(req.subagent_id, "sub-1");
+            assert!(req.block);
+            assert_eq!(req.timeout_ms, Some(5000));
+            req.respond_to
+                .send(Some(SubagentSnapshot {
+                    subagent_id: "sub-1".to_string(),
+                    description: "find bugs".to_string(),
+                    subagent_type: "explore".to_string(),
+                    status: super::super::types::SubagentSnapshotStatus::Completed {
+                        output: "result".to_string(),
+                        tool_calls: 2,
+                        turns: 1,
+                        worktree_path: None,
+                    },
+                    started_at_epoch_ms: 1000,
+                    duration_ms: 200,
+                    persona: Some("reviewer".to_string()),
+                }))
+                .unwrap();
+        });
+
+        let snap = backend.query("sub-1", true, Some(5000)).await;
+        let snap = snap.expect("snapshot should be present");
+        assert_eq!(snap.subagent_id, "sub-1");
+        assert_eq!(snap.description, "find bugs");
+        assert_eq!(snap.subagent_type, "explore");
+        assert_eq!(snap.started_at_epoch_ms, 1000);
+        assert_eq!(snap.duration_ms, 200);
+        assert_eq!(snap.persona.as_deref(), Some("reviewer"));
+        match &snap.status {
+            super::super::types::SubagentSnapshotStatus::Completed {
+                output,
+                tool_calls,
+                turns,
+                worktree_path,
+            } => {
+                assert_eq!(output, "result");
+                assert_eq!(*tool_calls, 2);
+                assert_eq!(*turns, 1);
+                assert!(worktree_path.is_none());
+            }
+            other => panic!("Expected Completed, got {:?}", other),
+        }
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_backend_query_non_blocking_passes_through() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = ChannelBackend::new(tx);
+
+        let handle = tokio::spawn(async move {
+            let req = recv_event!(rx, Query);
+            assert_eq!(req.subagent_id, "sub-nb");
+            assert!(!req.block, "block should be false");
+            assert_eq!(req.timeout_ms, None, "timeout_ms should be None");
+            req.respond_to.send(None).unwrap();
+        });
+
+        let snap = backend.query("sub-nb", false, None).await;
+        assert!(snap.is_none());
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_backend_query_not_found() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = ChannelBackend::new(tx);
+
+        let handle = tokio::spawn(async move {
+            let req = recv_event!(rx, Query);
+            req.respond_to.send(None).unwrap();
+        });
+
+        let snap = backend.query("nonexistent", false, None).await;
+        assert!(snap.is_none());
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_backend_cancel_success() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = ChannelBackend::new(tx);
+
+        let handle = tokio::spawn(async move {
+            let req = recv_event!(rx, Cancel);
+            match &req.target {
+                SubagentCancelTarget::SubagentId(id) => assert_eq!(id, "sub-cancel"),
+                other => panic!("Expected SubagentId, got {:?}", other),
+            }
+            req.respond_to
+                .send(SubagentCancelOutcome::Cancelled)
+                .unwrap();
+        });
+
+        let outcome = backend.cancel("sub-cancel").await;
+        assert!(matches!(outcome, SubagentCancelOutcome::Cancelled));
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_backend_cancel_closed_channel() {
+        let (tx, rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        drop(rx);
+
+        let backend = ChannelBackend::new(tx);
+
+        let outcome = backend.cancel("sub-cancel").await;
+        assert!(matches!(outcome, SubagentCancelOutcome::NotFound));
+    }
+
+    #[tokio::test]
+    async fn channel_backend_spawn_result_dropped() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = ChannelBackend::new(tx);
+
+        let handle = tokio::spawn(async move {
+            let req = recv_event!(rx, Spawn);
+            drop(req.result_tx);
+        });
+
+        let (dummy_tx, _dummy_rx) = oneshot::channel();
+        let request = SubagentRequest {
+            id: "drop-test".to_string(),
+            prompt: "test".to_string(),
+            description: "test".to_string(),
+            subagent_type: "general-purpose".to_string(),
+            parent_session_id: "parent".to_string(),
+            parent_prompt_id: None,
+            resume_from: None,
+            cwd: None,
+            runtime_overrides: Default::default(),
+            run_in_background: false,
+            surface_completion: true,
+            fork_context: false,
+            advisor_gate_prevalidated: false,
+            result_tx: dummy_tx,
+        };
+
+        let err = backend.spawn(request).await.unwrap_err();
+        assert!(
+            err.to_string().contains("result channel dropped"),
+            "error: {err}"
+        );
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_backend_query_closed_channel() {
+        let (tx, rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        drop(rx);
+
+        let backend = ChannelBackend::new(tx);
+
+        let snap = backend.query("sub-1", false, None).await;
+        assert!(snap.is_none());
+    }
+
+    // ── validate_type ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn channel_backend_validate_type_round_trips_outcome() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = ChannelBackend::new(tx);
+
+        let handle = tokio::spawn(async move {
+            let event = rx.recv().await.unwrap();
+            match event {
+                SubagentEvent::ValidateType(req) => {
+                    assert_eq!(req.subagent_type, "explore");
+                    assert_eq!(req.parent_session_id, "parent-1");
+                    req.respond_to
+                        .send(SubagentValidateTypeOutcome::Ok)
+                        .unwrap();
+                }
+                _ => panic!("Expected ValidateType event"),
+            }
+        });
+
+        let outcome = backend.validate_type("explore", "parent-1").await;
+        assert!(matches!(outcome, SubagentValidateTypeOutcome::Ok));
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_backend_validate_type_propagates_unknown_outcome() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = ChannelBackend::new(tx);
+
+        let handle = tokio::spawn(async move {
+            if let Some(SubagentEvent::ValidateType(req)) = rx.recv().await {
+                req.respond_to
+                    .send(SubagentValidateTypeOutcome::Unknown {
+                        available: vec!["explore".into(), "plan".into()],
+                    })
+                    .unwrap();
+            }
+        });
+
+        let outcome = backend.validate_type("invented", "p").await;
+        match outcome {
+            SubagentValidateTypeOutcome::Unknown { available } => {
+                assert_eq!(available, vec!["explore".to_string(), "plan".to_string()]);
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_backend_validate_type_returns_validation_unavailable_when_channel_closed() {
+        let (tx, rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        drop(rx);
+        let backend = ChannelBackend::new(tx);
+        let outcome = backend.validate_type("explore", "p").await;
+        assert!(matches!(
+            outcome,
+            SubagentValidateTypeOutcome::ValidationUnavailable
+        ));
+    }
+
+    #[tokio::test]
+    async fn channel_backend_validate_type_returns_validation_unavailable_when_responder_dropped() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = ChannelBackend::new(tx);
+        let handle = tokio::spawn(async move {
+            if let Some(SubagentEvent::ValidateType(req)) = rx.recv().await {
+                drop(req.respond_to);
+            }
+        });
+        let outcome = backend.validate_type("explore", "p").await;
+        assert!(matches!(
+            outcome,
+            SubagentValidateTypeOutcome::ValidationUnavailable,
+        ));
+        handle.await.unwrap();
+    }
+
+    use super::super::types::test_capture;
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_backend_validate_type_logs_warn_on_timeout() {
+        let captured = test_capture::capture();
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = ChannelBackend::new(tx);
+
+        // Coordinator receives but never replies; keeps the responder
+        // alive so the timeout arm fires (not responder-dropped).
+        let holder = tokio::spawn(async move {
+            if let Some(SubagentEvent::ValidateType(req)) = rx.recv().await {
+                std::mem::forget(req.respond_to);
+                std::future::pending::<()>().await;
+            }
+        });
+
+        let validate = tokio::spawn(async move { backend.validate_type("explore", "p").await });
+        tokio::time::advance(VALIDATE_TYPE_TIMEOUT + std::time::Duration::from_millis(1)).await;
+        let outcome = validate.await.unwrap();
+        assert!(matches!(
+            outcome,
+            SubagentValidateTypeOutcome::ValidationUnavailable
+        ));
+
+        let mut events_rx = captured.events_rx;
+        let mut saw_timeout_warn = false;
+        while let Ok(event) = events_rx.try_recv() {
+            if event.level == tracing::Level::WARN
+                && event.fields.contains("coordinator validation timed out")
+                && event.fields.contains("subagent_type=explore")
+                && event.fields.contains("timeout_ms=")
+            {
+                saw_timeout_warn = true;
+                break;
+            }
+        }
+        assert!(saw_timeout_warn, "must emit WARN with timeout_ms field");
+
+        holder.abort();
+    }
+
+    // ── describe_subagent_type ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn channel_backend_describe_round_trips_summary() {
+        use super::super::types::{SubagentDescribeOutcome, SubagentTypeSummary};
+        use crate::types::tool::ToolKind;
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = ChannelBackend::new(tx);
+
+        let handle = tokio::spawn(async move {
+            match rx.recv().await.unwrap() {
+                SubagentEvent::DescribeType(req) => {
+                    assert_eq!(req.subagent_type, "explore");
+                    assert_eq!(req.harness_agent_type.as_deref(), Some("cursor"));
+                    assert_eq!(req.parent_session_id, "parent-1");
+                    let mut summary = SubagentTypeSummary {
+                        can_read: true,
+                        can_search: true,
+                        ..Default::default()
+                    };
+                    summary
+                        .tool_names
+                        .insert(ToolKind::Read, "read_file".to_string());
+                    req.respond_to
+                        .send(SubagentDescribeOutcome::Ok(summary))
+                        .unwrap();
+                }
+                _ => panic!("Expected DescribeType event"),
+            }
+        });
+
+        let outcome = backend
+            .describe_subagent_type("explore", Some("cursor"), "parent-1")
+            .await;
+        match outcome {
+            SubagentDescribeOutcome::Ok(summary) => {
+                assert!(summary.can_read && summary.can_search && !summary.can_execute);
+                assert_eq!(
+                    summary.tool_names.get(&ToolKind::Read).unwrap(),
+                    "read_file"
+                );
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_backend_describe_propagates_not_allowed_outcome() {
+        use super::super::types::SubagentDescribeOutcome;
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = ChannelBackend::new(tx);
+
+        let handle = tokio::spawn(async move {
+            if let Some(SubagentEvent::DescribeType(req)) = rx.recv().await {
+                req.respond_to
+                    .send(SubagentDescribeOutcome::NotAllowed {
+                        allowed: vec!["explore".into()],
+                    })
+                    .unwrap();
+            }
+        });
+
+        match backend.describe_subagent_type("plan", None, "p").await {
+            SubagentDescribeOutcome::NotAllowed { allowed } => {
+                assert_eq!(allowed, vec!["explore".to_string()]);
+            }
+            other => panic!("expected NotAllowed, got {other:?}"),
+        }
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_backend_describe_returns_unavailable_when_channel_closed() {
+        use super::super::types::SubagentDescribeOutcome;
+        let (tx, rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        drop(rx);
+        let backend = ChannelBackend::new(tx);
+        assert!(matches!(
+            backend.describe_subagent_type("explore", None, "p").await,
+            SubagentDescribeOutcome::Unavailable
+        ));
+    }
+
+    #[tokio::test]
+    async fn channel_backend_describe_returns_unavailable_when_responder_dropped() {
+        use super::super::types::SubagentDescribeOutcome;
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = ChannelBackend::new(tx);
+        let handle = tokio::spawn(async move {
+            if let Some(SubagentEvent::DescribeType(req)) = rx.recv().await {
+                drop(req.respond_to);
+            }
+        });
+        assert!(matches!(
+            backend.describe_subagent_type("explore", None, "p").await,
+            SubagentDescribeOutcome::Unavailable
+        ));
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_backend_describe_returns_unavailable_on_timeout() {
+        use super::super::types::SubagentDescribeOutcome;
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = ChannelBackend::new(tx);
+
+        let holder = tokio::spawn(async move {
+            if let Some(SubagentEvent::DescribeType(req)) = rx.recv().await {
+                std::mem::forget(req.respond_to);
+                std::future::pending::<()>().await;
+            }
+        });
+
+        let describe =
+            tokio::spawn(async move { backend.describe_subagent_type("explore", None, "p").await });
+        tokio::time::advance(VALIDATE_TYPE_TIMEOUT + std::time::Duration::from_millis(1)).await;
+        assert!(matches!(
+            describe.await.unwrap(),
+            SubagentDescribeOutcome::Unavailable
+        ));
+        holder.abort();
+    }
+
+    #[test]
+    fn parse_timeout_ms_returns_none_for_unset() {
+        assert_eq!(parse_timeout_ms(None), None);
+    }
+
+    #[test]
+    fn parse_timeout_ms_returns_none_for_unparseable() {
+        assert_eq!(parse_timeout_ms(Some("not-a-number")), None);
+        assert_eq!(parse_timeout_ms(Some("")), None);
+        assert_eq!(parse_timeout_ms(Some("3.14")), None);
+        assert_eq!(parse_timeout_ms(Some("-100")), None);
+    }
+
+    #[test]
+    fn parse_timeout_ms_returns_none_for_zero() {
+        assert_eq!(parse_timeout_ms(Some("0")), None);
+    }
+
+    #[test]
+    fn parse_timeout_ms_returns_value_for_positive_integer() {
+        assert_eq!(parse_timeout_ms(Some("5000")), Some(5000));
+        assert_eq!(parse_timeout_ms(Some("1")), Some(1));
+    }
 }
 
 #[cfg(test)]

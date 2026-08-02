@@ -101,6 +101,7 @@ pub struct AgentBuilder {
     subagents_enabled: bool,
     background_workflows_enabled: bool,
     ask_user_question_enabled: bool,
+    advisor_enabled: bool,
     subagent_toggle: HashMap<String, bool>,
     task_model_slugs: Vec<String>,
     skills_config: crate::prompt::skills::SkillsConfig,
@@ -241,6 +242,7 @@ impl AgentBuilder {
             subagents_enabled: false,
             background_workflows_enabled: false,
             ask_user_question_enabled: true,
+            advisor_enabled: true,
             subagent_toggle: HashMap::new(),
             task_model_slugs: Vec::new(),
             skills_config: Default::default(),
@@ -571,6 +573,19 @@ impl AgentBuilder {
         self.ask_user_question_enabled = enabled;
         self
     }
+    /// Enable or disable the `advisor` tool.
+    ///
+    /// `AdvisorTool` requires subagent support to spawn its child session, so
+    /// it is stripped whenever `!advisor_enabled || !subagents_enabled`. This
+    /// is the single authoritative gate — re-applied on every `build()`, so
+    /// it stays correct across rebuilds (e.g. zero-turn model switches),
+    /// unlike a one-shot post-spawn strip. Driven by the shell's resolved
+    /// gate (`resolve_advisor_enabled`, meta `advisorEnabled` outranks env,
+    /// default ON).
+    pub fn with_advisor_enabled(mut self, enabled: bool) -> Self {
+        self.advisor_enabled = enabled;
+        self
+    }
     /// Set per-subagent enable/disable toggles from `[subagents.toggle]`.
     ///
     /// Keys are agent names, values are booleans. Omitted agents default
@@ -786,7 +801,11 @@ impl AgentBuilder {
             );
             tool_config.tools.retain(|tc| tc.id != ask_user_id);
         }
-        apply_workflow_tool_gates(&mut tool_config, self.background_workflows_enabled);
+        if !self.advisor_enabled || !self.subagents_enabled {
+            tool_config
+                .tools
+                .retain(|tc| tc.kind != Some(ToolKind::Advisor));
+        }
         let task_tool_id = format!(
             "{}:{}",
             xai_grok_tools::types::tool::ToolNamespace::GrokBuild,
@@ -1755,6 +1774,174 @@ mod tests {
                 "[{label}] exit_plan_mode must always be present (TUI plan-mode keybind needs it); got tools: {names:?}"
             );
         }
+    }
+    /// Regression test for the "advisor survives rebuild" defect: the
+    /// `advisor` tool must be stripped whenever `advisor_enabled` is false,
+    /// mirroring the `ask_user_question` gate assertions above.
+    #[tokio::test]
+    async fn advisor_gate_strips_advisor_when_advisor_disabled() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+        let agent = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(crate::config::AgentDefinition::default_grok_build())
+        .with_subagents_enabled(true)
+        .with_advisor_enabled(false)
+        .build()
+        .await
+        .expect("agent should build with advisor disabled");
+        let defs = agent.tool_definitions().await;
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        assert!(
+            !names.contains(&"advisor"),
+            "advisor tool must be stripped when advisor_enabled=false; got: {names:?}"
+        );
+    }
+    /// Advisor requires subagent support to spawn its child session, so it
+    /// must ALSO be stripped when subagents are disabled, even if
+    /// `advisor_enabled` is true (defect #2: `--no-subagents` previously
+    /// left `advisor` reachable).
+    #[tokio::test]
+    async fn advisor_gate_strips_advisor_when_subagents_disabled() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+        let agent = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(crate::config::AgentDefinition::default_grok_build())
+        .with_subagents_enabled(false)
+        .with_advisor_enabled(true)
+        .build()
+        .await
+        .expect("agent should build with subagents disabled");
+        let defs = agent.tool_definitions().await;
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        assert!(
+            !names.contains(&"advisor"),
+            "advisor tool must be stripped when subagents_enabled=false even if advisor_enabled=true; got: {names:?}"
+        );
+    }
+    #[tokio::test]
+    async fn advisor_gate_keeps_advisor_when_both_enabled() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+        let agent = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(crate::config::AgentDefinition::default_grok_build())
+        .with_subagents_enabled(true)
+        .with_advisor_enabled(true)
+        .build()
+        .await
+        .expect("agent should build with advisor and subagents enabled");
+        let defs = agent.tool_definitions().await;
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        assert!(
+            names.contains(&"advisor"),
+            "advisor tool must be present when both advisor_enabled and subagents_enabled are true; got: {names:?}"
+        );
+    }
+    /// Idempotency / rebuild-safety: a SECOND `build()` from a fresh
+    /// advisor-bearing definition (simulating `RebuildAgentForDefinition`
+    /// reconstructing the definition via discovery) must still honor
+    /// `advisor_enabled=false`. Before this fix, the gate ran only once at
+    /// initial spawn (a one-shot post-hoc strip on `AgentDefinition`), so a
+    /// zero-turn model-switch rebuild would silently re-enable `advisor` by
+    /// building a fresh definition that statically re-declares it. Now the
+    /// gate lives inside `build()` itself, so it re-applies every time.
+    #[tokio::test]
+    async fn advisor_gate_reapplies_on_second_build_from_fresh_definition() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+        // First build: advisor enabled, as at initial spawn.
+        let first = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(crate::config::AgentDefinition::default_grok_build())
+        .with_subagents_enabled(true)
+        .with_advisor_enabled(true)
+        .build()
+        .await
+        .expect("first build should succeed");
+        let first_defs = first.tool_definitions().await;
+        let first_names: Vec<&str> = first_defs
+            .iter()
+            .map(|d| d.function.name.as_str())
+            .collect();
+        assert!(
+            first_names.contains(&"advisor"),
+            "premise: first build must have advisor present"
+        );
+        // Second build: a FRESH definition (mirrors `by_name_in_cwd_with_plugins`
+        // rebuilding a fresh advisor-bearing definition) with advisor now
+        // disabled, exactly as `RebuildAgentForDefinition` calls
+        // `AgentRebuildSpec::build_agent` a second time.
+        let rebuilt = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(crate::config::AgentDefinition::default_grok_build())
+        .with_subagents_enabled(true)
+        .with_advisor_enabled(false)
+        .build()
+        .await
+        .expect("rebuilt agent should succeed");
+        let rebuilt_defs = rebuilt.tool_definitions().await;
+        let rebuilt_names: Vec<&str> = rebuilt_defs
+            .iter()
+            .map(|d| d.function.name.as_str())
+            .collect();
+        assert!(
+            !rebuilt_names.contains(&"advisor"),
+            "advisor must be stripped on rebuild when advisor_enabled=false, even though the \
+             fresh definition statically re-declares it; got: {rebuilt_names:?}"
+        );
+    }
+    /// Adversarial: a toolset with MULTIPLE `Advisor`-kind entries (defensive
+    /// against a future accidental double-registration) must have every one
+    /// stripped, while entries of every other kind survive untouched.
+    #[tokio::test]
+    async fn advisor_gate_strips_all_advisor_entries_only() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::implementations::grok_build;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+        use xai_grok_tools::registry::types::ToolConfig;
+        let mut profile = crate::config::AgentDefinition::default_grok_build();
+        profile
+            .tool_config
+            .tools
+            .push(ToolConfig::from(&grok_build::AdvisorTool));
+        let agent = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(profile)
+        .with_subagents_enabled(true)
+        .with_advisor_enabled(false)
+        .build()
+        .await
+        .expect("agent should build");
+        let defs = agent.tool_definitions().await;
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        assert!(
+            !names.contains(&"advisor"),
+            "every Advisor-kind entry must be stripped; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"read_file"),
+            "unrelated tools must be preserved; got: {names:?}"
+        );
     }
     #[tokio::test]
     async fn curated_empty_toolset_fails_agent_build() {

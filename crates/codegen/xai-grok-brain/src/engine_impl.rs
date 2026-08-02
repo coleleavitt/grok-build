@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::types::{
     MemoryCategory, MemorySourceType, NewPage, PageUpdate, memory_title_for_content,
@@ -131,6 +131,37 @@ pub enum RunOutcome {
         /// Number of pages created or updated.
         applied: usize,
     },
+}
+
+/// A prepared self-improvement run that is ready for the extraction step.
+///
+/// This separates the async production LLM call from the synchronous durable
+/// store updates: callers can inspect [`Self::input`], call any model client,
+/// then pass the extracted pages to [`complete_self_improvement`].
+#[derive(Debug, Clone)]
+pub struct PreparedSelfImprovementRun {
+    input: ExtractionInput,
+    source_map: HashMap<String, SourceRef>,
+    run_at: DateTime<Utc>,
+}
+
+impl PreparedSelfImprovementRun {
+    /// Structured prompt input for the extraction provider/model.
+    pub fn input(&self) -> &ExtractionInput {
+        &self.input
+    }
+}
+
+/// Result of preparing a self-improvement run.
+#[derive(Debug, Clone)]
+pub enum PreparedRunOutcome {
+    /// Settings have the enabled flag off; nothing ran, timestamp untouched.
+    Disabled,
+    /// There was no transcript to extract from. The run timestamp has already
+    /// been stamped, matching Onyx's empty-run behavior.
+    NoPages,
+    /// Source material exists and a caller should run extraction.
+    Ready(PreparedSelfImprovementRun),
 }
 
 /// Normalize a provider-supplied source ref (e.g. `"[s1]"`) to a source-map
@@ -333,29 +364,25 @@ fn apply_pages(
     Ok(applied.len())
 }
 
-/// Run one self-improvement pass (Onyx `_run_for_user` + the task gating).
+/// Prepare one self-improvement pass up to the extraction boundary.
 ///
-/// - No-op returning [`RunOutcome::Disabled`] when settings have the enabled
-///   flag off (the timestamp stays untouched).
-/// - Builds the transcript from `context` (documents only when
-///   `use_connectors` is set), passes the user's focus instructions and
-///   existing page titles to the provider, applies the extracted pages, and
-///   stamps `last_run_at` on every completed (even empty) run.
-pub fn run_self_improvement(
+/// If settings are disabled, no state changes. If there is no transcript, this
+/// stamps `last_run_at` immediately and returns [`PreparedRunOutcome::NoPages`]
+/// so callers do not waste a model call on empty input.
+pub fn prepare_self_improvement(
     store: &BrainStore,
     context: &RunContext,
-    provider: &dyn ExtractionProvider,
-) -> Result<RunOutcome> {
+) -> Result<PreparedRunOutcome> {
     let settings = store.settings()?;
     if !settings.enabled {
-        return Ok(RunOutcome::Disabled);
+        return Ok(PreparedRunOutcome::Disabled);
     }
 
-    let now = Utc::now();
+    let run_at = Utc::now();
     let (transcript, source_map) = build_context(context, settings.use_connectors);
     if transcript.is_empty() {
-        store.mark_run_complete(now)?;
-        return Ok(RunOutcome::NoPages);
+        store.mark_run_complete(run_at)?;
+        return Ok(PreparedRunOutcome::NoPages);
     }
 
     let existing_titles = store
@@ -370,20 +397,30 @@ pub fn run_self_improvement(
         })
         .collect();
 
-    let input = ExtractionInput {
-        transcript,
-        existing_titles,
-        focus_instructions: settings.focus_instructions.clone(),
-        max_pages: BRAIN_MAX_PAGES_PER_RUN,
-    };
-    let pages = provider.extract(&input).map_err(BrainError::Provider)?;
+    Ok(PreparedRunOutcome::Ready(PreparedSelfImprovementRun {
+        input: ExtractionInput {
+            transcript,
+            existing_titles,
+            focus_instructions: settings.focus_instructions.clone(),
+            max_pages: BRAIN_MAX_PAGES_PER_RUN,
+        },
+        source_map,
+        run_at,
+    }))
+}
 
+/// Apply extracted pages for a prepared run and stamp completion.
+pub fn complete_self_improvement(
+    store: &BrainStore,
+    prepared: PreparedSelfImprovementRun,
+    pages: &[ExtractedPage],
+) -> Result<RunOutcome> {
     let applied = if pages.is_empty() {
         0
     } else {
-        apply_pages(store, &pages, &source_map)?
+        apply_pages(store, pages, &prepared.source_map)?
     };
-    store.mark_run_complete(now)?;
+    store.mark_run_complete(prepared.run_at)?;
 
     if applied == 0 {
         tracing::debug!("brain run produced no pages");
@@ -392,4 +429,28 @@ pub fn run_self_improvement(
         tracing::debug!(applied, "brain run applied pages");
         Ok(RunOutcome::Applied { applied })
     }
+}
+
+/// Run one self-improvement pass (Onyx `_run_for_user` + the task gating).
+///
+/// - No-op returning [`RunOutcome::Disabled`] when settings have the enabled
+///   flag off (the timestamp stays untouched).
+/// - Builds the transcript from `context` (documents only when
+///   `use_connectors` is set), passes the user's focus instructions and
+///   existing page titles to the provider, applies the extracted pages, and
+///   stamps `last_run_at` on every completed (even empty) run.
+pub fn run_self_improvement(
+    store: &BrainStore,
+    context: &RunContext,
+    provider: &dyn ExtractionProvider,
+) -> Result<RunOutcome> {
+    let prepared = match prepare_self_improvement(store, context)? {
+        PreparedRunOutcome::Disabled => return Ok(RunOutcome::Disabled),
+        PreparedRunOutcome::NoPages => return Ok(RunOutcome::NoPages),
+        PreparedRunOutcome::Ready(prepared) => prepared,
+    };
+    let pages = provider
+        .extract(prepared.input())
+        .map_err(BrainError::Provider)?;
+    complete_self_improvement(store, prepared, &pages)
 }
