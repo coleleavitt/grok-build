@@ -1,0 +1,700 @@
+# Instincts generated from https://github.com/coleleavitt/grok-build
+# Generated: 2026-08-02T22:17:51.333Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: grok-build-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Commit Length
+
+## Action
+
+Keep commit messages concise (~21 characters)
+
+## Evidence
+
+- Average commit message length: 21 chars
+- Based on 15 commits
+
+---
+id: grok-build-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Naming Files
+
+## Action
+
+Use snake_case naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: snake_case
+
+---
+id: grok-build-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: grok-build-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: grok-build-test-naming
+trigger: "when creating a test file"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Test Naming
+
+## Action
+
+Name test files using the pattern: *.test.ts
+
+## Evidence
+
+- File pattern: *.test.ts
+- Consistent across test files
+
+---
+id: grok-build-test-types
+trigger: "when planning tests for a feature"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Test Types
+
+## Action
+
+Write unit, integration, e2e tests to match project standards
+
+## Evidence
+
+- Test types detected: unit, integration, e2e
+- Coverage config: no
+
+---
+id: grok-build-workflow-feature-development
+trigger: "when implementing a new feature"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Workflow Feature Development
+
+## Action
+
+Follow the feature-development workflow:
+1. Add feature implementation
+2. Add tests for feature
+3. Update documentation
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~24x per month
+- Files: **/*.test.*, **/api/**
+
+---
+id: grok-build-workflow-add-or-update-tool-implementation
+trigger: "when doing add or update tool implementation"
+confidence: 0.75
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Workflow Add Or Update Tool Implementation
+
+## Action
+
+Follow the add-or-update-tool-implementation workflow:
+1. Create or update files in crates/codegen/xai-grok-tools/src/implementations/grok_build/<tool_name>/
+2. Update corresponding mod.rs or tool.rs files to register or export the tool
+3. Optionally update types in crates/codegen/xai-grok-tools/src/types/ or registry/types.rs
+4. Add or update tests for the tool
+5. Update documentation if needed
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~5x per month
+- Files: crates/codegen/xai-grok-tools/src/implementations/grok_build/*, crates/codegen/xai-grok-tools/src/implementations/grok_build/mod.rs, crates/codegen/xai-grok-tools/src/types/*.rs
+
+---
+id: grok-build-workflow-add-or-update-slash-command
+trigger: "when doing add or update slash command"
+confidence: 0.65
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Workflow Add Or Update Slash Command
+
+## Action
+
+Follow the add-or-update-slash-command workflow:
+1. Create or update a file in crates/codegen/xai-grok-pager/src/slash/commands/<command>.rs
+2. Update mod.rs or registry.rs to register the command
+3. Update user documentation in crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md or tutorial/05-slash-commands.md
+4. Optionally add or update tests
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~3x per month
+- Files: crates/codegen/xai-grok-pager/src/slash/commands/*.rs, crates/codegen/xai-grok-pager/src/slash/mod.rs, crates/codegen/xai-grok-pager/src/slash/registry.rs
+
+---
+id: grok-build-workflow-add-or-update-session-lifecycle-or-management
+trigger: "when doing add or update session lifecycle or management"
+confidence: 0.7
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Workflow Add Or Update Session Lifecycle Or Management
+
+## Action
+
+Follow the add-or-update-session-lifecycle-or-management workflow:
+1. Edit session lifecycle logic in crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_lifecycle.rs or related session files
+2. Update session management code in crates/codegen/xai-grok-shell/src/session/*
+3. Update or add tests in crates/codegen/xai-grok-shell/src/session/acp_session_tests/* or tests/test_session_*
+4. Update TUI or dashboard session views if needed
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~4x per month
+- Files: crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_lifecycle.rs, crates/codegen/xai-grok-shell/src/session/*.rs, crates/codegen/xai-grok-shell/src/session/acp_session_tests/*.rs
+
+---
+id: grok-build-workflow-add-or-update-background-task-or-scheduler
+trigger: "when doing add or update background task or scheduler"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Workflow Add Or Update Background Task Or Scheduler
+
+## Action
+
+Follow the add-or-update-background-task-or-scheduler workflow:
+1. Edit or create files in crates/codegen/xai-grok-tools/src/implementations/grok_build/task/* or scheduler/*
+2. Update related types in task/types.rs or scheduler/types.rs
+3. Update UI in crates/codegen/xai-grok-pager/src/views/tasks_pane.rs or background task views
+4. Add or update tests for task/scheduler logic
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: crates/codegen/xai-grok-tools/src/implementations/grok_build/task/*, crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/*, crates/codegen/xai-grok-tools/src/implementations/grok_build/task/types.rs
+
+---
+id: grok-build-workflow-add-or-update-settings-or-configuration
+trigger: "when doing add or update settings or configuration"
+confidence: 0.65
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Workflow Add Or Update Settings Or Configuration
+
+## Action
+
+Follow the add-or-update-settings-or-configuration workflow:
+1. Edit or add setting definitions in crates/codegen/xai-grok-pager/src/settings/defs.rs or registry.rs
+2. Update settings UI in settings_modal/* or related app/dispatch/settings/* files
+3. Update documentation in docs/user-guide/05-configuration.md
+4. Add or update tests for settings
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~3x per month
+- Files: crates/codegen/xai-grok-pager/src/settings/defs.rs, crates/codegen/xai-grok-pager/src/settings/registry.rs, crates/codegen/xai-grok-pager/src/views/settings_modal/*
+
+---
+id: grok-build-workflow-add-or-update-documentation-or-tutorial
+trigger: "when doing add or update documentation or tutorial"
+confidence: 0.7
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Workflow Add Or Update Documentation Or Tutorial
+
+## Action
+
+Follow the add-or-update-documentation-or-tutorial workflow:
+1. Edit or add markdown files in crates/codegen/xai-grok-pager/docs/user-guide/* or docs/tutorial/*
+2. Update README.md or related documentation indices
+3. Optionally update code comments or inline docs
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~4x per month
+- Files: crates/codegen/xai-grok-pager/docs/user-guide/*.md, crates/codegen/xai-grok-pager/docs/tutorial/*.md, crates/codegen/xai-grok-pager/docs/user-guide/README.md
+
+---
+id: grok-build-workflow-add-or-update-hook-or-plugin
+trigger: "when doing add or update hook or plugin"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Workflow Add Or Update Hook Or Plugin
+
+## Action
+
+Follow the add-or-update-hook-or-plugin workflow:
+1. Edit or add files in crates/codegen/xai-grok-hooks/src/*
+2. Update or add example hooks in crates/codegen/xai-grok-hooks/examples/*
+3. Update documentation in docs/custom-hooks.md or user-guide/10-hooks.md
+4. Add or update integration tests
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: crates/codegen/xai-grok-hooks/src/*.rs, crates/codegen/xai-grok-hooks/examples/*, crates/codegen/xai-grok-pager/docs/custom-hooks.md
+
+---
+id: grok-build-workflow-add-or-update-auth-provider-or-authentication-flow
+trigger: "when doing add or update auth provider or authentication flow"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/grok-build
+---
+
+# Grok Build Workflow Add Or Update Auth Provider Or Authentication Flow
+
+## Action
+
+Follow the add-or-update-auth-provider-or-authentication-flow workflow:
+1. Edit or add files in crates/codegen/xai-grok-shell/src/auth/*
+2. Update related config or provider registration
+3. Update or add tests in auth_provider_tests.rs or test_auth_provider_e2e.rs
+4. Update documentation if needed
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: crates/codegen/xai-grok-shell/src/auth/*.rs, crates/codegen/xai-grok-shell/src/auth/auth_provider_tests.rs, crates/codegen/xai-grok-shell/tests/test_auth_provider_e2e.rs
+
+---
+id: grok-build-instinct-file-naming
+trigger: "When creating or renaming a file"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct File Naming
+
+## Action
+
+Use snake_case for file names
+
+## Evidence
+
+- Pattern in namingConventions.files: snake_case
+
+---
+id: grok-build-instinct-function-naming
+trigger: "When defining a function"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Function Naming
+
+## Action
+
+Use camelCase for function names
+
+## Evidence
+
+- Pattern in namingConventions.functions: camelCase
+
+---
+id: grok-build-instinct-class-naming
+trigger: "When defining a struct or class"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Class Naming
+
+## Action
+
+Use PascalCase for class/struct names
+
+## Evidence
+
+- Pattern in namingConventions.classes: PascalCase
+
+---
+id: grok-build-instinct-constant-naming
+trigger: "When defining a constant"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Constant Naming
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for constant names
+
+## Evidence
+
+- Pattern in namingConventions.constants: SCREAMING_SNAKE_CASE
+
+---
+id: grok-build-instinct-import-style
+trigger: "When importing modules"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Import Style
+
+## Action
+
+Use relative imports
+
+## Evidence
+
+- Pattern in importStyle: relative
+
+---
+id: grok-build-instinct-export-style
+trigger: "When exporting modules or functions"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle: named
+
+---
+id: grok-build-instinct-testing-file-pattern
+trigger: "When creating a test file"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Testing File Pattern
+
+## Action
+
+Name the file with a .test.ts suffix
+
+## Evidence
+
+- Pattern in testing.filePattern: *.test.ts
+
+---
+id: grok-build-instinct-testing-types
+trigger: "When writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Testing Types
+
+## Action
+
+Include unit, integration, and e2e tests as appropriate
+
+## Evidence
+
+- Pattern in testing.testTypes: unit, integration, e2e
+
+---
+id: grok-build-instinct-testing-location
+trigger: "When placing test files"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Testing Location
+
+## Action
+
+Place tests mixed with source files or in dedicated test folders as observed
+
+## Evidence
+
+- Pattern in architecture.folderStructure.testLocation: mixed
+
+---
+id: grok-build-instinct-git-commit-format
+trigger: "When writing a commit message"
+confidence: 0.8
+domain: git
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Git Commit Format
+
+## Action
+
+Use short, imperative, freeform commit messages (e.g., 'add pull app sync config')
+
+## Evidence
+
+- Seen in commits: 'add pull app sync config (#1)', 'Synced from monorepo'
+
+---
+id: grok-build-instinct-add-tool-implementation
+trigger: "When adding or updating a tool in grok-build"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Add Tool Implementation
+
+## Action
+
+Create/update files under crates/codegen/xai-grok-tools/src/implementations/grok_build/<tool_name>/, update mod.rs/tool.rs, update types/registry if needed, add/update tests, and update docs if needed
+
+## Evidence
+
+- Workflow: add-or-update-tool-implementation
+- Commit sequence and files in workflow example
+
+---
+id: grok-build-instinct-add-slash-command
+trigger: "When adding or updating a slash command in the TUI"
+confidence: 0.92
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Add Slash Command
+
+## Action
+
+Create/update command file in crates/codegen/xai-grok-pager/src/slash/commands/, update mod.rs/registry.rs, update user docs, optionally add/update tests
+
+## Evidence
+
+- Workflow: add-or-update-slash-command
+- Commit sequence and files in workflow example
+
+---
+id: grok-build-instinct-session-lifecycle-management
+trigger: "When changing session lifecycle logic"
+confidence: 0.93
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Session Lifecycle Management
+
+## Action
+
+Edit session_lifecycle.rs or related session files, update session management code, update/add tests, update TUI/dashboard session views if needed
+
+## Evidence
+
+- Workflow: add-or-update-session-lifecycle-or-management
+- Commit sequence and files in workflow example
+
+---
+id: grok-build-instinct-background-task-scheduler
+trigger: "When adding/updating background task or scheduler logic"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Background Task Scheduler
+
+## Action
+
+Edit/create files in task/ or scheduler/ directories, update related types, update UI in tasks_pane.rs, add/update tests
+
+## Evidence
+
+- Workflow: add-or-update-background-task-or-scheduler
+- Commit sequence and files in workflow example
+
+---
+id: grok-build-instinct-settings-configuration
+trigger: "When adding/updating settings or configuration"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Settings Configuration
+
+## Action
+
+Edit/add setting definitions in defs.rs/registry.rs, update settings UI, update docs/user-guide/05-configuration.md, add/update tests
+
+## Evidence
+
+- Workflow: add-or-update-settings-or-configuration
+- Commit sequence and files in workflow example
+
+---
+id: grok-build-instinct-documentation-tutorial
+trigger: "When adding or updating documentation or tutorials"
+confidence: 0.88
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Documentation Tutorial
+
+## Action
+
+Edit/add markdown files in docs/user-guide/ or docs/tutorial/, update README.md or indices, optionally update code comments
+
+## Evidence
+
+- Workflow: add-or-update-documentation-or-tutorial
+- Commit sequence and files in workflow example
+
+---
+id: grok-build-instinct-hook-plugin
+trigger: "When adding or updating a hook or plugin"
+confidence: 0.89
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Hook Plugin
+
+## Action
+
+Edit/add files in hooks/src/, update/add example hooks, update docs/custom-hooks.md or user-guide/10-hooks.md, add/update integration tests
+
+## Evidence
+
+- Workflow: add-or-update-hook-or-plugin
+- Commit sequence and files in workflow example
+
+---
+id: grok-build-instinct-auth-provider
+trigger: "When adding or updating authentication provider logic or flows"
+confidence: 0.87
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/grok-build
+---
+
+# Grok Build Instinct Auth Provider
+
+## Action
+
+Edit/add files in auth/, update config/provider registration, update/add tests, update documentation if needed
+
+## Evidence
+
+- Workflow: add-or-update-auth-provider-or-authentication-flow
+- Commit sequence and files in workflow example
+
