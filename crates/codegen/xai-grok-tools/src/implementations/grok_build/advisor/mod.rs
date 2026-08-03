@@ -24,7 +24,7 @@ use crate::implementations::grok_build::task::backend::SubagentBackendResource;
 use crate::implementations::grok_build::task::spawn::{SubagentSpawnParams, spawn_and_await};
 use crate::implementations::grok_build::task::types::{
     CurrentPromptIdResource, ModelOverrideProvenance, SessionIdResource,
-    SubagentAdvisorPreflightOutcome, SubagentDepthCounter,
+    SubagentAdvisorPreflightOutcome, SubagentDepthCounter, SubagentForegroundWait,
 };
 use crate::types::output::ToolOutput;
 use crate::types::tool::{ToolKind, ToolNamespace};
@@ -117,7 +117,7 @@ impl xai_tool_runtime::Tool for AdvisorTool {
         let resources = shared_resources(&ctx)?;
 
         // 1. Gather resources exactly as TaskTool does.
-        let (depth, backend, parent_session_id, parent_prompt_id) = {
+        let (depth, backend, parent_session_id, parent_prompt_id, foreground_wait) = {
             let res = resources.lock().await;
 
             let depth = res.get::<SubagentDepthCounter>().map(|d| d.0).unwrap_or(0);
@@ -142,7 +142,15 @@ impl xai_tool_runtime::Tool for AdvisorTool {
                 .map(|p| p.0.clone())
                 .filter(|prompt_id| !prompt_id.is_empty());
 
-            (depth, backend, parent_session_id, parent_prompt_id)
+            let foreground_wait = res.get::<SubagentForegroundWait>().cloned();
+
+            (
+                depth,
+                backend,
+                parent_session_id,
+                parent_prompt_id,
+                foreground_wait,
+            )
         };
 
         // 2. Depth check — advisor cannot be launched from inside a subagent.
@@ -213,7 +221,7 @@ impl xai_tool_runtime::Tool for AdvisorTool {
         };
 
         // 5. Spawn and await — always blocking (never backgrounded by design).
-        let result = spawn_and_await(&backend, params).await?;
+        let result = spawn_and_await(&backend, params, foreground_wait.as_ref()).await?;
 
         // Defense in depth: if the coordinator's await budget expired and it
         // auto-backgrounded the child anyway, surface a poll hint like TaskTool

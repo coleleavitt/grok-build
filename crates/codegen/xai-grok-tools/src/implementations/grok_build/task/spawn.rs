@@ -109,7 +109,9 @@ impl SubagentSpawnParams {
 pub async fn spawn_and_await(
     backend: &SubagentBackendResource,
     params: SubagentSpawnParams,
+    foreground_wait: Option<&super::types::SubagentForegroundWait>,
 ) -> Result<SubagentResult, xai_tool_runtime::ToolError> {
+    let _foreground_wait = foreground_wait.map(|wait| wait.enter());
     backend.backend().spawn(params.into_request()).await
 }
 

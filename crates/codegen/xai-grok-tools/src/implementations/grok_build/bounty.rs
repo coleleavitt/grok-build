@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::implementations::grok_build::task::backend::SubagentBackendResource;
 use crate::implementations::grok_build::task::spawn::{SubagentSpawnParams, spawn_and_await};
 use crate::implementations::grok_build::task::types::{
-    CurrentPromptIdResource, ModelOverrideProvenance, SessionIdResource,
+    CurrentPromptIdResource, ModelOverrideProvenance, SessionIdResource, SubagentForegroundWait,
 };
 use crate::types::output::{TextOutput, ToolOutput};
 use crate::types::resources::{Cwd, State};
@@ -129,7 +129,7 @@ impl xai_tool_runtime::Tool for BountyTool {
     ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
         use crate::types::tool_metadata::shared_resources;
         let resources = shared_resources(&ctx)?;
-        let (market, cwd, backend, parent_session_id, parent_prompt_id) = {
+        let (market, cwd, backend, parent_session_id, parent_prompt_id, foreground_wait) = {
             let mut res = resources.lock().await;
             let market = res.get_or_default::<State<BountyMarket>>().0.clone();
             let cwd = res
@@ -147,7 +147,15 @@ impl xai_tool_runtime::Tool for BountyTool {
                 .map(|s| s.0.clone())
                 .unwrap_or_default();
             let parent_prompt_id = res.get::<CurrentPromptIdResource>().map(|p| p.0.clone());
-            (market, cwd, backend, parent_session_id, parent_prompt_id)
+            let foreground_wait = res.get::<SubagentForegroundWait>().cloned();
+            (
+                market,
+                cwd,
+                backend,
+                parent_session_id,
+                parent_prompt_id,
+                foreground_wait,
+            )
         };
 
         let text = match input.action {
@@ -160,6 +168,7 @@ impl xai_tool_runtime::Tool for BountyTool {
                     backend,
                     parent_session_id,
                     parent_prompt_id,
+                    foreground_wait,
                 )
                 .await
             }
@@ -175,6 +184,7 @@ async fn run_bounty(
     backend: SubagentBackendResource,
     parent_session_id: String,
     parent_prompt_id: Option<String>,
+    foreground_wait: Option<SubagentForegroundWait>,
 ) -> String {
     let bounty_id = if let Some(id) = input.bounty_id.clone() {
         id
@@ -214,6 +224,7 @@ async fn run_bounty(
         cwd: cwd.to_path_buf(),
         parent_session_id,
         parent_prompt_id,
+        foreground_wait,
     };
     let swarm = ExistingSubagentWorktreeSwarm;
     let n_solvers = input.max_solvers.unwrap_or(2).clamp(1, 5);
@@ -371,6 +382,7 @@ struct SubagentEconomyInvoker {
     cwd: PathBuf,
     parent_session_id: String,
     parent_prompt_id: Option<String>,
+    foreground_wait: Option<SubagentForegroundWait>,
 }
 
 #[async_trait::async_trait]
@@ -503,7 +515,7 @@ impl SubagentEconomyInvoker {
             fork_context: false,
             advisor_gate_prevalidated: false,
         };
-        spawn_and_await(&self.backend, params)
+        spawn_and_await(&self.backend, params, self.foreground_wait.as_ref())
             .await
             .map_err(|error| error.to_string())
     }

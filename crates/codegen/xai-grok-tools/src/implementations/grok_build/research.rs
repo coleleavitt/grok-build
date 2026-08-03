@@ -9,7 +9,7 @@
 use crate::implementations::grok_build::task::backend::SubagentBackendResource;
 use crate::implementations::grok_build::task::spawn::{SubagentSpawnParams, spawn_and_await};
 use crate::implementations::grok_build::task::types::{
-    CurrentPromptIdResource, ModelOverrideProvenance, SessionIdResource,
+    CurrentPromptIdResource, ModelOverrideProvenance, SessionIdResource, SubagentForegroundWait,
 };
 use crate::types::output::{TextOutput, ToolOutput};
 use crate::types::resources::Cwd;
@@ -113,7 +113,7 @@ impl xai_tool_runtime::Tool for ResearchTool {
     ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
         use crate::types::tool_metadata::shared_resources;
         let resources = shared_resources(&ctx)?;
-        let (cwd, backend, parent_session_id, parent_prompt_id) =
+        let (cwd, backend, parent_session_id, parent_prompt_id, foreground_wait) =
             research_resources(&resources).await;
         let report = run_research_flow(
             &input.question,
@@ -123,6 +123,7 @@ impl xai_tool_runtime::Tool for ResearchTool {
             backend.as_ref(),
             parent_session_id,
             parent_prompt_id,
+            foreground_wait.as_ref(),
         )
         .await;
 
@@ -158,6 +159,7 @@ async fn research_resources(
     Option<SubagentBackendResource>,
     String,
     Option<String>,
+    Option<SubagentForegroundWait>,
 ) {
     let res = resources.lock().await;
     let cwd = res.get::<Cwd>().map(|cwd| cwd.0.clone());
@@ -167,7 +169,14 @@ async fn research_resources(
         .map(|s| s.0.clone())
         .unwrap_or_default();
     let parent_prompt_id = res.get::<CurrentPromptIdResource>().map(|p| p.0.clone());
-    (cwd, backend, parent_session_id, parent_prompt_id)
+    let foreground_wait = res.get::<SubagentForegroundWait>().cloned();
+    (
+        cwd,
+        backend,
+        parent_session_id,
+        parent_prompt_id,
+        foreground_wait,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +248,7 @@ async fn run_research_flow(
     backend: Option<&SubagentBackendResource>,
     parent_session_id: String,
     parent_prompt_id: Option<String>,
+    foreground_wait: Option<&SubagentForegroundWait>,
 ) -> ResearchReport {
     let question = question.trim().to_owned();
     if question.is_empty() {
@@ -263,6 +273,7 @@ async fn run_research_flow(
                 fallback_plan.get(idx).map(String::as_str),
                 parent_session_id.clone(),
                 parent_prompt_id.clone(),
+                foreground_wait,
             )
             .await
             .or_else(|| fallback_plan.get(idx).cloned())
@@ -341,6 +352,7 @@ async fn run_research_flow(
             &steps,
             parent_session_id,
             parent_prompt_id,
+            foreground_wait,
         )
         .await
         .unwrap_or_else(|| local_synthesis(&question, &steps))
@@ -425,6 +437,7 @@ async fn planner_next_query(
     fallback: Option<&str>,
     parent_session_id: String,
     parent_prompt_id: Option<String>,
+    foreground_wait: Option<&SubagentForegroundWait>,
 ) -> Option<String> {
     let evidence = numbered_evidence(steps);
     let fallback_line = fallback
@@ -441,6 +454,7 @@ async fn planner_next_query(
         prompt,
         parent_session_id,
         parent_prompt_id,
+        foreground_wait,
     )
     .await?;
     let query = clean_planner_query(&result);
@@ -551,6 +565,7 @@ async fn synthesize_with_subagent(
     steps: &[ResearchStep],
     parent_session_id: String,
     parent_prompt_id: Option<String>,
+    foreground_wait: Option<&SubagentForegroundWait>,
 ) -> Option<String> {
     if steps.iter().all(|step| !step.succeeded()) {
         return None;
@@ -567,6 +582,7 @@ async fn synthesize_with_subagent(
         prompt,
         parent_session_id,
         parent_prompt_id,
+        foreground_wait,
     )
     .await
     .filter(|text| !text.trim().is_empty())
@@ -578,6 +594,7 @@ async fn spawn_research_subagent(
     prompt: String,
     parent_session_id: String,
     parent_prompt_id: Option<String>,
+    foreground_wait: Option<&SubagentForegroundWait>,
 ) -> Option<String> {
     let params = SubagentSpawnParams {
         id: None,
@@ -600,7 +617,9 @@ async fn spawn_research_subagent(
         fork_context: false,
         advisor_gate_prevalidated: false,
     };
-    let result = spawn_and_await(backend, params).await.ok()?;
+    let result = spawn_and_await(backend, params, foreground_wait)
+        .await
+        .ok()?;
     result.success.then(|| result.output.trim().to_owned())
 }
 
