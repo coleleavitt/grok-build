@@ -87,7 +87,7 @@ fn text(output: ToolOutput) -> String {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn brain_search_uses_nomic_compatible_embeddings_then_brain_get_reads_page() {
+async fn brain_search_uses_local_embeddings_without_api_key_then_brain_get_reads_page() {
     let _guard = ENV_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -112,9 +112,14 @@ async fn brain_search_uses_nomic_compatible_embeddings_then_brain_get_reads_page
 
     let _env = EnvRestore::set(&[
         ("GROK_BRAIN_DB", db_path.display().to_string()),
-        ("NOMIC_API_KEY", "test-key".to_owned()),
-        ("NOMIC_API_BASE", server.uri()),
-        ("NOMIC_EMBED_DIMENSIONS", "2".to_owned()),
+        ("GROK_BRAIN_EMBED_API_KEY", String::new()),
+        ("GROK_BRAIN_EMBED_BASE_URL", server.uri()),
+        ("GROK_BRAIN_EMBED_MODEL", "mxbai-embed-large".to_owned()),
+        ("GROK_BRAIN_EMBED_DIMENSIONS", "2".to_owned()),
+        ("NOMIC_API_KEY", String::new()),
+        ("NOMIC_API_BASE", String::new()),
+        ("NOMIC_EMBED_MODEL", String::new()),
+        ("NOMIC_EMBED_DIMENSIONS", String::new()),
     ]);
     let ctx = test_ctx(resources(&workspace).into_shared());
     let result = xai_tool_runtime::Tool::run(
@@ -131,19 +136,14 @@ async fn brain_search_uses_nomic_compatible_embeddings_then_brain_get_reads_page
     assert_eq!(
         requests.len(),
         1,
-        "brain_search must call the Nomic-compatible embeddings endpoint exactly once"
+        "brain_search must call the local OpenAI-compatible embeddings endpoint exactly once"
     );
-    assert_eq!(
-        requests[0]
-            .headers
-            .get("authorization")
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        "Bearer test-key"
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "local embeddings should not require or send an API key"
     );
     let body: serde_json::Value = requests[0].body_json().unwrap();
-    assert_eq!(body["model"], "nomic-embed-text-v1.5");
+    assert_eq!(body["model"], "mxbai-embed-large");
     assert_eq!(body["dimensions"], 2);
     let inputs = body["input"].as_array().expect("input array");
     assert_eq!(inputs.len(), 3, "query plus two Brain candidate pages");
@@ -155,7 +155,7 @@ async fn brain_search_uses_nomic_compatible_embeddings_then_brain_get_reads_page
     assert!(output.contains("[workstreams] Branch State"), "{output}");
     assert!(
         output.find("Branch State").unwrap() < output.find("Install Safety").unwrap(),
-        "Nomic-compatible semantic ranking should put Branch State first: {output}"
+        "local semantic ranking should put Branch State first: {output}"
     );
     assert!(output.contains("time-sensitive"), "{output}");
 
@@ -199,9 +199,14 @@ async fn brain_search_falls_back_to_lexical_when_embedding_response_is_malformed
 
     let _env = EnvRestore::set(&[
         ("GROK_BRAIN_DB", db_path.display().to_string()),
-        ("NOMIC_API_KEY", "test-key".to_owned()),
-        ("NOMIC_API_BASE", server.uri()),
-        ("NOMIC_EMBED_DIMENSIONS", "2".to_owned()),
+        ("GROK_BRAIN_EMBED_API_KEY", String::new()),
+        ("GROK_BRAIN_EMBED_BASE_URL", server.uri()),
+        ("GROK_BRAIN_EMBED_MODEL", "mxbai-embed-large".to_owned()),
+        ("GROK_BRAIN_EMBED_DIMENSIONS", "2".to_owned()),
+        ("NOMIC_API_KEY", String::new()),
+        ("NOMIC_API_BASE", String::new()),
+        ("NOMIC_EMBED_MODEL", String::new()),
+        ("NOMIC_EMBED_DIMENSIONS", String::new()),
     ]);
     let ctx = test_ctx(resources(&workspace).into_shared());
     let result = xai_tool_runtime::Tool::run(
@@ -220,6 +225,10 @@ async fn brain_search_falls_back_to_lexical_when_embedding_response_is_malformed
         requests.len(),
         1,
         "brain_search should attempt embeddings before falling back"
+    );
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "local embedding fallback should not require or send an API key"
     );
 
     let output = text(result);

@@ -9,9 +9,9 @@ use crate::types::output::{TextOutput, ToolOutput};
 use crate::types::resources::Cwd;
 use crate::types::tool::{ToolKind, ToolNamespace};
 
-const NOMIC_EMBEDDING_BASE_URL: &str = "https://api.nomic.ai/v1";
-const NOMIC_EMBEDDING_MODEL: &str = "nomic-embed-text-v1.5";
-const NOMIC_EMBEDDING_DIMENSIONS: usize = 768;
+const LOCAL_EMBEDDING_BASE_URL: &str = "http://localhost:11434/v1";
+const LOCAL_EMBEDDING_MODEL: &str = "mxbai-embed-large";
+const LOCAL_EMBEDDING_DIMENSIONS: usize = 1024;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct BrainSearchInput {
@@ -97,12 +97,10 @@ impl xai_tool_runtime::Tool for BrainSearchTool {
         )
         .map_err(|err| tool_error("brain_search", err))?;
         drop(service);
-        let provider = NomicEmbeddingProvider::from_env();
+        let provider = OpenAiCompatibleEmbeddingProvider::from_env();
         let outcome = xai_grok_brain::BrainSearchEngine::search_prepared(
             prepared,
-            provider
-                .as_ref()
-                .map(|provider| provider as &dyn xai_grok_brain::BrainEmbeddingProvider),
+            Some(&provider as &dyn xai_grok_brain::BrainEmbeddingProvider),
         )
         .await;
         if matches!(
@@ -280,29 +278,34 @@ impl xai_tool_runtime::Tool for BrainGetTool {
 }
 
 #[derive(Debug, Clone)]
-struct NomicEmbeddingProvider {
-    api_key: String,
+struct OpenAiCompatibleEmbeddingProvider {
+    api_key: Option<String>,
     base_url: String,
     model: String,
     dimensions: usize,
 }
 
-impl NomicEmbeddingProvider {
-    fn from_env() -> Option<Self> {
-        let api_key = std::env::var("NOMIC_API_KEY")
-            .ok()
-            .filter(|key| !key.trim().is_empty())?;
-        Some(Self {
+impl OpenAiCompatibleEmbeddingProvider {
+    fn from_env() -> Self {
+        let legacy_nomic_base = env_non_empty(&["NOMIC_API_BASE"]);
+        let base_url = env_non_empty(&["GROK_BRAIN_EMBED_BASE_URL", "GROK_BRAIN_EMBED_BASE"])
+            .or_else(|| legacy_nomic_base.clone())
+            .unwrap_or_else(|| LOCAL_EMBEDDING_BASE_URL.to_owned());
+        let api_key = env_non_empty(&["GROK_BRAIN_EMBED_API_KEY"]).or_else(|| {
+            if legacy_nomic_base.is_some() || base_url.contains("api.nomic.ai") {
+                env_non_empty(&["NOMIC_API_KEY"])
+            } else {
+                None
+            }
+        });
+        Self {
             api_key,
-            base_url: std::env::var("NOMIC_API_BASE")
-                .unwrap_or_else(|_| NOMIC_EMBEDDING_BASE_URL.to_owned()),
-            model: std::env::var("NOMIC_EMBED_MODEL")
-                .unwrap_or_else(|_| NOMIC_EMBEDDING_MODEL.to_owned()),
-            dimensions: std::env::var("NOMIC_EMBED_DIMENSIONS")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(NOMIC_EMBEDDING_DIMENSIONS),
-        })
+            base_url,
+            model: env_non_empty(&["GROK_BRAIN_EMBED_MODEL", "NOMIC_EMBED_MODEL"])
+                .unwrap_or_else(|| LOCAL_EMBEDDING_MODEL.to_owned()),
+            dimensions: env_usize(&["GROK_BRAIN_EMBED_DIMENSIONS", "NOMIC_EMBED_DIMENSIONS"])
+                .unwrap_or(LOCAL_EMBEDDING_DIMENSIONS),
+        }
     }
 
     async fn embed_inner(&self, inputs: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -311,31 +314,32 @@ impl NomicEmbeddingProvider {
             "input": inputs,
             "dimensions": self.dimensions,
         });
-        let response = reqwest::Client::new()
+        let mut request = reqwest::Client::new()
             .post(format!(
                 "{}/embeddings",
                 self.base_url.trim_end_matches('/')
             ))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+        if let Some(api_key) = self.api_key.as_deref() {
+            request = request.bearer_auth(api_key);
+        }
+        let response = request.send().await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Nomic embeddings API error {status}: {body}");
+            anyhow::bail!("Brain embeddings API error {status}: {body}");
         }
         let json: serde_json::Value = response.json().await?;
         let data = json
             .get("data")
             .and_then(|value| value.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Nomic response missing data array"))?;
+            .ok_or_else(|| anyhow::anyhow!("Brain embeddings response missing data array"))?;
         let mut out = Vec::with_capacity(data.len());
         for item in data {
             let embedding = item
                 .get("embedding")
                 .and_then(|value| value.as_array())
-                .ok_or_else(|| anyhow::anyhow!("Nomic response item missing embedding"))?
+                .ok_or_else(|| anyhow::anyhow!("Brain embeddings response item missing embedding"))?
                 .iter()
                 .map(|value| {
                     value
@@ -346,7 +350,7 @@ impl NomicEmbeddingProvider {
                 .collect::<anyhow::Result<Vec<_>>>()?;
             if embedding.len() != self.dimensions {
                 anyhow::bail!(
-                    "Nomic embedding dimension mismatch: expected {}, got {}",
+                    "Brain embedding dimension mismatch: expected {}, got {}",
                     self.dimensions,
                     embedding.len()
                 );
@@ -357,7 +361,19 @@ impl NomicEmbeddingProvider {
     }
 }
 
-impl xai_grok_brain::BrainEmbeddingProvider for NomicEmbeddingProvider {
+fn env_non_empty(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn env_usize(names: &[&str]) -> Option<usize> {
+    env_non_empty(names).and_then(|value| value.parse::<usize>().ok())
+}
+
+impl xai_grok_brain::BrainEmbeddingProvider for OpenAiCompatibleEmbeddingProvider {
     fn embed<'a>(
         &'a self,
         inputs: &'a [&'a str],
