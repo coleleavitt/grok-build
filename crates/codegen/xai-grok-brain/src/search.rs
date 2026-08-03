@@ -124,7 +124,13 @@ impl PreparedBrainSearch {
         })
     }
 
-    fn complete_lexical(self, mode: BrainSearchMode, model: Option<String>) -> BrainSearchOutcome {
+    fn complete_lexical(
+        mut self,
+        mode: BrainSearchMode,
+        model: Option<String>,
+    ) -> BrainSearchOutcome {
+        let limit = normalize_limit(self.options.limit);
+        self.candidates.truncate(limit);
         BrainSearchOutcome {
             pages: self.candidates,
             mode,
@@ -175,17 +181,17 @@ impl BrainSearchEngine {
         let inputs = prepared.embedding_inputs();
         let refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
         match provider.embed(&refs).await {
-            Ok(embeddings) => prepared
-                .complete_semantic(embeddings, provider)
-                .unwrap_or_else(|_| {
-                    // A malformed provider response is treated like a provider
-                    // failure: return lexical fallback, not an empty result.
-                    BrainSearchOutcome {
-                        pages: Vec::new(),
-                        mode: BrainSearchMode::LexicalFallback,
-                        embedding_model: model.clone(),
-                    }
-                }),
+            Ok(embeddings) => {
+                let lexical_fallback = prepared.clone();
+                prepared
+                    .complete_semantic(embeddings, provider)
+                    .unwrap_or_else(|_| {
+                        // A malformed provider response is treated like a provider
+                        // failure: return the prepared lexical candidates, not an
+                        // empty result set.
+                        lexical_fallback.complete_lexical(BrainSearchMode::LexicalFallback, model)
+                    })
+            }
             Err(_) => prepared.complete_lexical(BrainSearchMode::LexicalFallback, model),
         }
     }
@@ -265,6 +271,28 @@ mod tests {
         }
     }
 
+    struct MalformedProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl BrainEmbeddingProvider for MalformedProvider {
+        fn embed<'a>(
+            &'a self,
+            _inputs: &'a [&'a str],
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<Vec<f32>>>> + Send + 'a>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec![vec![1.0, 0.0]]) })
+        }
+
+        fn model_name(&self) -> &str {
+            "malformed-nomic-compatible"
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+    }
+
     #[tokio::test]
     async fn semantic_provider_can_override_lexical_ordering() {
         let store = BrainStore::open_in_memory().unwrap();
@@ -315,6 +343,53 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(outcome.pages[0].page.title, "Branch State");
+    }
+
+    #[tokio::test]
+    async fn malformed_embedding_response_falls_back_to_lexical_candidates() {
+        let store = BrainStore::open_in_memory().unwrap();
+        store
+            .create_page(NewPage {
+                title: Some("Install Safety".to_owned()),
+                memory_text: "Avoid curl pipe bash installers.".to_owned(),
+                category: MemoryCategory::Notes,
+                source: Some("manual".to_owned()),
+            })
+            .unwrap();
+        store
+            .create_page(NewPage {
+                title: Some("Branch State".to_owned()),
+                memory_text: "The custom fork now uses dev for active work.".to_owned(),
+                category: MemoryCategory::Workstreams,
+                source: Some("current_state".to_owned()),
+            })
+            .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = MalformedProvider {
+            calls: Arc::clone(&calls),
+        };
+        let outcome = BrainSearchEngine::search(
+            &store,
+            BrainSearchOptions {
+                query: "install safety".to_owned(),
+                workspace_scope: None,
+                limit: 2,
+            },
+            Some(&provider),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.mode, BrainSearchMode::LexicalFallback);
+        assert_eq!(
+            outcome.embedding_model.as_deref(),
+            Some(provider.model_name())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.pages.len(), 2);
+        assert_eq!(outcome.pages[0].page.title, "Install Safety");
+        assert_eq!(outcome.pages[1].page.title, "Branch State");
     }
 
     #[tokio::test]

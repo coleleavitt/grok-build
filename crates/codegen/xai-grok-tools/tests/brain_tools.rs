@@ -175,6 +175,67 @@ async fn brain_search_uses_nomic_compatible_embeddings_then_brain_get_reads_page
     assert!(output.contains("Sources:"), "{output}");
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn brain_search_falls_back_to_lexical_when_embedding_response_is_malformed() {
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("brain.sqlite");
+    let workspace = tmp.path().join("repo");
+    std::fs::create_dir_all(&workspace).unwrap();
+    seed_brain(&db_path, &workspace.to_string_lossy());
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                {"embedding": [1.0, 0.0]}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let _env = EnvRestore::set(&[
+        ("GROK_BRAIN_DB", db_path.display().to_string()),
+        ("NOMIC_API_KEY", "test-key".to_owned()),
+        ("NOMIC_API_BASE", server.uri()),
+        ("NOMIC_EMBED_DIMENSIONS", "2".to_owned()),
+    ]);
+    let ctx = test_ctx(resources(&workspace).into_shared());
+    let result = xai_tool_runtime::Tool::run(
+        &BrainSearchTool,
+        ctx,
+        xai_grok_tools::implementations::grok_build::brain::BrainSearchInput {
+            query: "dev branch state".to_owned(),
+            limit: Some(2),
+        },
+    )
+    .await
+    .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "brain_search should attempt embeddings before falling back"
+    );
+
+    let output = text(result);
+    assert!(
+        output.contains("Found 2 Brain memory result(s):"),
+        "{output}"
+    );
+    assert!(output.contains("Branch State"), "{output}");
+    assert!(output.contains("Install Safety"), "{output}");
+    assert!(
+        output.find("Branch State").unwrap() < output.find("Install Safety").unwrap(),
+        "lexical fallback should preserve prepared lexical ordering: {output}"
+    );
+    assert!(!output.contains("No Brain memories found"), "{output}");
+}
+
 struct LegacyBackendShouldNotRun;
 
 #[async_trait::async_trait]
