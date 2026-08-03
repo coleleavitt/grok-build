@@ -199,7 +199,18 @@ pub fn resolve_model_catalog(
     cfg: &config::Config,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
-    let mut catalog: IndexMap<String, ModelEntry> = config::resolve_model_list(cfg, prefetched);
+    resolve_model_catalog_with_providers(cfg, prefetched, &IndexMap::new())
+}
+
+/// Resolve the effective catalog while retaining trusted plugin providers and
+/// applying the same visibility, allowlist, and effort policy as built-ins.
+pub fn resolve_model_catalog_with_providers(
+    cfg: &config::Config,
+    prefetched: Option<IndexMap<String, ModelEntry>>,
+    plugin_providers: &IndexMap<String, config::ModelProviderConfig>,
+) -> IndexMap<String, ModelEntry> {
+    let mut catalog: IndexMap<String, ModelEntry> =
+        config::resolve_model_list_with_providers(cfg, prefetched, plugin_providers);
 
     if let Ok(Some(disabled)) = ModelGlobSet::compile(cfg.models.disabled_models.as_ref()) {
         let before = catalog.len();

@@ -446,7 +446,7 @@ impl SessionActor {
         }
         impl xai_grok_sampler::BearerResolver for AuthManagerBearerResolver {
             fn current_bearer(&self) -> Option<String> {
-                self.0.current_or_expired().map(|a| a.key)
+                self.0.current_wire_valid().map(|a| a.key)
             }
         }
         #[allow(clippy::items_after_statements)]
@@ -1033,9 +1033,7 @@ impl SessionActor {
         }
         if matches!(error.kind, SamplingErrorKind::RateLimited) {
             if self.rotate_anthropic_after_rate_limit(&error).await {
-                return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit(
-                    SamplerResubmitReason::anthropic_account_rotated(error.status_code),
-                ));
+                return Ok(SamplerFailureRecovery::ProviderAccountRotated);
             }
             self.log_terminal_failure("rate_limited", error.status_code, &detailed_message);
             self.send_xai_notification(XaiSessionUpdate::RetryState(
@@ -1120,9 +1118,10 @@ impl SessionActor {
                         "auth recovery: sampler 401, devbox re-mint, retrying"
                     );
                     self.prepare_sampler_for_turn().await;
-                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit(
-                        SamplerResubmitReason::auth_recovered(error.status_code),
-                    ));
+                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                        credential: error.credential,
+                        store: RecoveredStore::SessionToken,
+                    });
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1150,9 +1149,10 @@ impl SessionActor {
                     None,
                 );
                 self.prepare_sampler_for_turn().await;
-                return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit(
-                    SamplerResubmitReason::auth_recovered(error.status_code),
-                ));
+                return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                    credential: error.credential,
+                    store: RecoveredStore::SessionToken,
+                });
             }
             tracing::warn!(session_id = %self.session_info.id.0, "auth recovery: sampler 401, refresh failed");
             xai_grok_telemetry::unified_log::warn(
@@ -1374,8 +1374,11 @@ impl SessionActor {
                     SamplerFailureRecovery::CompactAndResubmit => {
                         Ok(SamplerTurnOutcome::CompactAndResubmit)
                     }
-                    SamplerFailureRecovery::RefreshAuthAndResubmit(reason) => {
-                        Ok(SamplerTurnOutcome::RefreshAuthAndResubmit(reason))
+                    SamplerFailureRecovery::RefreshAuthAndResubmit { credential, store } => {
+                        Ok(SamplerTurnOutcome::RefreshAuthAndResubmit { credential, store })
+                    }
+                    SamplerFailureRecovery::ProviderAccountRotated => {
+                        Ok(SamplerTurnOutcome::ProviderAccountRotated)
                     }
                 }
             }

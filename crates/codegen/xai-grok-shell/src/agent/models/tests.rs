@@ -18,6 +18,37 @@ fn test_manager() -> ModelsManager {
     .build()
 }
 
+#[test]
+fn catalog_refresh_retains_plugin_models_and_catalog_policy() {
+    let manager = test_manager();
+    let cfg = config::Config::default();
+    let mut provider = config::ModelProviderConfig {
+        base_url: Some("https://api.example.test/v1".to_string()),
+        api_backend: Some(crate::sampling::ApiBackend::Responses),
+        ..Default::default()
+    };
+    provider.models.insert(
+        "plugin-model".to_string(),
+        config::ProviderModelConfig {
+            model: Some("plugin-model".to_string()),
+            name: Some("Plugin Model".to_string()),
+            ..Default::default()
+        },
+    );
+    manager.set_plugin_model_providers(IndexMap::from([("plugin".to_string(), provider)]));
+    assert!(manager.models().contains_key("plugin-model"));
+
+    manager.apply_catalog(&cfg, IndexMap::new(), Some("etag-1".to_string()));
+
+    let model = manager
+        .models()
+        .get("plugin-model")
+        .cloned()
+        .expect("plugin model must survive a remote catalog refresh");
+    assert_eq!(model.info.base_url, "https://api.example.test/v1");
+    assert!(model.info.user_selectable);
+}
+
 #[tokio::test]
 async fn catalog_retry_recovers_after_endpoint_returns() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1696,6 +1727,7 @@ fn make_entry_config_with_id(
         compaction_at_tokens: None,
         show_model_fingerprint: false,
         stream_tool_calls: None,
+        provider_request_adapter: None,
         laziness_detector: config::LazinessDetectorPerModelConfig::default(),
     }
 }

@@ -543,8 +543,16 @@ pub(crate) fn parse_timeout_ms(value: Option<&str>) -> Option<u64> {
     value?.parse::<u64>().ok().filter(|&ms| ms > 0)
 }
 
+/// Resolve a duration from a positive-millisecond environment override.
+pub fn env_duration_or(env_var: &str, default: std::time::Duration) -> std::time::Duration {
+    parse_timeout_ms(std::env::var(env_var).ok().as_deref())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(default)
+}
+
 #[cfg(test)]
-mod tests {
+mod inline_tests {
+    use super::super::types::SubagentOwner;
     use super::*;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -554,7 +562,7 @@ mod tests {
         ($rx:expr, Spawn) => {{
             let event = $rx.recv().await.unwrap();
             match event {
-                SubagentEvent::Spawn(inner) => *inner,
+                SubagentEvent::Spawn(inner) => inner,
                 _ => panic!("Expected SubagentEvent::Spawn, got different variant"),
             }
         }};
@@ -593,7 +601,6 @@ mod tests {
                 .unwrap();
         });
 
-        let (dummy_tx, _dummy_rx) = oneshot::channel();
         let request = SubagentRequest {
             id: "test-id".to_string(),
             prompt: "do something".to_string(),
@@ -606,9 +613,11 @@ mod tests {
             runtime_overrides: Default::default(),
             run_in_background: false,
             surface_completion: true,
+            await_to_completion: false,
             fork_context: false,
             advisor_gate_prevalidated: false,
-            result_tx: dummy_tx,
+            owner: SubagentOwner::Task,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
         };
 
         let result = backend.spawn(request).await.unwrap();
@@ -626,7 +635,6 @@ mod tests {
 
         let backend = ChannelBackend::new(tx);
 
-        let (dummy_tx, _dummy_rx) = oneshot::channel();
         let request = SubagentRequest {
             id: "test-id".to_string(),
             prompt: "do something".to_string(),
@@ -639,9 +647,11 @@ mod tests {
             runtime_overrides: Default::default(),
             run_in_background: false,
             surface_completion: true,
+            await_to_completion: false,
             fork_context: false,
             advisor_gate_prevalidated: false,
-            result_tx: dummy_tx,
+            owner: SubagentOwner::Task,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
         };
 
         let err = backend.spawn(request).await.unwrap_err();
@@ -780,7 +790,6 @@ mod tests {
             drop(req.result_tx);
         });
 
-        let (dummy_tx, _dummy_rx) = oneshot::channel();
         let request = SubagentRequest {
             id: "drop-test".to_string(),
             prompt: "test".to_string(),
@@ -793,9 +802,11 @@ mod tests {
             runtime_overrides: Default::default(),
             run_in_background: false,
             surface_completion: true,
+            await_to_completion: false,
             fork_context: false,
             advisor_gate_prevalidated: false,
-            result_tx: dummy_tx,
+            owner: SubagentOwner::Task,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
         };
 
         let err = backend.spawn(request).await.unwrap_err();

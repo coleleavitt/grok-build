@@ -3,11 +3,11 @@
 //! the real coordinator/transport.
 //!
 //!   SUBAGENT_SOAK_CYCLES=20000 cargo test -p xai-grok-tools \
-//!     [--features dhat-heap] --test test_subagent_soak -- --ignored --nocapture
+//!     [--features dhat] --test test_subagent_soak -- --ignored --nocapture
 
 #![cfg(unix)]
 
-#[cfg(feature = "dhat-heap")]
+#[cfg(feature = "dhat")]
 #[global_allocator]
 static DHAT_ALLOC: dhat::Alloc = dhat::Alloc;
 
@@ -27,8 +27,9 @@ use xai_grok_tools::implementations::grok_build::task::coordinator::{
     LocalBoxFuture, MAX_COMPLETED_ENTRIES, StartedChild, SubagentCoordinator, SubagentProgress,
 };
 use xai_grok_tools::implementations::grok_build::task::types::{
-    SubagentDescribeOutcome, SubagentOwner, SubagentRegistryCounts, SubagentRequest,
-    SubagentResult, SubagentValidateTypeOutcome,
+    SubagentAdvisorPreflightOutcome, SubagentDescribeOutcome, SubagentOwner,
+    SubagentRegistryCounts, SubagentRequest, SubagentResult, SubagentResumeSource,
+    SubagentValidateTypeOutcome,
 };
 
 const PARENT_SESSION_ID: &str = "subagent-soak-parent";
@@ -135,7 +136,7 @@ fn bytes_to_mib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
-#[cfg_attr(not(feature = "dhat-heap"), allow(dead_code))]
+#[cfg_attr(not(feature = "dhat"), allow(dead_code))]
 #[derive(Clone, Copy, Serialize)]
 struct HeapSample {
     blocks: i64,
@@ -243,7 +244,7 @@ struct Summary<'a> {
 }
 
 fn heap_capture() -> Option<HeapSample> {
-    #[cfg(feature = "dhat-heap")]
+    #[cfg(feature = "dhat")]
     {
         let stats = dhat::HeapStats::get();
         Some(HeapSample {
@@ -251,7 +252,7 @@ fn heap_capture() -> Option<HeapSample> {
             bytes: stats.curr_bytes as i64,
         })
     }
-    #[cfg(not(feature = "dhat-heap"))]
+    #[cfg(not(feature = "dhat"))]
     {
         None
     }
@@ -301,6 +302,7 @@ impl ChildRunner for SoakRunner {
     type CompletionData = ();
     type RunFuture = LocalBoxFuture<ChildRunOutput<()>>;
     type ValidateFuture = LocalBoxFuture<SubagentValidateTypeOutcome>;
+    type AdvisorValidateFuture = LocalBoxFuture<SubagentAdvisorPreflightOutcome>;
     type DescribeFuture = LocalBoxFuture<SubagentDescribeOutcome>;
 
     fn run(&self, run: ChildRunRequest<Self::Control>) -> Self::RunFuture {
@@ -363,6 +365,17 @@ impl ChildRunner for SoakRunner {
         Box::pin(std::future::ready(SubagentValidateTypeOutcome::Ok))
     }
 
+    fn validate_advisor(
+        &self,
+        _subagent_type: String,
+        _parent: String,
+        _prompt: String,
+        _resume_from: Option<String>,
+        _resume_source: Option<SubagentResumeSource>,
+    ) -> Self::AdvisorValidateFuture {
+        Box::pin(std::future::ready(SubagentAdvisorPreflightOutcome::Ok))
+    }
+
     fn describe_type(
         &self,
         _subagent_type: String,
@@ -390,6 +403,7 @@ fn soak_request(id: String, background: bool) -> SubagentRequest {
         surface_completion: true,
         await_to_completion: false,
         fork_context: false,
+        advisor_gate_prevalidated: false,
         owner: SubagentOwner::Task,
         cancel_token: CancellationToken::new(),
     }
@@ -596,7 +610,7 @@ fn assert_bounds(bounds: &Bounds, m: &Measurement) {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "subagent soak; run with --ignored (SUBAGENT_SOAK_CYCLES bounds the measured window)"]
 async fn subagent_lifecycle_soak_bounds_threads_fds_and_heap() {
-    #[cfg(feature = "dhat-heap")]
+    #[cfg(feature = "dhat")]
     let _profiler = dhat::Profiler::builder().testing().build();
 
     let bounds = Bounds::from_env();

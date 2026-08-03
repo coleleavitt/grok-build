@@ -20,6 +20,10 @@ impl xai_grok_tools::implementations::grok_build::task::coordinator::ChildRunner
         xai_grok_tools::implementations::grok_build::task::coordinator::LocalBoxFuture<
             xai_grok_tools::implementations::grok_build::task::types::SubagentValidateTypeOutcome,
         >;
+    type AdvisorValidateFuture =
+        xai_grok_tools::implementations::grok_build::task::coordinator::LocalBoxFuture<
+            xai_grok_tools::implementations::grok_build::task::types::SubagentAdvisorPreflightOutcome,
+        >;
     type DescribeFuture =
         xai_grok_tools::implementations::grok_build::task::coordinator::LocalBoxFuture<
             xai_grok_tools::implementations::grok_build::task::types::SubagentDescribeOutcome,
@@ -92,6 +96,85 @@ impl xai_grok_tools::implementations::grok_build::task::coordinator::ChildRunner
             crate::agent::subagent::validate_subagent_type(&subagent_type, &ctx)
         })
     }
+    fn validate_advisor(
+        &self,
+        subagent_type: String,
+        parent_session_id: String,
+        prompt: String,
+        resume_from: Option<String>,
+        resume_source: Option<
+            xai_grok_tools::implementations::grok_build::task::types::SubagentResumeSource,
+        >,
+    ) -> Self::AdvisorValidateFuture {
+        let agent_ref = self.agent_ref.clone();
+        Box::pin(async move {
+            use xai_grok_tools::implementations::grok_build::task::types::SubagentAdvisorPreflightOutcome;
+
+            let this = agent_ref.get();
+            let Some(ctx) = this.try_build_subagent_spawn_context(&parent_session_id) else {
+                tracing::warn!(
+                    parent_session_id,
+                    "advisor preflight for unknown/evicted parent session"
+                );
+                return SubagentAdvisorPreflightOutcome::ValidationUnavailable;
+            };
+            let resume_source = resume_source.map(|source| xai_grok_subagent_resolution::ResumeSourceData {
+                subagent_id: source.subagent_id,
+                child_session_id: source.child_session_id,
+                child_cwd: source.child_cwd,
+                worktree_path: source.worktree_path.map(std::path::PathBuf::from),
+                snapshot_ref: source.snapshot_ref,
+                subagent_type: source.subagent_type,
+                persona: source.persona,
+                model_id: source.model_id,
+                tokens_used: source.tokens_used,
+            });
+            let resume_source = resume_source.or_else(|| {
+                resume_from.as_deref().and_then(|source_id| {
+                    crate::agent::subagent::durable_resume_source_for(
+                        source_id,
+                        &parent_session_id,
+                        &ctx.parent_cwd,
+                    )
+                })
+            });
+
+            if resume_from.is_some() && resume_source.is_none() {
+                let source_id = resume_from.as_deref().unwrap_or_default();
+                return SubagentAdvisorPreflightOutcome::Rejected {
+                    message: format!(
+                        "Cannot resume from subagent '{source_id}': not found. The subagent may have been evicted or the ID is invalid."
+                    ),
+                };
+            }
+            if let Some(ref source) = resume_source
+                && let Err(error) = xai_grok_subagent_resolution::validate_resume_identity(
+                    &subagent_type,
+                    None,
+                    source,
+                )
+            {
+                return SubagentAdvisorPreflightOutcome::Rejected {
+                    message: error.to_string(),
+                };
+            }
+
+            match crate::agent::subagent::validate_advisor_effective_context_budget(
+                &parent_session_id,
+                &prompt,
+                &ctx,
+                resume_source.as_ref(),
+            )
+            .await
+            {
+                Ok(()) => SubagentAdvisorPreflightOutcome::Ok,
+                Err(error) => SubagentAdvisorPreflightOutcome::Rejected {
+                    message: error.to_string(),
+                },
+            }
+        })
+    }
+
     fn describe_type(
         &self,
         subagent_type: String,
@@ -161,9 +244,8 @@ impl MvpAgent {
             return;
         };
         let agent_ref = LocalRef::new(self);
-        use crate::agent::subagent::{BlockWaitSlot, is_running, resolve_snapshot};
-        use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentCancelOutcome, SubagentCancelTarget, SubagentEvent, is_valid_resume_id,
+        let runner = ShellChildRunner {
+            agent_ref: agent_ref.clone(),
         };
         let config =
             xai_grok_tools::implementations::grok_build::task::coordinator::CoordinatorConfig {
@@ -177,11 +259,11 @@ impl MvpAgent {
             };
         tokio::task::spawn_local(
             xai_grok_tools::implementations::grok_build::task::coordinator::SubagentCoordinator::new(
-                    rx,
-                    runner,
-                    config,
-                )
-                .run(),
+                rx,
+                runner,
+                config,
+            )
+            .run(),
         );
         let (trace_tx, mut trace_rx) = tokio::sync::mpsc::unbounded_channel::<
             crate::upload::turn::SyntheticTurnTraceRequest,
@@ -196,270 +278,7 @@ impl MvpAgent {
                         async move {
                             handle_synthetic_turn_trace(agent_ref, request).await;
                         }
-                        SubagentEvent::Query(query) => {
-                            let agent_ref = agent_ref.clone();
-                            tokio::task::spawn_local(async move {
-                                let subagent_id = query.subagent_id;
-                                let block = query.block;
-                                let timeout_ms = query.timeout_ms;
-                                let slot: BlockWaitSlot = std::rc::Rc::new(
-                                    std::cell::RefCell::new(Some(query.respond_to)),
-                                );
-                                let send_via_slot =
-                                    |slot: &BlockWaitSlot, snap| match slot.borrow_mut().take() {
-                                        Some(tx) => tx.send(snap).is_ok(),
-                                        None => false,
-                                    };
-                                let lookup = {
-                                    let this = agent_ref.get();
-                                    let result =
-                                        this.subagent_coordinator.borrow().lookup(&subagent_id);
-                                    if block && result.is_some() {
-                                        this.subagent_coordinator
-                                            .borrow_mut()
-                                            .register_block_wait(&subagent_id, slot.clone());
-                                    }
-                                    result
-                                };
-                                let snapshot = resolve_snapshot(lookup).await;
-                                let should_block =
-                                    block && snapshot.as_ref().is_some_and(is_running);
-                                if should_block {
-                                    let timeout_ms = timeout_ms.unwrap_or(30_000);
-                                    let deadline = tokio::time::Instant::now()
-                                        + tokio::time::Duration::from_millis(timeout_ms);
-                                    loop {
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(200))
-                                            .await;
-                                        let receiver_gone =
-                                            slot.borrow().as_ref().is_none_or(|tx| tx.is_closed());
-                                        if receiver_gone {
-                                            let this = agent_ref.get();
-                                            let mut coord = this.subagent_coordinator.borrow_mut();
-                                            coord.clear_block_waited(&subagent_id);
-                                            coord.unregister_block_wait(&subagent_id, &slot);
-                                            return;
-                                        }
-                                        let lookup = {
-                                            let this = agent_ref.get();
-                                            this.subagent_coordinator.borrow().lookup(&subagent_id)
-                                        };
-                                        let snap = resolve_snapshot(lookup).await;
-                                        let still_running = snap.as_ref().is_some_and(is_running);
-                                        if !still_running || tokio::time::Instant::now() >= deadline
-                                        {
-                                            {
-                                                let this = agent_ref.get();
-                                                let mut coord =
-                                                    this.subagent_coordinator.borrow_mut();
-                                                if still_running {
-                                                    coord.clear_block_waited(&subagent_id);
-                                                }
-                                                coord.unregister_block_wait(&subagent_id, &slot);
-                                            }
-                                            if !send_via_slot(&slot, snap) && !still_running {
-                                                let this = agent_ref.get();
-                                                this.subagent_coordinator
-                                                    .borrow_mut()
-                                                    .clear_block_waited(&subagent_id);
-                                            }
-                                            return;
-                                        }
-                                    }
-                                } else {
-                                    let delivered = send_via_slot(&slot, snapshot);
-                                    if block {
-                                        let this = agent_ref.get();
-                                        let mut coord = this.subagent_coordinator.borrow_mut();
-                                        coord.unregister_block_wait(&subagent_id, &slot);
-                                        if !delivered {
-                                            coord.clear_block_waited(&subagent_id);
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                        SubagentEvent::Cancel(request) => {
-                            let this = agent_ref.get();
-                            let outcome = {
-                                let mut coord = this.subagent_coordinator.borrow_mut();
-                                match request.target {
-                                    SubagentCancelTarget::SubagentId(ref subagent_id) => {
-                                        coord.mark_explicitly_killed(subagent_id);
-                                        coord.cancel_with_outcome(subagent_id)
-                                    }
-                                    SubagentCancelTarget::ParentPromptId(ref parent_prompt_id) => {
-                                        coord.cancel_by_parent_prompt_id(parent_prompt_id);
-                                        SubagentCancelOutcome::Cancelled
-                                    }
-                                }
-                            };
-                            let _ = request.respond_to.send(outcome);
-                        }
-                        SubagentEvent::ListActive(request) => {
-                            let this = agent_ref.get();
-                            let summaries = this
-                                .subagent_coordinator
-                                .borrow()
-                                .active_summaries_for(&request.parent_session_id);
-                            let _ = request.respond_to.send(summaries);
-                        }
-                        SubagentEvent::Completions(request) => {
-                            let this = agent_ref.get();
-                            let mut completions = this
-                                .subagent_coordinator
-                                .borrow_mut()
-                                .drain_pending_completions();
-                            completions.retain(|c| !request.suppress_ids.contains(&c.subagent_id));
-                            let _ = request.respond_to.send(completions);
-                        }
-                        SubagentEvent::Outstanding(request) => {
-                            let this = agent_ref.get();
-                            let reply = this
-                                .subagent_coordinator
-                                .borrow()
-                                .outstanding_reply_for_prompt(&request.prompt_id);
-                            let _ = request.respond_to.send(reply);
-                        }
-                        SubagentEvent::ClearUsageNotApplied(request) => {
-                            let this = agent_ref.get();
-                            this.subagent_coordinator
-                                .borrow_mut()
-                                .clear_subagent_usage_not_applied(&request.prompt_id);
-                        }
-                        SubagentEvent::MarkUsageNotApplied(request) => {
-                            let this = agent_ref.get();
-                            this.subagent_coordinator
-                                .borrow_mut()
-                                .mark_subagent_usage_not_applied(&request.prompt_id);
-                            let _ = request.respond_to.send(());
-                        }
-                        SubagentEvent::ValidateType(request) => {
-                            let agent_ref = agent_ref.clone();
-                            tokio::task::spawn_local(async move {
-                                let this = agent_ref.get();
-                                let ctx = this
-                                    .build_subagent_validation_context(&request.parent_session_id);
-                                let outcome = crate::agent::subagent::validate_subagent_type(
-                                    &request.subagent_type,
-                                    &ctx,
-                                );
-                                let _ = request.respond_to.send(outcome);
-                            });
-                        }
-                        SubagentEvent::ValidateAdvisor(request) => {
-                            let agent_ref = agent_ref.clone();
-                            tokio::task::spawn_local(async move {
-                                use xai_grok_tools::implementations::grok_build::task::types::SubagentAdvisorPreflightOutcome;
-                                let this = agent_ref.get();
-                                let outcome = match this
-                                    .try_build_subagent_spawn_context(&request.parent_session_id)
-                                {
-                                    Some(ctx) => {
-                                        let resume_source = if let Some(resume_id) = request
-                                            .resume_from
-                                            .as_deref()
-                                            .filter(|s| is_valid_resume_id(s))
-                                        {
-                                            let coord = this.subagent_coordinator.borrow();
-                                            if coord.is_active(resume_id) {
-                                                Some(Err(format!(
-                                                    "Cannot resume from subagent '{resume_id}': it is still running. \
-                                                     Wait for it to complete before resuming."
-                                                )))
-                                            } else {
-                                                match coord.resumable_source_for(
-                                                    resume_id,
-                                                    &ctx.parent_session_id,
-                                                    &ctx.parent_cwd,
-                                                ) {
-                                                    Some(info) => Some(Ok(info)),
-                                                    None => Some(Err(format!(
-                                                        "Cannot resume from subagent '{resume_id}': not found. \
-                                                         The subagent may have been evicted or the ID is invalid."
-                                                    ))),
-                                                }
-                                            }
-                                        } else {
-                                            None
-                                        };
-                                        let resume_source = match resume_source {
-                                            Some(Ok(source)) => Some(source),
-                                            Some(Err(message)) => {
-                                                let _ = request.respond_to.send(
-                                                    SubagentAdvisorPreflightOutcome::Rejected {
-                                                        message,
-                                                    },
-                                                );
-                                                return;
-                                            }
-                                            None => None,
-                                        };
-                                        if let Some(ref source) = resume_source
-                                            && let Err(e) = xai_grok_subagent_resolution::validate_resume_identity(
-                                                &request.subagent_type,
-                                                None,
-                                                source,
-                                            )
-                                        {
-                                            let _ = request.respond_to.send(
-                                                SubagentAdvisorPreflightOutcome::Rejected {
-                                                    message: e.to_string(),
-                                                },
-                                            );
-                                            return;
-                                        }
-                                        match crate::agent::subagent::validate_advisor_effective_context_budget(
-                                            &request.parent_session_id,
-                                            &request.prompt,
-                                            &ctx,
-                                            resume_source.as_ref(),
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => SubagentAdvisorPreflightOutcome::Ok,
-                                            Err(err) => SubagentAdvisorPreflightOutcome::Rejected {
-                                                message: err.to_string(),
-                                            },
-                                        }
-                                    }
-                                    None => {
-                                        tracing::warn!(
-                                            parent_session_id = % request.parent_session_id,
-                                            "ValidateAdvisor for unknown/evicted parent session, replying ValidationUnavailable",
-                                        );
-                                        SubagentAdvisorPreflightOutcome::ValidationUnavailable
-                                    }
-                                };
-                                let _ = request.respond_to.send(outcome);
-                            });
-                        }
-                        SubagentEvent::DescribeType(request) => {
-                            let agent_ref = agent_ref.clone();
-                            tokio::task::spawn_local(async move {
-                                use xai_grok_tools::implementations::grok_build::task::types::SubagentDescribeOutcome;
-                                let this = agent_ref.get();
-                                let outcome = match this
-                                    .try_build_subagent_spawn_context(&request.parent_session_id)
-                                {
-                                    Some(ctx) => crate::agent::subagent::describe_subagent_type(
-                                        &request.subagent_type,
-                                        request.harness_agent_type.as_deref(),
-                                        &ctx,
-                                    ),
-                                    None => {
-                                        tracing::warn!(
-                                            parent_session_id = % request.parent_session_id,
-                                            subagent_type = % request.subagent_type,
-                                            "DescribeType for unknown/evicted parent session, replying Unavailable",
-                                        );
-                                        SubagentDescribeOutcome::Unavailable
-                                    }
-                                };
-                                let _ = request.respond_to.send(outcome);
-                            });
-                        }
-                    }
+                    });
                 }
             }
         });

@@ -112,84 +112,6 @@ pub(crate) async fn run_shell_child(
             return child_run_output(failure_result(&request, &msg), completion_data, None);
         }
     }
-    if request.subagent_type == "advisor" && !request.advisor_gate_prevalidated {
-        let resume_source_for_advisor = if let Some(resume_id) = request
-            .resume_from
-            .as_deref()
-            .filter(|s| is_valid_resume_id(s))
-        {
-            let coord = coordinator.borrow();
-            if coord.is_active(resume_id) {
-                let msg = format!(
-                    "Cannot resume from subagent '{resume_id}': it is still running. \
-                     Wait for it to complete before resuming."
-                );
-                drop(coord);
-                send_pre_spawn_failure(request, &msg, coordinator, &ctx, gateway);
-                return;
-            }
-            match coord.resumable_source_for(resume_id, &ctx.parent_session_id, &ctx.parent_cwd) {
-                Some(info) => {
-                    drop(coord);
-                    Some(info)
-                }
-                None => {
-                    let msg = format!(
-                        "Cannot resume from subagent '{resume_id}': not found. \
-                         The subagent may have been evicted or the ID is invalid."
-                    );
-                    drop(coord);
-                    send_pre_spawn_failure(request, &msg, coordinator, &ctx, gateway);
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        if let Some(ref source) = resume_source_for_advisor
-            && let Err(e) = xai_grok_subagent_resolution::validate_resume_identity(
-                &request.subagent_type,
-                request.runtime_overrides.persona.as_deref(),
-                source,
-            )
-        {
-            send_pre_spawn_failure(request, &e.to_string(), coordinator, &ctx, gateway);
-            return;
-        }
-        if let Err(err) = crate::agent::subagent::validate_advisor_effective_context_budget(
-            &ctx.parent_session_id,
-            &request.prompt,
-            &ctx,
-            resume_source_for_advisor.as_ref(),
-        )
-        .await
-        {
-            let msg = format!("Advisor unavailable: {err}");
-            send_pre_spawn_failure(request, &msg, coordinator, &ctx, gateway);
-            return;
-        }
-    }
-    let run_in_background = request.run_in_background || definition.background.unwrap_or(false);
-    let cancel_token = CancellationToken::new();
-    coordinator.borrow_mut().insert_pending(PendingSubagent {
-        subagent_id: request.id.clone(),
-        subagent_type: request.subagent_type.clone(),
-        description: request.description.clone(),
-        persona: request.runtime_overrides.persona.clone(),
-        parent_prompt_id: request.parent_prompt_id.clone(),
-        parent_session_id: ctx.parent_session_id.clone(),
-        started_at: start,
-        run_in_background,
-        surface_completion: request.surface_completion,
-        color: definition.color,
-        cancel_token: cancel_token.clone(),
-    });
-    let mut pending_guard = PendingGuard {
-        coordinator,
-        id: request.id.clone(),
-        defused: false,
-        error: None,
-    };
     resolve_subagent_toolset(
         &request.subagent_type,
         request.runtime_overrides.harness_agent_type.as_deref(),
@@ -249,6 +171,7 @@ pub(crate) async fn run_shell_child(
                 subagent_type: info.subagent_type,
                 persona: info.persona,
                 model_id: info.model_id,
+                tokens_used: info.tokens_used,
             }),
             SubagentResumeLookup::Missing => {
                 match durable_resume_source_for(resume_id, &ctx.parent_session_id, &ctx.parent_cwd)
@@ -290,6 +213,19 @@ pub(crate) async fn run_shell_child(
                 None,
             );
         }
+    }
+    if request.subagent_type == "advisor"
+        && !request.advisor_gate_prevalidated
+        && let Err(error) = crate::agent::subagent::validate_advisor_effective_context_budget(
+            &ctx.parent_session_id,
+            &request.prompt,
+            &ctx,
+            resume_source.as_ref(),
+        )
+        .await
+    {
+        let message = format!("Advisor unavailable: {error}");
+        return child_run_output(failure_result(&request, &message), completion_data, None);
     }
     if let Some(error) = task_model_override_error(
         request.runtime_overrides.model.as_deref(),
@@ -1140,100 +1076,13 @@ pub(crate) async fn run_shell_child(
         if verbatim_mirror_fork {
             None
         } else if let Some(scope) = agent_memory_scope {
-            ctx.memory_config.as_ref().map(|mc| {
-                let mut c = mc.clone();
+            ctx.memory_config.as_ref().map(|memory| {
+                let mut memory = memory.clone();
                 let resolved = scope.resolve_dir(&agent_name_for_memory, &ctx.parent_cwd);
-                c.enabled = true;
-                c.root_dir_override = Some(resolved.path);
-                c.flat_memory_root = resolved.is_project_scoped;
-                c
-            })
-        } else {
-            ctx.memory_config.clone()
-        },
-        false,
-        Default::default(),
-        ctx.managed_mcp_state.clone(),
-        None,
-        ctx.managed_mcp_proxy_base_url.clone(),
-        effective_model_id,
-        ctx.yolo_mode
-            || matches!(
-                agent_permission_mode,
-                xai_grok_agent::config::PermissionMode::BypassPermissions
-            ),
-        Some(ctx.auth_manager.clone()),
-        attribution_callback,
-        tool_ctx,
-        agent_mcp_servers,
-        vec![],
-        Default::default(),
-        parent_mcp_pool,
-        Vec::new(),
-        true,
-        false,
-        None,
-        persistence,
-        forked_conversation,
-        None,
-        None,
-        initial_child_tokens,
-        crate::session::StartupHints {
-            inherited_prefix_len: Some(inherited_prefix_len),
-            is_subagent: true,
-            parent_session_id: Some(ctx.parent_session_id.clone()),
-            subagent_type: Some(request.subagent_type.clone()),
-            preserve_inherited_system: verbatim_mirror_fork,
-            ..Default::default()
-        },
-        xai_grok_workspace::permission::ClientType::Generic,
-        ctx.resolve_auto_compact_threshold_percent(&subagent_model_id),
-        xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_string(),
-        xai_chat_state::CompactionMode::Summary,
-        ctx.resolve_compaction_verbatim_input(),
-        false,
-        None,
-        None,
-        std::sync::Arc::new(parking_lot::Mutex::new(
-            xai_grok_workspace::file_system::CodebaseIndexManager::new(),
-        )),
-        false,
-        subagent_fs_watch,
-        None,
-        None,
-        None,
-        None,
-        false,
-        false,
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        definition,
-        subagent_session_default_agent_profile,
-        if inherit_skills {
-            ctx.parent_skills_config.clone()
-        } else {
-            xai_grok_agent::prompt::skills::SkillsConfig::default()
-        },
-        if inherit_skills {
-            ctx.parent_skills.take()
-        } else {
-            None
-        },
-        ctx.parent_compat,
-        false,
-        None,
-        None,
-        None,
-        None,
-        if verbatim_mirror_fork {
-            None
-        } else if let Some(scope) = agent_memory_scope {
-            ctx.memory_config.as_ref().map(|mc| {
-                let mut c = mc.clone();
-                let resolved = scope.resolve_dir(&agent_name_for_memory, &ctx.parent_cwd);
-                c.enabled = true;
-                c.root_dir_override = Some(resolved.path);
-                c.flat_memory_root = resolved.is_project_scoped;
-                c
+                memory.enabled = true;
+                memory.root_dir_override = Some(resolved.path);
+                memory.flat_memory_root = resolved.is_project_scoped;
+                memory
             })
         } else {
             ctx.memory_config.clone()
@@ -1260,14 +1109,16 @@ pub(crate) async fn run_shell_child(
         ctx.app_builder_deployer_config.clone(),
         ctx.write_file_enabled,
         ctx.goal_enabled,
+        ctx.background_workflows_enabled,
         true,
+        ctx.subagents_max_depth,
         ctx.ask_user_question_enabled,
         true,
         false,
         ctx.client_hooks.clone(),
         None,
         std::collections::HashMap::new(),
-        ctx.persona_io_summaries.clone(),
+        Vec::new(),
         xai_grok_agent::prompt::context::PromptAudience::Subagent,
         effective_runtime.role_prompt.clone(),
         None,
@@ -1290,9 +1141,18 @@ pub(crate) async fn run_shell_child(
         std::mem::take(&mut ctx.remote_settings),
         std::mem::take(&mut ctx.laziness_debug_log),
         ctx.parent_terminal_backend.clone(),
-        ctx.parent_scheduler_handle.clone(),
+        if request.owner.is_workflow() {
+            None
+        } else {
+            ctx.parent_scheduler_handle.clone()
+        },
         subagent_max_turns,
-        forked_tool_override,
+        if verbatim_mirror_fork && !request.owner.is_workflow() {
+            std::mem::take(&mut ctx.parent_tool_definitions)
+        } else {
+            None
+        },
+        false,
     )
     .await;
     let (child_handle, mut permission_rx, _system_prompt, child_thread) = match spawn_result {

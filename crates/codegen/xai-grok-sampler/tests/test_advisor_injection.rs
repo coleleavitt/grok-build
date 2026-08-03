@@ -84,6 +84,8 @@ fn gate_active_config(base_url: String, model: &str) -> SamplerConfig {
         api_backend: ApiBackend::Messages,
         auth_scheme: AuthScheme::Bearer,
         extra_headers: IndexMap::new(),
+        query_params: IndexMap::new(),
+        env_http_headers: IndexMap::new(),
         context_window: 128_000,
         force_http1: false,
         max_retries: Some(0),

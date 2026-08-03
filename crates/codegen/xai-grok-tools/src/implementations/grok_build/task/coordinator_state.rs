@@ -8,9 +8,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::types::{
-    ActiveSubagentSummary, SubagentCompletionSummary, SubagentDescribeOutcome, SubagentInspection,
-    SubagentRequest, SubagentResult, SubagentResumeLookup, SubagentSnapshot,
-    SubagentSnapshotStatus, SubagentValidateTypeOutcome,
+    ActiveSubagentSummary, SubagentAdvisorPreflightOutcome, SubagentCompletionSummary,
+    SubagentDescribeOutcome, SubagentInspection, SubagentRequest, SubagentResult,
+    SubagentResumeLookup, SubagentResumeSource, SubagentSnapshot, SubagentSnapshotStatus,
+    SubagentValidateTypeOutcome,
 };
 
 /// Cap on retained completed-subagent entries before the oldest are evicted.
@@ -98,6 +99,7 @@ pub trait ChildRunner: 'static {
     type CompletionData: Default + 'static;
     type RunFuture: Future<Output = ChildRunOutput<Self::CompletionData>> + 'static;
     type ValidateFuture: Future<Output = SubagentValidateTypeOutcome> + 'static;
+    type AdvisorValidateFuture: Future<Output = SubagentAdvisorPreflightOutcome> + 'static;
     type DescribeFuture: Future<Output = SubagentDescribeOutcome> + 'static;
 
     fn run(&self, request: ChildRunRequest<Self::Control>) -> Self::RunFuture;
@@ -107,6 +109,15 @@ pub trait ChildRunner: 'static {
         subagent_type: String,
         parent_session_id: String,
     ) -> Self::ValidateFuture;
+
+    fn validate_advisor(
+        &self,
+        subagent_type: String,
+        parent_session_id: String,
+        prompt: String,
+        resume_from: Option<String>,
+        resume_source: Option<SubagentResumeSource>,
+    ) -> Self::AdvisorValidateFuture;
 
     fn describe_type(
         &self,

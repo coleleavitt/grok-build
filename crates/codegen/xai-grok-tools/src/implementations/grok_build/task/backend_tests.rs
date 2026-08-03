@@ -60,6 +60,7 @@ async fn channel_backend_spawn_success() {
         surface_completion: true,
         await_to_completion: false,
         fork_context: false,
+        advisor_gate_prevalidated: false,
         owner: super::super::types::SubagentOwner::Task,
         cancel_token: tokio_util::sync::CancellationToken::new(),
     };
@@ -93,6 +94,7 @@ async fn channel_backend_spawn_closed_channel() {
         surface_completion: true,
         await_to_completion: false,
         fork_context: false,
+        advisor_gate_prevalidated: false,
         owner: super::super::types::SubagentOwner::Task,
         cancel_token: tokio_util::sync::CancellationToken::new(),
     };
@@ -240,6 +242,7 @@ async fn workflow_spawn_future_drop_cancels_but_task_drop_does_not() {
             surface_completion: false,
             await_to_completion: true,
             fork_context: false,
+            advisor_gate_prevalidated: false,
             owner,
             cancel_token: tokio_util::sync::CancellationToken::new(),
         }
@@ -293,6 +296,7 @@ async fn channel_backend_spawn_result_dropped() {
         surface_completion: true,
         await_to_completion: false,
         fork_context: false,
+        advisor_gate_prevalidated: false,
         owner: super::super::types::SubagentOwner::Task,
         cancel_token: tokio_util::sync::CancellationToken::new(),
     };

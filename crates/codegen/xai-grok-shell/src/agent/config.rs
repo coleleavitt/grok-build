@@ -1,6 +1,7 @@
 use crate::agent::auth_method::ModelByok;
 use crate::agent::model_providers::{
-    ModelProviderConfig, auth_config_issues, model_provider_auth_name, parse_model_providers,
+    ModelProviderConfig as ModelProviderDefaultsConfig, auth_config_issues,
+    model_provider_auth_name, parse_model_providers,
 };
 use crate::auth::{AuthManager, GrokComConfig, OidcAuthConfig};
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
@@ -1363,7 +1364,7 @@ pub struct Config {
     #[serde(skip)]
     pub config_models: IndexMap<String, ConfigModelOverride>,
     #[serde(skip)]
-    pub model_override_warnings: Vec<super::config_model_override_parse::ModelOverrideWarning>,
+    pub config_warnings: Vec<super::config_model_override_parse::ConfigWarning>,
     /// `[provider.<id>]` provider/model catalog contributions. This mirrors the
     /// plugin manifest shape and lets provider-style plugins/config add models
     /// before ordinary `[model.*]` overrides are applied.
@@ -1375,7 +1376,7 @@ pub struct Config {
     #[serde(skip)]
     pub auth_providers: IndexMap<String, crate::auth::AuthProviderConfig>,
     #[serde(skip)]
-    pub model_providers: IndexMap<String, ModelProviderConfig>,
+    pub model_providers: IndexMap<String, ModelProviderDefaultsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shortcuts: Option<toml::Value>,
     /// Written by the client via `config_toml_edit`; absorbed so it isn't
@@ -1809,7 +1810,7 @@ impl Default for Config {
             worktree: WorktreeConfigSection::default(),
             auto_mode: AutoModeConfig::default(),
             config_models: IndexMap::new(),
-            model_override_warnings: Vec::new(),
+            config_warnings: Vec::new(),
             provider: IndexMap::new(),
             grok_com_config: GrokComConfig::default(),
             auth_providers: IndexMap::new(),

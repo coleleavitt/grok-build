@@ -698,6 +698,8 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::AdvisorTool>();
         b.register::<grok_build::ResearchTool>();
         b.register::<grok_build::BountyTool>();
+        b.register::<grok_build::BrainSearchTool>();
+        b.register::<grok_build::BrainGetTool>();
         b.register::<grok_build::WebSearchTool>();
         b.register_with_params::<grok_build::WebFetchTool, grok_build::web_fetch::WebFetchParams>();
         b.register::<grok_build::LspTool>();
@@ -2898,6 +2900,8 @@ mod tests {
             "GrokBuild:search_replace",
             "GrokBuild:list_dir",
             "GrokBuild:grep",
+            "GrokBuild:brain_search",
+            "GrokBuild:brain_get",
             "GrokBuild:get_terminal_command_output",
             "GrokBuild:kill_terminal_command",
         ] {
@@ -2928,6 +2932,8 @@ mod tests {
             ("GrokBuild:search_replace", ToolKind::Edit),
             ("GrokBuild:grep", ToolKind::Search),
             ("GrokBuild:list_dir", ToolKind::List),
+            ("GrokBuild:brain_search", ToolKind::MemorySearch),
+            ("GrokBuild:brain_get", ToolKind::MemoryGet),
         ] {
             assert_eq!(
                 kinds.get(id),

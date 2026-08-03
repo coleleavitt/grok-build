@@ -601,9 +601,12 @@ impl ChannelSpawner {
         harness_agent_type: Option<String>,
         resume_from: Option<&str>,
     ) -> Result<String, SpawnError> {
+        use xai_grok_tools::implementations::grok_build::task::backend::{
+            ChannelBackend, SubagentBackend,
+        };
         use xai_grok_tools::implementations::grok_build::task::spawn::SubagentSpawnParams;
-        use xai_grok_tools::implementations::grok_build::task::types::SubagentEvent;
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let backend =
+            ChannelBackend::for_session(self.event_tx.clone(), self.parent_session_id.clone());
         let request = SubagentSpawnParams {
             id: Some(id.to_string()),
             prompt,
@@ -617,17 +620,10 @@ impl ChannelSpawner {
             harness_agent_type,
             ..Default::default()
         }
-        .into_request_with_result_tx(result_tx);
-        if self
-            .event_tx
-            .send(SubagentEvent::Spawn(Box::new(request)))
-            .is_err()
-        {
-            return Err(SpawnError::Transport(
-                "subagent coordinator channel closed".to_string(),
-            ));
-        }
-        let result = result_rx
+        .into_request();
+        let _foreground_wait = self.foreground_wait.as_ref().map(|wait| wait.enter());
+        let result = backend
+            .spawn(request)
             .await
             .map_err(|error| SpawnError::Transport(error.to_string()))?;
         if result.backgrounded {

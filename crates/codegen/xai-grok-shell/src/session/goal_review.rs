@@ -999,7 +999,7 @@ impl SubagentReviewAgent {
         }
         .into_request_with_result_tx(result_tx);
         self.event_tx
-            .send(SubagentEvent::Spawn(Box::new(request)))
+            .send(SubagentEvent::Spawn(request))
             .map_err(|_| anyhow::anyhow!("subagent coordinator channel closed"))?;
         let result = result_rx.await.context("subagent result channel dropped")?;
         if !result.success {

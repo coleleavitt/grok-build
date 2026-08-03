@@ -782,17 +782,15 @@ impl ReasoningEffort {
             Self::Medium => crate::rs::ReasoningEffort::Medium,
             Self::High => crate::rs::ReasoningEffort::High,
             Self::Xhigh => crate::rs::ReasoningEffort::Xhigh,
-            Self::Max => crate::rs::ReasoningEffort::Xhigh,
+            Self::Max => crate::rs::ReasoningEffort::Max,
         }
     }
 
-    /// OpenAI/xAI-compatible backends currently cap at `xhigh`; Anthropic
-    /// Messages supports the separate `max` value via [`Self::to_messages_api`].
+    /// Convert to the OpenAI-compatible Chat Completions effort value.
+    /// Model capability filtering decides whether `max` can be selected, so
+    /// the wire conversion preserves the chosen level instead of weakening it.
     pub fn to_chat_completions_api(self) -> Self {
-        match self {
-            Self::Max => Self::Xhigh,
-            other => other,
-        }
+        self
     }
 
     /// Inverse of [`to_responses_api`](Self::to_responses_api): the effort the

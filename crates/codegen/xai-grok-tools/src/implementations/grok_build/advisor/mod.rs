@@ -264,7 +264,7 @@ mod tests {
         ChannelBackend, SubagentBackendResource,
     };
     use crate::implementations::grok_build::task::types::{
-        SubagentAdvisorPreflightOutcome, SubagentEvent, SubagentRequest, SubagentResult,
+        SubagentAdvisorPreflightOutcome, SubagentEvent, SubagentResult, SubagentSpawnRequest,
         SubagentValidateTypeOutcome,
     };
     use crate::types::resources::Resources;
@@ -318,9 +318,9 @@ mod tests {
         resources
     }
 
-    fn unwrap_spawn(event: SubagentEvent) -> SubagentRequest {
+    fn unwrap_spawn(event: SubagentEvent) -> SubagentSpawnRequest {
         match event {
-            SubagentEvent::Spawn(r) => *r,
+            SubagentEvent::Spawn(request) => request,
             _ => panic!("Expected SubagentEvent::Spawn"),
         }
     }
@@ -408,13 +408,14 @@ mod tests {
             assert!(request.fork_context, "advisor must fork parent context");
             assert!(request.advisor_gate_prevalidated);
             assert_eq!(request.parent_session_id, "parent-session");
+            let id = request.id.clone();
             request
                 .result_tx
                 .send(SubagentResult {
                     success: true,
                     output: std::sync::Arc::from("Risks: none. Recommendation: proceed."),
-                    subagent_id: request.id.clone(),
-                    child_session_id: request.id.clone(),
+                    subagent_id: id.clone(),
+                    child_session_id: id,
                     tool_calls: 1,
                     turns: 1,
                     duration_ms: 42,
@@ -451,13 +452,14 @@ mod tests {
         let handle = tokio::spawn(async move {
             let request = unwrap_spawn(rx.recv().await.unwrap());
             assert_eq!(request.prompt, DEFAULT_ADVISOR_PROMPT);
+            let id = request.id.clone();
             request
                 .result_tx
                 .send(SubagentResult {
                     success: true,
                     output: "ok".into(),
-                    subagent_id: request.id.clone(),
-                    child_session_id: request.id.clone(),
+                    subagent_id: id.clone(),
+                    child_session_id: id,
                     ..Default::default()
                 })
                 .unwrap();
@@ -482,13 +484,14 @@ mod tests {
         let handle = tokio::spawn(async move {
             let request = unwrap_spawn(rx.recv().await.unwrap());
             assert_eq!(request.prompt, "check auth");
+            let id = request.id.clone();
             request
                 .result_tx
                 .send(SubagentResult {
                     success: true,
                     output: "ok".into(),
-                    subagent_id: request.id.clone(),
-                    child_session_id: request.id.clone(),
+                    subagent_id: id.clone(),
+                    child_session_id: id,
                     ..Default::default()
                 })
                 .unwrap();
@@ -621,10 +624,11 @@ mod tests {
 
         let drain = tokio::spawn(async move {
             if let Some(SubagentEvent::Spawn(boxed)) = rx.recv().await {
+                let id = boxed.id.clone();
                 let _ = boxed.result_tx.send(SubagentResult {
                     backgrounded: true,
-                    subagent_id: boxed.id.clone(),
-                    child_session_id: boxed.id.clone(),
+                    subagent_id: id.clone(),
+                    child_session_id: id,
                     ..Default::default()
                 });
             }

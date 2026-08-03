@@ -19,7 +19,7 @@ use tracing::Instrument;
 
 use xai_grok_sampling_types::{
     ConversationRequest, ConversationResponse, EmptyResponseContext, ProviderRequestAdapter,
-    SamplingError, error::Result as SamplingResult,
+    SamplingError, SentCredential, error::Result as SamplingResult,
 };
 
 use crate::client::{ApiBackend, SamplingClient};
@@ -461,6 +461,14 @@ fn rate_limit_retry_threshold(config: &SamplerConfig, retry_policy: &RetryPolicy
         retry_mod::RATE_LIMIT_RETRY_THRESHOLD
     } else {
         retry_policy.rate_limit_retry_threshold
+    }
+}
+
+async fn sleep_or_cancel(duration: Duration, cancel_token: &CancellationToken) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => false,
+        _ = tokio::time::sleep(duration) => true,
     }
 }
 

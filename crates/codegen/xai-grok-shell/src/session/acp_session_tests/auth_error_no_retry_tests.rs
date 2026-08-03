@@ -199,10 +199,12 @@ async fn sampler_401_recovery_returns_refresh_and_retry() {
             assert!(
                 matches!(
                     result,
-                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit(reason))
-                        if reason.status_code == Some(401)
+                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                        credential: xai_grok_sampling_types::SentCredential::Unknown,
+                        store: RecoveredStore::SessionToken,
+                    })
                 ),
-                "session-based auth with a working refresher must return RefreshAuthAndResubmit with 401 status"
+                "session-based auth with a working refresher must return RefreshAuthAndResubmit for the session-token store"
             );
             assert!(called.load(Ordering::SeqCst), "refresher must be invoked");
         })
@@ -783,8 +785,10 @@ async fn sampler_401_session_method_with_stale_api_key_auth_type_still_recovers(
             assert!(
                 matches!(
                     result,
-                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit(reason))
-                        if reason.status_code == Some(401)
+                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                        credential: xai_grok_sampling_types::SentCredential::Unknown,
+                        store: RecoveredStore::SessionToken,
+                    })
                 ),
                 "session-based method must recover even when auth_type transiently reads ApiKey"
             );
@@ -821,8 +825,10 @@ async fn sampler_401_oidc_method_with_stale_api_key_auth_type_still_recovers() {
             assert!(
                 matches!(
                     result,
-                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit(reason))
-                        if reason.status_code == Some(401)
+                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                        credential: xai_grok_sampling_types::SentCredential::Unknown,
+                        store: RecoveredStore::SessionToken,
+                    })
                 ),
                 "oidc method must recover even when auth_type transiently reads ApiKey"
             );
@@ -1201,8 +1207,8 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
 // `XApiKey` (static key) when reachable; absent, it leaves the default
 // `Bearer` untouched. That makes the positive leg genuinely reachable
 // end-to-end here. The `auth_scheme != Bearer` leg is instead forced
-// hermetically via the `model_auth_facts` test-only memo (mirroring
-// `model_auth_facts_memo_serves_cached_status_and_keys_on_model` above),
+// hermetically via the `model_auth_memo` test-only cache (mirroring
+// `model_auth_memo_serves_cached_status_and_keys_on_model` above),
 // since flipping it via the live-credential branch is not test-controllable
 // without touching the (frozen) implementation. These four tests cover the
 // full AND end-to-end through the real `SessionActor::reconstruct_full_config`,
@@ -1322,7 +1328,7 @@ async fn advisor_server_model_none_when_backend_is_not_messages() {
         .await;
 }
 
-/// Negative: forcing `auth_scheme: XApiKey` via the `model_auth_facts` memo
+/// Negative: forcing `auth_scheme: XApiKey` via the `model_auth_memo` cache
 /// (the one axis the live-credential branch would otherwise flip, made
 /// hermetic here) must suppress `advisor_server_model` even with
 /// `server_advisor: true`, `Messages`, and an anthropic adapter all set --
@@ -1355,13 +1361,16 @@ async fn advisor_server_model_none_when_auth_scheme_is_not_bearer() {
                 });
             let model = slim.model.clone();
             actor.chat_state_handle.update_sampling_config(slim);
-            actor.model_auth_facts.replace(Some((
-                model,
-                ModelAuthFacts {
-                    byok: ModelByok::Byok,
-                    auth_scheme: xai_grok_sampler::AuthScheme::XApiKey,
-                },
-            )));
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: model,
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::Byok,
+                        auth_scheme: xai_grok_sampler::AuthScheme::XApiKey,
+                    },
+                    provider: None,
+                }));
 
             let cfg = actor.reconstruct_full_config().await;
 

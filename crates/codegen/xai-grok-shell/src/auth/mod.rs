@@ -23,6 +23,12 @@ pub use anthropic_cli::{
     AnthropicAuthArgs, AnthropicAuthCommand, AnthropicLoginArgs, AuthArgs, AuthCommand,
     run_cli_anthropic_auth, run_cli_auth,
 };
+pub use auth_provider::{AuthProviderConfig, AuthProviderRef};
+pub(crate) use auth_provider::{
+    PROVIDER_TIMEOUT_CEILING_SECS, PROVIDER_TOKEN_EXPIRY_SKEW_SECS, ProviderRefreshOutcome,
+};
+#[cfg(test)]
+pub(crate) use auth_provider::{test_backdate_provider_mint, test_counting_provider};
 pub(crate) use config::LEGACY_AUTH_SCOPE;
 pub use config::{
     ForceLoginTeam, GrokComConfig, OAuth2ProviderConfig, OidcAuthConfig, PreferredAuthMethod,

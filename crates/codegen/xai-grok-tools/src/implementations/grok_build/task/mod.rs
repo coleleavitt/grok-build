@@ -15,8 +15,12 @@
 //! - `TaskModelValidator` — validates explicit model slugs before spawn
 
 pub mod backend;
+pub mod coordinator;
+mod coordinator_state;
 pub mod spawn;
 pub mod types;
+
+pub use coordinator_state::{cap_completion_output, completion_summary};
 
 use self::backend::SubagentBackendResource;
 use self::spawn::SubagentSpawnParams;
@@ -181,9 +185,6 @@ impl xai_tool_runtime::Tool for TaskTool {
     ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
         use crate::types::tool_metadata::shared_resources;
         let resources = shared_resources(&ctx)?;
-        let tool_cancellation = ctx
-            .get::<xai_tool_runtime::Cancellation>()
-            .map(|cancellation| cancellation.0.clone());
 
         // 1. Depth check
         let (
@@ -1863,13 +1864,14 @@ mod tests {
                 request.advisor_gate_prevalidated,
                 "TaskTool must reserve advisor budget before coordinator spawn"
             );
+            let id = request.id.clone();
             request
                 .result_tx
                 .send(SubagentResult {
                     success: true,
                     output: "advice".into(),
-                    subagent_id: request.id.clone(),
-                    child_session_id: request.id.clone(),
+                    subagent_id: id.clone(),
+                    child_session_id: id,
                     ..Default::default()
                 })
                 .unwrap();
@@ -1922,13 +1924,14 @@ mod tests {
                 !request.advisor_gate_prevalidated,
                 "deep-research must not consume advisor budget"
             );
+            let id = request.id.clone();
             request
                 .result_tx
                 .send(SubagentResult {
                     success: true,
                     output: "# Research report\n\n[C1] evidence".into(),
-                    subagent_id: request.id.clone(),
-                    child_session_id: request.id.clone(),
+                    subagent_id: id.clone(),
+                    child_session_id: id,
                     tool_calls: 2,
                     turns: 1,
                     ..Default::default()

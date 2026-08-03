@@ -1840,6 +1840,7 @@ mod tests {
                 &[],
                 all_gated(),
                 SkillSlashRewrite::default(),
+                &[],
             )
             .unwrap_err();
             match outcome {
@@ -1865,6 +1866,7 @@ mod tests {
             &skills,
             CommandAvailability::default(),
             SkillSlashRewrite::default(),
+            &[],
         )
         .unwrap_err();
         assert!(matches!(

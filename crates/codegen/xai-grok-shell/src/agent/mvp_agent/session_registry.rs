@@ -166,6 +166,12 @@ impl SessionRegistry {
             e.resident.get_or_insert_default().codebase_index = Some(index);
         });
     }
+    #[cfg(test)]
+    pub(super) fn mark_require_gateway(&self, id: &acp::SessionId) {
+        self.edit(id, |e| {
+            e.resident.get_or_insert_default().require_gateway = true;
+        });
+    }
     /// Destructured so a new field has to be counted, or go unmeasured.
     pub(super) fn counts(&self) -> SessionCounts {
         let mut counts = SessionCounts::default();

@@ -743,6 +743,7 @@ pub struct SubagentResumeSource {
     pub subagent_type: String,
     pub persona: Option<String>,
     pub model_id: Option<String>,
+    pub tokens_used: u64,
 }
 
 /// Result of a resume-source lookup.

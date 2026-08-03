@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use xai_grok_sampling_types::error::{try_parse_stream_error, user_facing_api_error_message};
+use xai_grok_sampling_types::error::{
+    parse_error_bytes, try_parse_stream_error, user_facing_api_error_message,
+};
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
     ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
@@ -1321,16 +1323,22 @@ impl SamplingClient {
                 x_api_key_prefix = x_api_key_prefix.as_deref().unwrap_or("none"),
             );
         }
-        let sent_bearer = Self::sent_fragment_from_headers(&headers, &self.defaults.auth_scheme);
         if let Some(injector) = &self.header_injector {
             injector.inject(&mut headers);
         }
         headers
     }
 
-    /// POST with default headers.
-    fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
-        self.http.post(url).headers(self.request_headers())
+    /// POST with default headers and the credential fragment placed on the
+    /// request. Capturing it at build time keeps 401 attribution stable even
+    /// if a live credential resolver rotates immediately afterward.
+    fn post(&self, url: impl reqwest::IntoUrl) -> SentRequest {
+        let headers = self.request_headers();
+        let sent_bearer = Self::sent_fragment_from_headers(&headers, &self.defaults.auth_scheme);
+        SentRequest {
+            builder: self.http.post(url).headers(headers),
+            sent_bearer,
+        }
     }
 
     fn apply_messages_request_adapter(&self, request: &mut messages::MessagesRequest) {
@@ -1777,6 +1785,7 @@ impl SamplingClient {
             &mut request_body,
         )
         .await?;
+        let sent_bearer = Self::sent_fragment_from_headers(&headers, &self.defaults.auth_scheme);
         let http_request = grok_headers
             .apply(
                 self.http
@@ -2147,6 +2156,7 @@ impl SamplingClient {
         let mut headers = self.request_headers();
         self.apply_command_adapter("responses", &model_id, &mut headers, &mut request_body)
             .await?;
+        let sent_bearer = Self::sent_fragment_from_headers(&headers, &self.defaults.auth_scheme);
         let mut http_request = grok_headers
             .apply(self.http.post(self.endpoint("responses")).headers(headers))
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -2359,6 +2369,7 @@ impl SamplingClient {
         self.apply_anthropic_cli_headers(&mut headers, &model_id);
         self.apply_command_adapter("messages", &model_id, &mut headers, &mut request_body)
             .await?;
+        let sent_bearer = Self::sent_fragment_from_headers(&headers, &self.defaults.auth_scheme);
         // Same provider-rejection retry as the streaming path: strip the field
         // the provider named in a 400 and send once more without it. Fields
         // this model already rejected in this process are dropped up front.
@@ -2450,16 +2461,7 @@ impl SamplingClient {
                 continue;
             }
 
-            let req_headers =
-                self.format_request_headers(x_grok_conv_id, x_grok_req_id, &model_id, false);
-
-            let message = self.build_api_error_message(
-                status,
-                &server_message,
-                &self.endpoint("messages"),
-                &req_headers,
-                None,
-            );
+            let message = user_facing_api_error_message(status, bytes.as_ref());
             tracing::warn!(
                 status = %status,
                 error_message = %message,
@@ -2552,6 +2554,7 @@ impl SamplingClient {
         self.apply_anthropic_cli_headers(&mut headers, &model_id);
         self.apply_command_adapter("messages", &model_id, &mut headers, &mut request_body)
             .await?;
+        let sent_bearer = Self::sent_fragment_from_headers(&headers, &self.defaults.auth_scheme);
         // Providers reject some fields deterministically: Anthropic 400s on an
         // explicit `temperature` for newer models, and on JSON Schema keywords
         // its structured-output validator does not implement. Those are
@@ -2651,13 +2654,7 @@ impl SamplingClient {
                 continue;
             }
 
-            let message = self.build_api_error_message(
-                status,
-                &server_message,
-                &self.endpoint("messages"),
-                &req_headers,
-                Some(&resp_headers),
-            );
+            let message = user_facing_api_error_message(status, bytes.as_ref());
 
             span.record("error", message.as_str());
             tracing::error!(
@@ -3244,6 +3241,7 @@ mod tests {
             id: id.to_owned(),
             name: "bash".to_owned(),
             input: serde_json::json!({}),
+            cache_control: None,
         }
     }
 
@@ -3272,6 +3270,7 @@ mod tests {
                     messages::ContentBlock::ToolUse { .. } => "tool_use",
                     messages::ContentBlock::ToolResult { .. } => "tool_result",
                     messages::ContentBlock::Thinking { .. } => "thinking",
+                    messages::ContentBlock::RedactedThinking { .. } => "redacted_thinking",
                 })
                 .collect(),
         }

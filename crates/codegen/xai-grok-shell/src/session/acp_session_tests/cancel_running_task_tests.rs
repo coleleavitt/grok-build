@@ -361,6 +361,8 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                 model: "test-model".to_string(),
                 max_completion_tokens: None,
                 extra_headers: Default::default(),
+                query_params: Default::default(),
+                env_http_headers: Default::default(),
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),

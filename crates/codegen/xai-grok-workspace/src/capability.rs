@@ -162,9 +162,8 @@ pub(crate) fn kind_allowed(mode: CapabilityMode, kind: ToolKind) -> bool {
         Execute => matches!(mode, M::Execute),
 
         // Process control (background tasks, monitors).
-        BackgroundTaskAction | WaitTasksAction | KillTaskAction | Task | Bounty | Monitor => {
-            matches!(mode, M::Execute)
-        }
+        BackgroundTaskAction | WaitTasksAction | KillTaskAction | Task | Bounty | Monitor
+        | Workflow => matches!(mode, M::Execute),
 
         // Integration dispatch.
         UseTool => matches!(mode, M::ReadWrite | M::Execute),

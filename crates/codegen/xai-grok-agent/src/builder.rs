@@ -813,6 +813,7 @@ impl AgentBuilder {
                 .tools
                 .retain(|tc| tc.kind != Some(ToolKind::Advisor));
         }
+        apply_workflow_tool_gates(&mut tool_config, self.background_workflows_enabled);
         let task_tool_id = format!(
             "{}:{}",
             xai_grok_tools::types::tool::ToolNamespace::GrokBuild,

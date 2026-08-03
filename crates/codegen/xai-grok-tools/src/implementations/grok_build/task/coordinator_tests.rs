@@ -48,6 +48,7 @@ impl ChildRunner for TestRunner {
     type CompletionData = ();
     type RunFuture = SendBoxFuture<ChildRunOutput<()>>;
     type ValidateFuture = SendBoxFuture<SubagentValidateTypeOutcome>;
+    type AdvisorValidateFuture = SendBoxFuture<SubagentAdvisorPreflightOutcome>;
     type DescribeFuture = SendBoxFuture<SubagentDescribeOutcome>;
 
     fn run(&self, run: ChildRunRequest<Self::Control>) -> Self::RunFuture {
@@ -135,6 +136,17 @@ impl ChildRunner for TestRunner {
         Box::pin(std::future::ready(SubagentValidateTypeOutcome::Ok))
     }
 
+    fn validate_advisor(
+        &self,
+        _subagent_type: String,
+        _parent_session_id: String,
+        _prompt: String,
+        _resume_from: Option<String>,
+        _resume_source: Option<SubagentResumeSource>,
+    ) -> Self::AdvisorValidateFuture {
+        Box::pin(std::future::ready(SubagentAdvisorPreflightOutcome::Ok))
+    }
+
     fn describe_type(
         &self,
         _subagent_type: String,
@@ -175,6 +187,7 @@ fn request(id: &str, background: bool) -> SubagentRequest {
         surface_completion: true,
         await_to_completion: false,
         fork_context: false,
+        advisor_gate_prevalidated: false,
         owner: SubagentOwner::Task,
         cancel_token: CancellationToken::new(),
     }
@@ -276,6 +289,17 @@ async fn outstanding(backend: &ChannelBackend, prompt_id: &str) -> SubagentOutst
         }))
         .expect("actor command channel open");
     response_rx.await.expect("outstanding response")
+}
+
+#[tokio::test]
+async fn advisor_preflight_round_trips_through_runner() {
+    let harness = harness(false, std::time::Duration::from_secs(60));
+    let outcome = harness
+        .backend
+        .validate_advisor_spawn("advisor", "parent", "review this", None)
+        .await;
+    assert!(matches!(outcome, SubagentAdvisorPreflightOutcome::Ok));
+    harness.actor.abort();
 }
 
 #[tokio::test]

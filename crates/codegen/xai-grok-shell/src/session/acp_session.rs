@@ -91,6 +91,8 @@ mod compaction_segments;
 mod types;
 pub(crate) use types::*;
 pub use types::{TodoGateDecision, TodoGateReason};
+#[path = "acp_session_impl/auth_retry.rs"]
+mod auth_retry;
 #[path = "acp_session_impl/brain.rs"]
 mod brain;
 #[path = "acp_session_impl/goal.rs"]
@@ -106,8 +108,6 @@ pub(crate) use auth_retry::{
 mod interjection;
 #[path = "acp_session_impl/tool_calls.rs"]
 mod tool_calls;
-#[path = "acp_session_impl/turn.rs"]
-mod turn;
 use brain::*;
 pub(crate) use interjection::*;
 #[path = "acp_session_impl/laziness.rs"]

@@ -1466,7 +1466,7 @@ fn select_override_cwd<'a>(
         request_cwd
     }
 }
-fn durable_resume_source_for(
+pub(crate) fn durable_resume_source_for(
     id: &str,
     parent_session_id: &str,
     parent_cwd: &Path,
@@ -1495,6 +1495,7 @@ fn durable_resume_source_for(
         subagent_type: meta.subagent_type,
         persona: meta.persona,
         model_id: meta.effective_model_id,
+        tokens_used: 0,
     })
 }
 /// Resolve the MCP pool a child subagent should import from its parent.

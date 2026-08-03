@@ -33,31 +33,16 @@ pub(crate) enum SamplerFailureRecovery {
     /// Compaction ran. The turn loop should rebuild the request from
     /// the compacted conversation and resubmit.
     CompactAndResubmit,
-    /// Auth/account recovery succeeded. The turn loop should resubmit once
-    /// with the fresh token or rotated provider account.
-    RefreshAuthAndResubmit(SamplerResubmitReason),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SamplerResubmitReason {
-    pub(crate) status_code: Option<u16>,
-    pub(crate) retry_reason: &'static str,
-}
-
-impl SamplerResubmitReason {
-    pub(crate) fn auth_recovered(status_code: Option<u16>) -> Self {
-        Self {
-            status_code,
-            retry_reason: "Credentials refreshed; retrying request",
-        }
-    }
-
-    pub(crate) fn anthropic_account_rotated(status_code: Option<u16>) -> Self {
-        Self {
-            status_code,
-            retry_reason: "Anthropic account rate-limited; rotated account and retrying request",
-        }
-    }
+    /// Auth recovery succeeded; resubmit with the fresh credential. Missing
+    /// credentials are tracked separately so they do not consume the bounded
+    /// credential-rejection budget.
+    RefreshAuthAndResubmit {
+        credential: xai_grok_sampling_types::SentCredential,
+        store: RecoveredStore,
+    },
+    /// A rate-limited provider account was rotated successfully. This is not a
+    /// 401 and must not consume the credential-rejection retry budget.
+    ProviderAccountRotated,
 }
 
 /// Outcome of a single turn attempt via the sampler-based path.
@@ -71,8 +56,15 @@ pub(crate) enum SamplerTurnOutcome {
         Box<xai_grok_sampler::InferenceLatencyStats>,
     ),
     CompactAndResubmit,
-    /// Auth/account recovery succeeded; the outer loop should retry once.
-    RefreshAuthAndResubmit(SamplerResubmitReason),
+    /// Auth recovery succeeded; the outer loop should retry under the bounded
+    /// per-incident schedule.
+    RefreshAuthAndResubmit {
+        credential: xai_grok_sampling_types::SentCredential,
+        store: RecoveredStore,
+    },
+    /// A rate-limited provider account was rotated successfully. This is not a
+    /// 401 and must not consume the credential-rejection retry budget.
+    ProviderAccountRotated,
 }
 
 /// Outcome of `process_conversation_turn`, distinguishing normal completion from cancellation.

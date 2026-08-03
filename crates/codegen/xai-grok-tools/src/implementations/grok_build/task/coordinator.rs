@@ -25,10 +25,10 @@ use super::coordinator_state::{
     completion_summary, sleep_until, workflow_outstanding,
 };
 use super::types::{
-    SpawnedSubagentRef, SubagentCancelOutcome, SubagentCancelTarget, SubagentDescribeOutcome,
-    SubagentEvent, SubagentOutstandingReply, SubagentOwner, SubagentRegistryCounts,
-    SubagentRequest, SubagentResult, SubagentResumeLookup, SubagentResumeSource,
-    SubagentValidateTypeOutcome,
+    SpawnedSubagentRef, SubagentAdvisorPreflightOutcome, SubagentCancelOutcome,
+    SubagentCancelTarget, SubagentDescribeOutcome, SubagentEvent, SubagentOutstandingReply,
+    SubagentOwner, SubagentRegistryCounts, SubagentRequest, SubagentResult, SubagentResumeLookup,
+    SubagentResumeSource, SubagentValidateTypeOutcome,
 };
 
 pub use super::coordinator_state::{
@@ -60,6 +60,8 @@ pub struct SubagentCoordinator<R: ChildRunner> {
         TaggedFuture<futures::future::CatchUnwind<std::panic::AssertUnwindSafe<R::RunFuture>>>,
     >,
     validations: FuturesUnordered<ReplyFuture<R::ValidateFuture, SubagentValidateTypeOutcome>>,
+    advisor_validations:
+        FuturesUnordered<ReplyFuture<R::AdvisorValidateFuture, SubagentAdvisorPreflightOutcome>>,
     descriptions: FuturesUnordered<ReplyFuture<R::DescribeFuture, SubagentDescribeOutcome>>,
     progress: FuturesUnordered<ProgressFuture<<R::Control as ChildControl>::ProgressFuture>>,
     list_requests: HashMap<u64, ListRequest>,
@@ -105,6 +107,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             pending_completions: Vec::new(),
             runs: FuturesUnordered::new(),
             validations: FuturesUnordered::new(),
+            advisor_validations: FuturesUnordered::new(),
             descriptions: FuturesUnordered::new(),
             progress: FuturesUnordered::new(),
             list_requests: HashMap::new(),
@@ -118,6 +121,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             if !commands_open
                 && self.runs.is_empty()
                 && self.validations.is_empty()
+                && self.advisor_validations.is_empty()
                 && self.descriptions.is_empty()
                 && self.progress.is_empty()
             {
@@ -135,6 +139,9 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     }
                 }
                 Some((respond_to, outcome)) = self.validations.next(), if !self.validations.is_empty() => {
+                    let _ = respond_to.send(outcome);
+                }
+                Some((respond_to, outcome)) = self.advisor_validations.next(), if !self.advisor_validations.is_empty() => {
                     let _ = respond_to.send(outcome);
                 }
                 Some((respond_to, outcome)) = self.descriptions.next(), if !self.descriptions.is_empty() => {
@@ -474,6 +481,55 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     respond_to: Some(request.respond_to),
                 });
             }
+            SubagentEvent::ValidateAdvisor(request) => {
+                let resume_from = request.resume_from;
+                let resume_source = match resume_from.as_deref() {
+                    Some(source_id) => {
+                        let source_is_active = self.pending.get(source_id).is_some_and(|child| {
+                            child.request.parent_session_id == request.parent_session_id
+                        }) || self.active.get(source_id).is_some_and(
+                            |child| child.request.parent_session_id == request.parent_session_id,
+                        );
+                        if source_is_active {
+                            let _ = request.respond_to.send(
+                                SubagentAdvisorPreflightOutcome::Rejected {
+                                    message: format!(
+                                        "Cannot resume from subagent '{source_id}': it is still running. Wait for it to complete before resuming."
+                                    ),
+                                },
+                            );
+                            return;
+                        }
+                        self.completed
+                            .get(source_id)
+                            .filter(|child| {
+                                child.request.parent_session_id == request.parent_session_id
+                            })
+                            .map(|child| SubagentResumeSource {
+                                subagent_id: child.request.id.clone(),
+                                child_session_id: child.child_session_id.clone(),
+                                child_cwd: child.child_cwd.clone(),
+                                worktree_path: child.worktree_path.clone(),
+                                snapshot_ref: child.snapshot_ref.clone(),
+                                subagent_type: child.request.subagent_type.clone(),
+                                persona: child.persona.clone(),
+                                model_id: Some(child.effective_model_id.clone()),
+                                tokens_used: child.result.tokens_used,
+                            })
+                    }
+                    None => None,
+                };
+                self.advisor_validations.push(ReplyFuture {
+                    future: Box::pin(self.runner.validate_advisor(
+                        request.subagent_type,
+                        request.parent_session_id,
+                        request.prompt,
+                        resume_from,
+                        resume_source,
+                    )),
+                    respond_to: Some(request.respond_to),
+                });
+            }
             SubagentEvent::DescribeType(request) => {
                 self.descriptions.push(ReplyFuture {
                     future: Box::pin(self.runner.describe_type(
@@ -561,6 +617,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                         subagent_type: child.request.subagent_type.clone(),
                         persona: child.persona.clone(),
                         model_id: Some(child.effective_model_id.clone()),
+                        tokens_used: child.result.tokens_used,
                     })
                 } else {
                     SubagentResumeLookup::Missing

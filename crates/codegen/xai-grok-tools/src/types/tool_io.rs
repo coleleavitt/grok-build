@@ -18,6 +18,7 @@ use crate::implementations::codex::read_file::tool::CodexReadFileInput;
 use crate::implementations::grok_build::advisor::AdvisorToolInput;
 use crate::implementations::grok_build::ask_user_question::AskUserQuestionInput;
 use crate::implementations::grok_build::bounty::BountyInput;
+use crate::implementations::grok_build::brain::{BrainGetInput, BrainSearchInput};
 use crate::implementations::grok_build::enter_plan_mode::EnterPlanModeInput;
 use crate::implementations::grok_build::exit_plan_mode::ExitPlanModeInput;
 use crate::implementations::grok_build::grep::GrepSearchInput;
@@ -90,6 +91,8 @@ pub enum ToolInput {
     CodexReadFile(CodexReadFileInput),
     MemorySearch(MemorySearchInput),
     MemoryGet(MemoryGetInput),
+    BrainSearch(BrainSearchInput),
+    BrainGet(BrainGetInput),
     SearchTool(SearchToolInput),
     UseTool(UseToolInput),
     EnterPlanMode(EnterPlanModeInput),

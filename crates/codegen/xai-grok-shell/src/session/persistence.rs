@@ -344,6 +344,15 @@ pub enum PersistenceMsg {
     /// Persist goal mode orchestration state (`None` clears it, so a
     /// cleared goal does not resurrect on session resume).
     GoalModeState(Option<crate::session::goal_tracker::GoalOrchestration>),
+    DeleteGoalModeState {
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
+    WorkflowRunState(crate::session::workflow::store::WorkflowRunManifest),
+    WorkflowRunStateAndAck {
+        manifest: crate::session::workflow::store::WorkflowRunManifest,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
+    DeleteWorkflowRunState(String),
     /// Persist a local feedback entry (user feedback)
     Feedback(LocalFeedbackEntry),
     /// Persist a /btw side question entry

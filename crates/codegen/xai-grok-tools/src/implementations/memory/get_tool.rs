@@ -15,6 +15,7 @@ use crate::types::tool::{ToolKind, ToolNamespace};
 /// behavior of the standard `read_file` tool.  `lines()` would silently drop
 /// that trailing element, causing off-by-one line references for files
 /// (virtually all Markdown memory files) that end with a newline.
+#[cfg(test)]
 pub(crate) fn format_with_line_numbers(content: &str, first_line_num: usize) -> String {
     if content.is_empty() {
         return String::new();

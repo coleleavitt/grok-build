@@ -166,15 +166,53 @@ pub(super) fn build_responses_input(req: &ConversationRequest) -> rs::InputParam
     let items: Vec<rs::InputItem> = req
         .items
         .iter()
-        .flat_map(conversation_item_to_input_items)
+        .enumerate()
+        .filter(|(index, item)| !is_orphaned_reasoning(&req.items, *index, item))
+        .flat_map(|(_, item)| conversation_item_to_input_items(item))
         .collect();
     rs::InputParam::Items(items)
 }
 
-/// Inject the `type: "reasoning_text"` discriminator the API requires.
-/// `async-openai`'s `ReasoningTextContent` has no `type` field, so it
-/// serializes to `{"text": ...}` and the API answers 400. Delete this once
-/// upstream grows the field.
+/// True when a reasoning sibling has no following model output to anchor it.
+///
+/// The Responses API rejects orphaned reasoning items. History mutation can
+/// leave them behind after an aborted stream or compaction, so drop them at
+/// request-build time rather than turning all later turns into deterministic
+/// provider errors.
+fn is_orphaned_reasoning(
+    items: &[ConversationItem],
+    index: usize,
+    item: &ConversationItem,
+) -> bool {
+    if !matches!(item, ConversationItem::Reasoning(_)) {
+        return false;
+    }
+
+    for follower in &items[index + 1..] {
+        match follower {
+            ConversationItem::Reasoning(_) => continue,
+            ConversationItem::Assistant(assistant) => {
+                if assistant.content.is_empty() && assistant.tool_calls.is_empty() {
+                    continue;
+                }
+                return false;
+            }
+            ConversationItem::BackendToolCall(_) => return false,
+            ConversationItem::System(_)
+            | ConversationItem::User(_)
+            | ConversationItem::ToolResult(_) => return true,
+        }
+    }
+
+    true
+}
+
+/// Repair small async-openai and cross-provider wire mismatches on serialized
+/// Responses API reasoning items.
+///
+/// This injects the required `type: "reasoning_text"` discriminator, removes
+/// invalid Responses reasoning IDs, and drops provider-bound encrypted content
+/// when there is no valid ID with which to replay it.
 pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
     let Some(input) = body.get_mut("input").and_then(|v| v.as_array_mut()) else {
         return;
@@ -183,16 +221,38 @@ pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
         if item.get("type").and_then(|t| t.as_str()) != Some("reasoning") {
             continue;
         }
+
+        if let Some(object) = item.as_object_mut() {
+            let has_valid_id = object
+                .get("id")
+                .and_then(|id| id.as_str())
+                .is_some_and(is_responses_input_id);
+            if object.contains_key("id") && !has_valid_id {
+                object.remove("id");
+            }
+            if !has_valid_id {
+                object.remove("encrypted_content");
+            }
+        }
+
         let Some(content) = item.get_mut("content").and_then(|c| c.as_array_mut()) else {
             continue;
         };
-        for c in content.iter_mut() {
-            if let Some(obj) = c.as_object_mut() {
-                obj.entry("type")
+        for content_item in content.iter_mut() {
+            if let Some(object) = content_item.as_object_mut() {
+                object
+                    .entry("type")
                     .or_insert_with(|| serde_json::Value::String("reasoning_text".into()));
             }
         }
     }
+}
+
+fn is_responses_input_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputItem> {

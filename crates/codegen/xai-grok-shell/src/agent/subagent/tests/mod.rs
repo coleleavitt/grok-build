@@ -3,6 +3,20 @@ use super::*;
 use super::handle_request::{
     canonical_total_tokens, record_subagent_usage, usage_is_incomplete,
 };
+use crate::test_support::lsp_runtime::{
+    DummyLspDispatch, ctx_with_toggle, test_gateway_with_receiver,
+};
+use xai_grok_subagent_resolution::resolve_effective_overrides;
+use xai_grok_tools::implementations::grok_build::task::backend::{
+    ChannelBackend, SubagentBackend,
+};
+use xai_grok_tools::implementations::grok_build::task::coordinator::{
+    ChildRunRequest, ChildRunner, CompletionDisposition, CoordinatorConfig, SubagentCoordinator,
+};
+use xai_grok_tools::implementations::grok_build::task::types::{
+    SubagentAdvisorPreflightOutcome, SubagentOwner, SubagentResumeSource,
+    SubagentValidateTypeOutcome,
+};
 
 struct EnvGuard(&'static str);
 impl Drop for EnvGuard {
@@ -14,34 +28,209 @@ fn set_env(name: &'static str, value: &str) -> EnvGuard {
     unsafe { std::env::set_var(name, value) };
     EnvGuard(name)
 }
-/// Invariant: resolving a subagent applies the parent session's
-/// `--tools`/`--disallowed-tools`/`--permission-mode` — driven through
-/// `resolve_agent_definition` so the spawn path can't skip them.
+
+#[derive(Clone, Default)]
+struct AdvisorTestControl;
+
+impl ChildControl for AdvisorTestControl {
+    type ProgressFuture = std::future::Ready<SubagentProgress>;
+
+    fn progress(&self) -> Self::ProgressFuture {
+        std::future::ready(SubagentProgress::default())
+    }
+
+    fn cancel(&self) {}
+}
+
+struct AdvisorTestRunner {
+    ctx: std::rc::Rc<SubagentSpawnContext>,
+    run_count: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl ChildRunner for AdvisorTestRunner {
+    type Control = AdvisorTestControl;
+    type CompletionData = ();
+    type RunFuture = LocalBoxFuture<ChildRunOutput<()>>;
+    type ValidateFuture = LocalBoxFuture<SubagentValidateTypeOutcome>;
+    type AdvisorValidateFuture = LocalBoxFuture<SubagentAdvisorPreflightOutcome>;
+    type DescribeFuture = LocalBoxFuture<SubagentDescribeOutcome>;
+
+    fn run(&self, run: ChildRunRequest<Self::Control>) -> Self::RunFuture {
+        self.run_count.set(self.run_count.get() + 1);
+        Box::pin(async move {
+            let request = run.request;
+            ChildRunOutput {
+                result: SubagentResult {
+                    success: true,
+                    output: "completed test source".into(),
+                    subagent_id: request.id.clone(),
+                    child_session_id: request.id,
+                    tokens_used: 1_000,
+                    ..Default::default()
+                },
+                completion_data: (),
+                snapshot_ref: None,
+            }
+        })
+    }
+
+    fn validate_type(
+        &self,
+        _subagent_type: String,
+        _parent_session_id: String,
+    ) -> Self::ValidateFuture {
+        Box::pin(std::future::ready(SubagentValidateTypeOutcome::Ok))
+    }
+
+    fn validate_advisor(
+        &self,
+        subagent_type: String,
+        parent_session_id: String,
+        prompt: String,
+        resume_from: Option<String>,
+        resume_source: Option<SubagentResumeSource>,
+    ) -> Self::AdvisorValidateFuture {
+        let ctx = self.ctx.clone();
+        Box::pin(async move {
+            let resume_source = resume_source.map(|source| ResumeSourceData {
+                subagent_id: source.subagent_id,
+                child_session_id: source.child_session_id,
+                child_cwd: source.child_cwd,
+                worktree_path: source.worktree_path.map(PathBuf::from),
+                snapshot_ref: source.snapshot_ref,
+                subagent_type: source.subagent_type,
+                persona: source.persona,
+                model_id: source.model_id,
+                tokens_used: source.tokens_used,
+            });
+            if resume_from.is_some() && resume_source.is_none() {
+                return SubagentAdvisorPreflightOutcome::Rejected {
+                    message: format!(
+                        "Cannot resume from subagent '{}': not found",
+                        resume_from.as_deref().unwrap_or_default(),
+                    ),
+                };
+            }
+            if let Some(ref source) = resume_source
+                && let Err(error) = xai_grok_subagent_resolution::validate_resume_identity(
+                    &subagent_type,
+                    None,
+                    source,
+                )
+            {
+                return SubagentAdvisorPreflightOutcome::Rejected {
+                    message: error.to_string(),
+                };
+            }
+            match validate_advisor_effective_context_budget(
+                &parent_session_id,
+                &prompt,
+                &ctx,
+                resume_source.as_ref(),
+            )
+            .await
+            {
+                Ok(()) => SubagentAdvisorPreflightOutcome::Ok,
+                Err(error) => SubagentAdvisorPreflightOutcome::Rejected {
+                    message: error.to_string(),
+                },
+            }
+        })
+    }
+
+    fn describe_type(
+        &self,
+        _subagent_type: String,
+        _harness_agent_type: Option<String>,
+        _parent_session_id: String,
+    ) -> Self::DescribeFuture {
+        Box::pin(std::future::ready(SubagentDescribeOutcome::Unavailable))
+    }
+
+    fn on_completed(&self, _completion: ChildCompletion<Self::CompletionData>) {}
+}
+
+async fn run_with_advisor_test_coordinator<F, T>(
+    ctx: SubagentSpawnContext,
+    run_count: std::rc::Rc<std::cell::Cell<usize>>,
+    action: impl FnOnce(ChannelBackend) -> F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let backend = ChannelBackend::new(event_tx);
+    let coordinator = SubagentCoordinator::new(
+        event_rx,
+        AdvisorTestRunner {
+            ctx: std::rc::Rc::new(ctx),
+            run_count,
+        },
+        CoordinatorConfig::default(),
+    )
+    .run();
+    let action = action(backend);
+    tokio::pin!(coordinator);
+    tokio::pin!(action);
+    tokio::select! {
+        output = &mut action => output,
+        () = &mut coordinator => panic!("test coordinator exited before the action completed"),
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn advisor_disabled_env_blocks_real_subagent_spawn_path() {
+    use std::sync::Arc;
+    use xai_grok_tools::implementations::grok_build::task::TaskTool;
+    use xai_grok_tools::implementations::grok_build::task::backend::SubagentBackendResource;
+    use xai_grok_tools::implementations::grok_build::task::types::{
+        CurrentPromptIdResource, SessionIdResource, SubagentDepthCounter, TaskModelValidator,
+    };
+    use xai_grok_tools::types::resources::Resources;
+    use xai_grok_tools::types::tool_metadata::test_ctx;
+    use xai_tool_types::TaskToolInput;
+
     let _guard = set_env("GROK_ADVISOR_ENABLED", "false");
-    let (request, result_rx) = make_request("advisor");
-    let ctx = ctx_with_toggle(HashMap::new());
-    let coordinator = std::cell::RefCell::new(SubagentCoordinator::new());
-    let gateway = test_gateway();
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.parent_session_id = "advisor-disabled-parent".into();
+    let parent_session_id = ctx.parent_session_id.clone();
+    let run_count = std::rc::Rc::new(std::cell::Cell::new(0));
+    let result = run_with_advisor_test_coordinator(ctx, run_count.clone(), move |backend| async move {
+        let mut resources = Resources::new();
+        resources.insert(SubagentBackendResource(Arc::new(backend)));
+        resources.insert(SubagentDepthCounter(0));
+        resources.insert(SessionIdResource(parent_session_id));
+        resources.insert(CurrentPromptIdResource("prompt-123".to_string()));
+        resources.insert(TaskModelValidator::new(|_| None));
+        xai_tool_runtime::Tool::run(
+            &TaskTool,
+            test_ctx(resources.into_shared()),
+            TaskToolInput {
+                description: "advisor disabled".into(),
+                prompt: "review this".into(),
+                subagent_type: "advisor".into(),
+                run_in_background: true,
+                capability_mode: None,
+                isolation: None,
+                resume_from: None,
+                cwd: None,
+                model: None,
+                task_id: None,
+            },
+        )
+        .await
+    })
+    .await;
 
-    handle_subagent_request(request, ctx, &coordinator, &gateway).await;
-
-    let result = result_rx.await.expect("pre-spawn failure must answer caller");
-    assert!(!result.success);
-    assert!(
-        result
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("advisor is disabled"),
-        "got error: {:?}",
-        result.error,
-    );
-    assert!(
-        coordinator.borrow().active_summaries().is_empty(),
-        "advisor disabled gate must fail before inserting a running child",
+    let message = result
+        .expect_err("disabled advisor must fail before spawn")
+        .to_string();
+    assert!(message.contains("advisor is disabled"), "error: {message}");
+    assert_eq!(
+        run_count.get(),
+        0,
+        "advisor disabled gate must fail before the child runner starts",
     );
 }
 
@@ -51,12 +240,9 @@ async fn advisor_task_tool_budget_counts_real_forked_parent_transcript() {
     use std::sync::Arc;
     use xai_grok_sampling_types::conversation::ConversationItem;
     use xai_grok_tools::implementations::grok_build::task::TaskTool;
-    use xai_grok_tools::implementations::grok_build::task::backend::{
-        ChannelBackend, SubagentBackendResource,
-    };
+    use xai_grok_tools::implementations::grok_build::task::backend::SubagentBackendResource;
     use xai_grok_tools::implementations::grok_build::task::types::{
-        CurrentPromptIdResource, SessionIdResource, SubagentAdvisorPreflightOutcome,
-        SubagentDepthCounter, SubagentEvent, SubagentValidateTypeOutcome, TaskModelValidator,
+        CurrentPromptIdResource, SessionIdResource, SubagentDepthCounter, TaskModelValidator,
     };
     use xai_grok_tools::types::resources::Resources;
     use xai_grok_tools::types::tool_metadata::test_ctx;
@@ -84,110 +270,38 @@ async fn advisor_task_tool_budget_counts_real_forked_parent_transcript() {
     assert_eq!(xai_tool_types::advisor::AdvisorConfig::from_env().token_budget, 5);
     spawn_ctx.parent_chat_state = Some(chat);
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SubagentEvent>();
-    let backend = SubagentBackendResource(Arc::new(ChannelBackend::new(event_tx)));
-    let mut resources = Resources::new();
-    resources.insert(backend);
-    resources.insert(SubagentDepthCounter(0));
-    resources.insert(SessionIdResource(spawn_ctx.parent_session_id.clone()));
-    resources.insert(CurrentPromptIdResource("prompt-123".to_string()));
-    resources.insert(TaskModelValidator::new(|_| None));
-
-    let input = TaskToolInput {
-        description: "advisor budget".into(),
-        prompt: "ok".into(),
-        subagent_type: "advisor".into(),
-        run_in_background: true,
-        capability_mode: None,
-        isolation: None,
-        resume_from: None,
-        cwd: None,
-        model: None,
-        task_id: None,
-    };
-
-    let run_task_tool = xai_tool_runtime::Tool::run(
-        &TaskTool,
-        test_ctx(resources.into_shared()),
-        input,
-    );
-    let drive_coordinator_preflight = async {
-        let validate_type = event_rx.recv().await.expect("ValidateType event");
-        match validate_type {
-            SubagentEvent::ValidateType(req) => {
-                assert_eq!(req.subagent_type, "advisor");
-                let _ = req.respond_to.send(SubagentValidateTypeOutcome::Ok);
-            }
-            _ => panic!("expected ValidateType before advisor preflight"),
-        }
-
-        let validate_advisor = event_rx.recv().await.expect("ValidateAdvisor event");
-        match validate_advisor {
-            SubagentEvent::ValidateAdvisor(req) => {
-                assert_eq!(req.prompt, "ok");
-                let live_estimate = estimate_advisor_fork_tokens_for_items(
-                    spawn_ctx
-                        .parent_chat_state
-                        .as_ref()
-                        .expect("parent chat state")
-                        .get_conversation()
-                        .await,
-                    &req.prompt,
-                    spawn_ctx.sampling_config.context_window,
-                );
-                assert!(
-                    live_estimate > 5,
-                    "live preflight setup must still exceed budget, got {live_estimate}"
-                );
-                let validation = validate_advisor_fork_snapshot_budget(
-                    &req.parent_session_id,
-                    &req.prompt,
-                    &spawn_ctx,
-                )
-                .await;
-                assert!(
-                    validation.is_err(),
-                    "real fork preflight should reject estimate {live_estimate} against budget 5"
-                );
-                let outcome = match validation {
-                    Ok(()) => SubagentAdvisorPreflightOutcome::Ok,
-                    Err(err) => SubagentAdvisorPreflightOutcome::Rejected {
-                        message: err.to_string(),
-                    },
-                };
-                let _ = req.respond_to.send(outcome);
-            }
-            _ => panic!("expected ValidateAdvisor before spawn"),
-        }
-
-        if let Ok(Some(event)) =
-            tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv()).await
-        {
-            match event {
-                SubagentEvent::Spawn(_) => panic!(
-                    "advisor over-budget preflight must stop before SubagentEvent::Spawn"
-                ),
-                SubagentEvent::ValidateType(_) => panic!("unexpected second ValidateType event"),
-                SubagentEvent::ValidateAdvisor(_) => {
-                    panic!("unexpected second ValidateAdvisor event")
-                }
-                SubagentEvent::Query(_) => panic!("unexpected Query event"),
-                SubagentEvent::Cancel(_) => panic!("unexpected Cancel event"),
-                SubagentEvent::ListActive(_) => panic!("unexpected ListActive event"),
-                SubagentEvent::Completions(_) => panic!("unexpected Completions event"),
-                SubagentEvent::Outstanding(_) => panic!("unexpected Outstanding event"),
-                SubagentEvent::ClearUsageNotApplied(_) => {
-                    panic!("unexpected ClearUsageNotApplied event")
-                }
-                SubagentEvent::MarkUsageNotApplied(_) => {
-                    panic!("unexpected MarkUsageNotApplied event")
-                }
-                SubagentEvent::DescribeType(_) => panic!("unexpected DescribeType event"),
-            }
-        }
-    };
-
-    let (result, ()) = tokio::join!(run_task_tool, drive_coordinator_preflight);
+    let parent_session_id = spawn_ctx.parent_session_id.clone();
+    let run_count = std::rc::Rc::new(std::cell::Cell::new(0));
+    let result = run_with_advisor_test_coordinator(
+        spawn_ctx,
+        run_count.clone(),
+        move |backend| async move {
+            let mut resources = Resources::new();
+            resources.insert(SubagentBackendResource(Arc::new(backend)));
+            resources.insert(SubagentDepthCounter(0));
+            resources.insert(SessionIdResource(parent_session_id));
+            resources.insert(CurrentPromptIdResource("prompt-123".to_string()));
+            resources.insert(TaskModelValidator::new(|_| None));
+            xai_tool_runtime::Tool::run(
+                &TaskTool,
+                test_ctx(resources.into_shared()),
+                TaskToolInput {
+                    description: "advisor budget".into(),
+                    prompt: "ok".into(),
+                    subagent_type: "advisor".into(),
+                    run_in_background: true,
+                    capability_mode: None,
+                    isolation: None,
+                    resume_from: None,
+                    cwd: None,
+                    model: None,
+                    task_id: None,
+                },
+            )
+            .await
+        },
+    )
+    .await;
     let msg = result
         .expect_err("fork transcript should exhaust the advisor budget before spawn")
         .to_string();
@@ -196,6 +310,11 @@ async fn advisor_task_tool_budget_counts_real_forked_parent_transcript() {
         msg.contains("advisor token budget exhausted"),
         "budget must account for the real forked parent transcript, got: {msg}"
     );
+    assert_eq!(
+        run_count.get(),
+        0,
+        "over-budget advisor must not reach the child runner",
+    );
 }
 
 #[tokio::test]
@@ -203,13 +322,9 @@ async fn advisor_task_tool_budget_counts_real_forked_parent_transcript() {
 async fn advisor_task_tool_budget_counts_resumed_source_transcript() {
     use std::sync::Arc;
     use xai_grok_tools::implementations::grok_build::task::TaskTool;
-    use xai_grok_tools::implementations::grok_build::task::backend::{
-        ChannelBackend, SubagentBackendResource,
-    };
+    use xai_grok_tools::implementations::grok_build::task::backend::SubagentBackendResource;
     use xai_grok_tools::implementations::grok_build::task::types::{
-        CurrentPromptIdResource, SessionIdResource, SubagentAdvisorPreflightOutcome,
-        SubagentDepthCounter, SubagentEvent, SubagentResult, SubagentValidateTypeOutcome,
-        TaskModelValidator,
+        CurrentPromptIdResource, SessionIdResource, SubagentDepthCounter, TaskModelValidator,
     };
     use xai_grok_tools::types::resources::Resources;
     use xai_grok_tools::types::tool_metadata::test_ctx;
@@ -220,118 +335,62 @@ async fn advisor_task_tool_budget_counts_resumed_source_transcript() {
     let mut spawn_ctx = ctx_with_toggle(HashMap::new());
     spawn_ctx.parent_session_id = "advisor-resume-budget-parent".into();
 
-    let mut coordinator = SubagentCoordinator::new();
-    let source_id = "advisor-resume-source".to_string();
-    coordinator.completed.insert(
-        source_id.clone(),
-        CompletedSubagent {
-            subagent_id: source_id.clone(),
-            parent_session_id: spawn_ctx.parent_session_id.clone(),
-            parent_prompt_id: Some("source-prompt".into()),
-            child_session_id: "advisor-resume-child".into(),
-            description: "source advisor".into(),
-            subagent_type: "advisor".into(),
-            persona: None,
-            started_at: std::time::Instant::now(),
-            completed_at: std::time::Instant::now(),
-            result: SubagentResult {
-                success: true,
-                output: "prior advisor answer".into(),
-                subagent_id: source_id.clone(),
-                child_session_id: "advisor-resume-child".into(),
-                tokens_used: 1_000,
-                ..Default::default()
-            },
-            resumed_from: None,
-            child_cwd: "/tmp".into(),
-            worktree_path: None,
-            snapshot_ref: None,
-            effective_model_id: "grok-4.5".into(),
-            block_waited: false,
-            explicitly_killed: false,
-            persisted_output_dir: None,
+    let parent_session_id = spawn_ctx.parent_session_id.clone();
+    let run_count = std::rc::Rc::new(std::cell::Cell::new(0));
+    let result = run_with_advisor_test_coordinator(
+        spawn_ctx,
+        run_count.clone(),
+        move |backend| async move {
+            let source_id = "advisor-resume-source".to_string();
+            let source_result = backend
+                .spawn(SubagentRequest {
+                    id: source_id.clone(),
+                    prompt: "prior advisor answer".into(),
+                    description: "source advisor".into(),
+                    subagent_type: "advisor".into(),
+                    parent_session_id: parent_session_id.clone(),
+                    parent_prompt_id: Some("source-prompt".into()),
+                    resume_from: None,
+                    cwd: Some("/tmp".into()),
+                    runtime_overrides: Default::default(),
+                    run_in_background: false,
+                    surface_completion: false,
+                    await_to_completion: true,
+                    fork_context: false,
+                    advisor_gate_prevalidated: true,
+                    owner: SubagentOwner::Task,
+                    cancel_token: CancellationToken::new(),
+                })
+                .await
+                .expect("source spawn must complete");
+            assert_eq!(source_result.tokens_used, 1_000);
+
+            let mut resources = Resources::new();
+            resources.insert(SubagentBackendResource(Arc::new(backend)));
+            resources.insert(SubagentDepthCounter(0));
+            resources.insert(SessionIdResource(parent_session_id));
+            resources.insert(CurrentPromptIdResource("prompt-123".to_string()));
+            resources.insert(TaskModelValidator::new(|_| None));
+            xai_tool_runtime::Tool::run(
+                &TaskTool,
+                test_ctx(resources.into_shared()),
+                TaskToolInput {
+                    description: "resume advisor".into(),
+                    prompt: "ok".into(),
+                    subagent_type: "advisor".into(),
+                    run_in_background: true,
+                    capability_mode: None,
+                    isolation: None,
+                    resume_from: Some(source_id),
+                    cwd: None,
+                    model: None,
+                    task_id: None,
+                },
+            )
+            .await
         },
-    );
-
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SubagentEvent>();
-    let backend = SubagentBackendResource(Arc::new(ChannelBackend::new(event_tx)));
-    let mut resources = Resources::new();
-    resources.insert(backend);
-    resources.insert(SubagentDepthCounter(0));
-    resources.insert(SessionIdResource(spawn_ctx.parent_session_id.clone()));
-    resources.insert(CurrentPromptIdResource("prompt-123".to_string()));
-    resources.insert(TaskModelValidator::new(|_| None));
-
-    let input = TaskToolInput {
-        description: "resume advisor".into(),
-        prompt: "ok".into(),
-        subagent_type: "advisor".into(),
-        run_in_background: true,
-        capability_mode: None,
-        isolation: None,
-        resume_from: Some(source_id.clone()),
-        cwd: None,
-        model: None,
-        task_id: None,
-    };
-
-    let run_task_tool = xai_tool_runtime::Tool::run(
-        &TaskTool,
-        test_ctx(resources.into_shared()),
-        input,
-    );
-    let drive_coordinator_preflight = async {
-        let validate_type = event_rx.recv().await.expect("ValidateType event");
-        match validate_type {
-            SubagentEvent::ValidateType(req) => {
-                assert_eq!(req.subagent_type, "advisor");
-                let _ = req.respond_to.send(SubagentValidateTypeOutcome::Ok);
-            }
-            _ => panic!("expected ValidateType before advisor preflight"),
-        }
-
-        let validate_advisor = event_rx.recv().await.expect("ValidateAdvisor event");
-        match validate_advisor {
-            SubagentEvent::ValidateAdvisor(req) => {
-                assert_eq!(req.resume_from.as_deref(), Some(source_id.as_str()));
-                let source = coordinator
-                    .resumable_source_for(
-                        req.resume_from.as_deref().unwrap(),
-                        &req.parent_session_id,
-                        &spawn_ctx.parent_cwd,
-                    )
-                    .expect("completed advisor source must resolve");
-                assert_eq!(source.tokens_used, 1_000);
-                let validation = validate_advisor_effective_context_budget(
-                    &req.parent_session_id,
-                    &req.prompt,
-                    &spawn_ctx,
-                    Some(&source),
-                )
-                .await;
-                assert!(
-                    validation.is_err(),
-                    "resumed source transcript must be budgeted before spawn"
-                );
-                let outcome = match validation {
-                    Ok(()) => SubagentAdvisorPreflightOutcome::Ok,
-                    Err(err) => SubagentAdvisorPreflightOutcome::Rejected {
-                        message: err.to_string(),
-                    },
-                };
-                let _ = req.respond_to.send(outcome);
-            }
-            _ => panic!("expected ValidateAdvisor before spawn"),
-        }
-
-        if let Ok(Some(SubagentEvent::Spawn(_))) =
-            tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv()).await
-        {
-            panic!("resumed advisor over-budget preflight must stop before Spawn");
-        }
-    };
-
-    let (result, ()) = tokio::join!(run_task_tool, drive_coordinator_preflight);
+    )
+    .await;
     let msg = result
         .expect_err("resumed advisor source should exhaust budget before spawn")
         .to_string();
@@ -339,6 +398,11 @@ async fn advisor_task_tool_budget_counts_resumed_source_transcript() {
     assert!(
         msg.contains("advisor token budget exhausted"),
         "budget must account for resumed advisor source transcript, got: {msg}"
+    );
+    assert_eq!(
+        run_count.get(),
+        1,
+        "only the completed source may reach the child runner",
     );
 }
 
@@ -568,7 +632,8 @@ fn auto_wake_test_request(id: &str) -> SubagentRequest {
         await_to_completion: false,
         fork_context: false,
         advisor_gate_prevalidated: false,
-        result_tx,
+        owner: SubagentOwner::Task,
+        cancel_token: CancellationToken::new(),
     }
 }
 /// Behavior-level: the action half of the subagent auto-wake.
@@ -1435,7 +1500,8 @@ fn bootstrap_test_request(fork_context: bool) -> SubagentRequest {
         await_to_completion: false,
         fork_context,
         advisor_gate_prevalidated: false,
-        result_tx,
+        owner: SubagentOwner::Task,
+        cancel_token: CancellationToken::new(),
     }
 }
 #[tokio::test]
