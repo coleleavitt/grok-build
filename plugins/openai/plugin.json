@@ -3,7 +3,11 @@
   "version": "0.1.0",
   "description": "OpenAI GPT models as a Grok model provider (Responses API).",
   "homepage": "https://platform.openai.com/docs/models",
-  "keywords": ["openai", "gpt", "model-provider"],
+  "keywords": [
+    "openai",
+    "gpt",
+    "model-provider"
+  ],
   "modelProviders": {
     "openai": {
       "name": "OpenAI",
@@ -12,6 +16,198 @@
       "authScheme": "bearer",
       "envKey": "OPENAI_API_KEY",
       "models": {
+        "gpt-5.6": {
+          "model": "gpt-5.6",
+          "name": "GPT-5.6",
+          "description": "Frontier GPT-5.6 model for complex professional work, coding, and agentic workflows",
+          "contextWindow": 1050000,
+          "maxCompletionTokens": 128000,
+          "supportsReasoningEffort": true,
+          "reasoningEffort": "xhigh",
+          "reasoningEfforts": [
+            {
+              "id": "none",
+              "value": "none",
+              "label": "None",
+              "description": "No explicit reasoning effort"
+            },
+            {
+              "id": "low",
+              "value": "low",
+              "label": "Low Effort",
+              "description": "Quick, fast implementations"
+            },
+            {
+              "id": "medium",
+              "value": "medium",
+              "label": "Medium Effort",
+              "description": "Balanced effort with standard implementation and testing"
+            },
+            {
+              "id": "high",
+              "value": "high",
+              "label": "High Effort",
+              "description": "High implementation quality with deeper reasoning"
+            },
+            {
+              "id": "xhigh",
+              "value": "xhigh",
+              "label": "Extra High Effort",
+              "description": "Deeper reasoning than high, just below maximum",
+              "default": true
+            },
+            {
+              "id": "max",
+              "value": "max",
+              "label": "Max Effort",
+              "description": "Maximum capability with deepest reasoning"
+            }
+          ]
+        },
+        "gpt-5.6-sol": {
+          "model": "gpt-5.6-sol",
+          "name": "GPT-5.6 Sol",
+          "description": "Frontier GPT-5.6 model for complex professional work, coding, and agentic workflows",
+          "contextWindow": 1050000,
+          "maxCompletionTokens": 128000,
+          "supportsReasoningEffort": true,
+          "reasoningEffort": "xhigh",
+          "reasoningEfforts": [
+            {
+              "id": "none",
+              "value": "none",
+              "label": "None",
+              "description": "No explicit reasoning effort"
+            },
+            {
+              "id": "low",
+              "value": "low",
+              "label": "Low Effort",
+              "description": "Quick, fast implementations"
+            },
+            {
+              "id": "medium",
+              "value": "medium",
+              "label": "Medium Effort",
+              "description": "Balanced effort with standard implementation and testing"
+            },
+            {
+              "id": "high",
+              "value": "high",
+              "label": "High Effort",
+              "description": "High implementation quality with deeper reasoning"
+            },
+            {
+              "id": "xhigh",
+              "value": "xhigh",
+              "label": "Extra High Effort",
+              "description": "Deeper reasoning than high, just below maximum",
+              "default": true
+            },
+            {
+              "id": "max",
+              "value": "max",
+              "label": "Max Effort",
+              "description": "Maximum capability with deepest reasoning"
+            }
+          ]
+        },
+        "gpt-5.6-terra": {
+          "model": "gpt-5.6-terra",
+          "name": "GPT-5.6 Terra",
+          "description": "Balanced GPT-5.6 model for capable, cost-efficient everyday work",
+          "contextWindow": 1050000,
+          "maxCompletionTokens": 128000,
+          "supportsReasoningEffort": true,
+          "reasoningEffort": "xhigh",
+          "reasoningEfforts": [
+            {
+              "id": "none",
+              "value": "none",
+              "label": "None",
+              "description": "No explicit reasoning effort"
+            },
+            {
+              "id": "low",
+              "value": "low",
+              "label": "Low Effort",
+              "description": "Quick, fast implementations"
+            },
+            {
+              "id": "medium",
+              "value": "medium",
+              "label": "Medium Effort",
+              "description": "Balanced effort with standard implementation and testing"
+            },
+            {
+              "id": "high",
+              "value": "high",
+              "label": "High Effort",
+              "description": "High implementation quality with deeper reasoning"
+            },
+            {
+              "id": "xhigh",
+              "value": "xhigh",
+              "label": "Extra High Effort",
+              "description": "Deeper reasoning than high, just below maximum",
+              "default": true
+            },
+            {
+              "id": "max",
+              "value": "max",
+              "label": "Max Effort",
+              "description": "Maximum capability with deepest reasoning"
+            }
+          ]
+        },
+        "gpt-5.6-luna": {
+          "model": "gpt-5.6-luna",
+          "name": "GPT-5.6 Luna",
+          "description": "Cost-efficient GPT-5.6 model for fast, high-volume workloads",
+          "contextWindow": 1050000,
+          "maxCompletionTokens": 128000,
+          "supportsReasoningEffort": true,
+          "reasoningEffort": "xhigh",
+          "reasoningEfforts": [
+            {
+              "id": "none",
+              "value": "none",
+              "label": "None",
+              "description": "No explicit reasoning effort"
+            },
+            {
+              "id": "low",
+              "value": "low",
+              "label": "Low Effort",
+              "description": "Quick, fast implementations"
+            },
+            {
+              "id": "medium",
+              "value": "medium",
+              "label": "Medium Effort",
+              "description": "Balanced effort with standard implementation and testing"
+            },
+            {
+              "id": "high",
+              "value": "high",
+              "label": "High Effort",
+              "description": "High implementation quality with deeper reasoning"
+            },
+            {
+              "id": "xhigh",
+              "value": "xhigh",
+              "label": "Extra High Effort",
+              "description": "Deeper reasoning than high, just below maximum",
+              "default": true
+            },
+            {
+              "id": "max",
+              "value": "max",
+              "label": "Max Effort",
+              "description": "Maximum capability with deepest reasoning"
+            }
+          ]
+        },
         "gpt-5.5": {
           "model": "gpt-5.5",
           "name": "GPT-5.5",

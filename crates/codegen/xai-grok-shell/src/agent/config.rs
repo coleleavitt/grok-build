@@ -7844,6 +7844,10 @@ reasoning_effort = "low"
         let resolved = resolve_model_list_with_providers(&cfg, None, &providers);
 
         for key in [
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
             "gpt-5.5",
             "gpt-5.5-pro",
             "gpt-5.4",
@@ -7867,9 +7871,17 @@ reasoning_effort = "low"
             assert_eq!(model.info.max_completion_tokens, Some(128_000));
             assert!(model.info.supports_reasoning_effort);
         }
+        assert_eq!(
+            resolved["gpt-5.6"].info.reasoning_effort,
+            Some(ReasoningEffort::Xhigh)
+        );
         assert!(
-            resolved.keys().all(|key| !key.starts_with("gpt-5.6")),
-            "GPT-5.6 preview models should not be contributed by the OpenAI plugin"
+            resolved["gpt-5.6"]
+                .info
+                .reasoning_efforts
+                .iter()
+                .any(|effort| effort.value == ReasoningEffort::Max),
+            "GPT-5.6 series should expose the max reasoning-effort menu entry"
         );
     }
 
