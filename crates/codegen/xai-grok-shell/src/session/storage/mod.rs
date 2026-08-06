@@ -18,6 +18,8 @@ use xai_grok_workspace::session::file_state::RewindPoint;
 pub mod jsonl;
 #[allow(dead_code)] // Transaction APIs remain deferred until later protocol wiring.
 pub(crate) mod relocation;
+#[cfg(test)]
+mod replay_chaos_tests;
 pub mod search;
 pub mod search_fts;
 mod search_recovery;
