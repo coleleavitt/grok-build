@@ -217,15 +217,17 @@ impl SessionActor {
             )))
             .meta(Some(chunk_meta)),
         );
-        let notification_meta = self.build_notification_meta();
-        let notification = acp::SessionNotification::new(self.session_info.id.clone(), update)
-            .meta(notification_meta.as_object().cloned());
-        let _ = self
-            .notifications
-            .persistence_tx
-            .send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Acp(Box::new(notification)),
-            ));
+        crate::util::event_id::with_event_order(|| {
+            let notification_meta = self.build_notification_meta();
+            let notification = acp::SessionNotification::new(self.session_info.id.clone(), update)
+                .meta(notification_meta.as_object().cloned());
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(PersistenceMsg::Update(
+                    crate::session::storage::SessionUpdate::Acp(Box::new(notification)),
+                ));
+        });
     }
     #[tracing::instrument(
         name = "session.handle_prompt",
@@ -546,18 +548,28 @@ impl SessionActor {
             let update = acp::SessionUpdate::UserMessageChunk(
                 acp::ContentChunk::new(block.clone()).meta(user_chunk_meta.clone()),
             );
-            let notification_meta = self.build_notification_meta();
-            let notification = acp::SessionNotification::new(self.session_info.id.clone(), update)
-                .meta(notification_meta.as_object().cloned());
             if echo_mode == UserEchoMode::PersistOnly {
-                let _ = self
-                    .notifications
-                    .persistence_tx
-                    .send(PersistenceMsg::Update(
-                        crate::session::storage::SessionUpdate::Acp(Box::new(notification)),
-                    ));
+                crate::util::event_id::with_event_order(|| {
+                    let notification_meta = self.build_notification_meta();
+                    let notification =
+                        acp::SessionNotification::new(self.session_info.id.clone(), update)
+                            .meta(notification_meta.as_object().cloned());
+                    let _ = self
+                        .notifications
+                        .persistence_tx
+                        .send(PersistenceMsg::Update(
+                            crate::session::storage::SessionUpdate::Acp(Box::new(notification)),
+                        ));
+                });
             } else {
-                self.emit_notification_direct(notification).await;
+                // Left unstamped on purpose: `emit_notification_direct` mints
+                // the id inside its own ordered persist/broadcast section, so
+                // pre-stamping here would move the mint outside that section.
+                self.emit_notification_direct(acp::SessionNotification::new(
+                    self.session_info.id.clone(),
+                    update,
+                ))
+                .await;
             }
         }
         let crate::session::prompt_parser::ParsedPrompt {

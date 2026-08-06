@@ -5,8 +5,9 @@ use super::test_agent_view;
 use super::{
     ActivePane, AgentView, InlineMediaHitAreas, InputMode, PaneAreas, PluginCtaState,
     PromptInputMode, PromptMode, REWOUND_PROMPT_ID_CAP, SELF_ORIGINATED_PROMPT_CAP, SessionReload,
+    SubagentInfo,
 };
-use crate::app::agent::AgentSession;
+use crate::app::agent::{AgentSession, AgentState};
 use crate::app::app_view::InputOutcome;
 use crate::scrollback::state::ScrollbackState;
 use crate::scrollback::text_selection::ResolvedSelectionModel;
@@ -297,6 +298,7 @@ impl AgentView {
             timeline_hover_preview: None,
             session_agent_name: None,
             subagent_sessions: HashMap::new(),
+            terminal_subagent_sessions: HashSet::new(),
             subagent_views: HashMap::new(),
             active_subagent: None,
             is_subagent_view: false,
@@ -449,6 +451,13 @@ impl AgentView {
             workflow_runs: std::mem::take(&mut self.workflow_runs),
             workflow_run_revisions: std::mem::take(&mut self.workflow_run_revisions),
             cleared_workflow_runs: std::mem::take(&mut self.cleared_workflow_runs),
+            terminal_subagent_infos: self
+                .subagent_sessions
+                .iter()
+                .filter(|(_, info)| info.finished)
+                .map(|(child_session_id, info)| (child_session_id.clone(), info.clone()))
+                .collect(),
+            terminal_subagent_sessions: self.terminal_subagent_sessions.clone(),
             last_seen_event_id: self.last_seen_event_id.clone(),
             last_applied_event_seq: self.last_applied_event_seq,
             last_applied_xai_event_seq: self.last_applied_xai_event_seq,
@@ -576,6 +585,69 @@ impl AgentView {
         }
         finalized
     }
+
+    /// Restore only the absorbing terminal subset after a failed/superseded
+    /// replay. Other subagent state stays live by design, but a historical
+    /// replayed spawn must not turn a pre-outage completed row back to Working.
+    fn restore_terminal_subagents_after_failed_reload(
+        &mut self,
+        terminal_infos: HashMap<String, SubagentInfo>,
+        terminal_sessions: HashSet<String>,
+    ) {
+        let tombstone_only: Vec<String> = terminal_sessions
+            .iter()
+            .filter(|child_session_id| !terminal_infos.contains_key(*child_session_id))
+            .cloned()
+            .collect();
+        self.terminal_subagent_sessions.extend(terminal_sessions);
+
+        // A finish-before-spawn has no info snapshot. If replay created a
+        // running row for that id, remove it with the failed staging branch;
+        // leaving it beside the restored tombstone would make it permanently
+        // Working while every future finish is rejected as a duplicate.
+        for child_session_id in tombstone_only {
+            let current_is_terminal = self
+                .subagent_sessions
+                .get(&child_session_id)
+                .is_some_and(|current| current.finished);
+            if current_is_terminal {
+                continue;
+            }
+            self.subagent_sessions.remove(&child_session_id);
+            self.subagent_views.remove(&child_session_id);
+            if self.active_subagent.as_deref() == Some(child_session_id.as_str()) {
+                self.active_subagent = None;
+            }
+        }
+
+        for (child_session_id, mut prior) in terminal_infos {
+            if self
+                .subagent_sessions
+                .get(&child_session_id)
+                .is_some_and(|current| current.finished)
+            {
+                self.terminal_subagent_sessions.insert(child_session_id);
+                continue;
+            }
+
+            // A replayed spawn replaces the child view. Make that replacement
+            // inert now; opening it later will lazily rebuild its transcript.
+            prior.child_updates_replayed = false;
+            self.subagent_sessions
+                .insert(child_session_id.clone(), prior);
+            self.terminal_subagent_sessions
+                .insert(child_session_id.clone());
+            if let Some(child_view) = self.subagent_views.get_mut(&child_session_id) {
+                child_view.session.state = AgentState::Idle;
+                child_view
+                    .session
+                    .tracker
+                    .finish_turn(&mut child_view.scrollback);
+                child_view.scrollback.finish_all_running();
+            }
+        }
+    }
+
     /// Resolve a closed window per the [`SessionReload`] outcome trichotomy.
     ///
     /// Returns whether a heavy transient was dropped — the stashed pre-reload
@@ -644,6 +716,10 @@ impl AgentView {
             self.last_seen_event_id = reload.last_seen_event_id;
             self.last_applied_event_seq = reload.last_applied_event_seq;
             self.last_applied_xai_event_seq = reload.last_applied_xai_event_seq;
+            self.restore_terminal_subagents_after_failed_reload(
+                reload.terminal_subagent_infos,
+                reload.terminal_subagent_sessions,
+            );
             dropped_heavy = true;
         }
         self.session.loading_replay = false;

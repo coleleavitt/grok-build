@@ -96,11 +96,19 @@ impl<'de> Deserialize<'de> for UserMessageTemplate {
         impl<'de> serde::de::Visitor<'de> for Visitor {
             type Value = UserMessageTemplate;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str(r#""default", "cursor", {"custom": "..."}, or a template string"#)
+                f.write_str(r#""default", {"custom": "..."}, or a template string"#)
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
                 match v {
                     "default" => Ok(UserMessageTemplate::Default),
+                    // A built-in variant this build does not carry. Falling
+                    // through to `Custom` would make the template body the
+                    // literal word — silently replacing the entire
+                    // user-message prefix with it — so reject instead.
+                    "cursor" => Err(serde::de::Error::custom(
+                        "user_message_template \"cursor\" is not available in this build; \
+                         use {\"custom\": \"...\"} to supply the template inline",
+                    )),
                     other => Ok(UserMessageTemplate::Custom(other.to_owned())),
                 }
             }
@@ -326,6 +334,22 @@ mod tests {
         assert_eq!(v, UserMessageTemplate::Default);
         let v: UserMessageTemplate = serde_json::from_str(r#""my custom""#).unwrap();
         assert_eq!(v, UserMessageTemplate::Custom("my custom".into()));
+    }
+    /// Sibling of the `system_prompt` guard: an unavailable built-in name must
+    /// be rejected rather than absorbed by the legacy bare-string arm, which
+    /// would silently make the whole user-message prefix that one word.
+    #[test]
+    fn unavailable_builtin_template_name_is_rejected_not_absorbed() {
+        let err = serde_json::from_str::<UserMessageTemplate>(r#""cursor""#)
+            .expect_err("an unavailable built-in name must not parse");
+        assert!(
+            err.to_string().contains("not available in this build"),
+            "the error must say why, got: {err}",
+        );
+        assert_eq!(
+            serde_json::from_str::<UserMessageTemplate>(r#"{"custom":"cursor"}"#).unwrap(),
+            UserMessageTemplate::Custom("cursor".into()),
+        );
     }
     #[test]
     fn placeholders_carry_today_local_key() {

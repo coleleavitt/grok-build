@@ -1140,8 +1140,8 @@ pub(super) async fn run_session(
                         SessionCommand::ReconcileRewindTracker { target_prompt_index } => {
                             session.merge_rewind_tracker_from(target_prompt_index).await;
                         }
-                        SessionCommand::XaiSessionNotification { notification } => {
-                            session.handle_xai_session_notification(notification).await;
+                        SessionCommand::XaiSessionNotification { notification, broadcast } => {
+                            session.handle_xai_session_notification(notification, broadcast).await;
                         }
                         SessionCommand::RecordSubagentUsage {
                             by_model,

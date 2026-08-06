@@ -136,27 +136,48 @@ async fn handle_scheduled_task_removed(
 ) -> Result<(), String> {
     tracing::info!(task_id = %removed.task_id, "Scheduled task removed");
     let result: Result<Box<serde_json::value::RawValue>, String> = async {
-        let mut meta = None;
-        stamp_scheduler_meta(config, &mut meta, &removed.generation, removed.revision);
-        let notification = crate::extensions::notification::SessionNotification {
-            session_id: config.session_id.clone(),
-            update: crate::extensions::notification::SessionUpdate::ScheduledTaskDeleted {
-                task_id: removed.task_id,
-            },
-            meta: meta.map(serde_json::Value::Object),
-        };
-        let params = serde_json::to_value(&notification)
-            .and_then(|value| serde_json::value::to_raw_value(&value))
-            .map_err(|error| format!("failed to serialize scheduled task deletion: {error}"))?;
-        let update = crate::session::storage::SessionUpdate::Xai(Box::new(notification));
-        if acknowledgement.is_some() {
-            durable_append_landed(config.persistence.append_update_durably(update).await)?;
-        } else {
-            config
-                .persistence
-                .tx
-                .send(PersistenceMsg::Update(update))
-                .map_err(|_| "session persistence stopped".to_owned())?;
+        // Stamp and enqueue in one ordered section so the id order is the
+        // on-disk order; only the durable barrier is awaited outside it.
+        let enqueued: Result<
+            (
+                Box<serde_json::value::RawValue>,
+                Option<crate::session::persistence::DurableAppendAck>,
+            ),
+            String,
+        > = crate::util::event_id::with_event_order(|| {
+            let mut meta = None;
+            stamp_scheduler_meta(config, &mut meta, &removed.generation, removed.revision);
+            let notification = crate::extensions::notification::SessionNotification {
+                session_id: config.session_id.clone(),
+                update: crate::extensions::notification::SessionUpdate::ScheduledTaskDeleted {
+                    task_id: removed.task_id,
+                },
+                meta: meta.map(serde_json::Value::Object),
+            };
+            let params = serde_json::to_value(&notification)
+                .and_then(|value| serde_json::value::to_raw_value(&value))
+                .map_err(|error| format!("failed to serialize scheduled task deletion: {error}"))?;
+            let update = crate::session::storage::SessionUpdate::Xai(Box::new(notification));
+            if acknowledgement.is_some() {
+                let ack = config
+                    .persistence
+                    .enqueue_update_durably(update)
+                    .map_err(|error| format!("scheduler tombstone was not committed: {error}"))?;
+                Ok((params, Some(ack)))
+            } else {
+                config
+                    .persistence
+                    .tx
+                    .send(PersistenceMsg::Update(update))
+                    .map_err(|_| "session persistence stopped".to_owned())?;
+                Ok((params, None))
+            }
+        });
+        let (params, ack) = enqueued?;
+        if let Some(ack) = ack {
+            durable_append_landed(
+                crate::session::persistence::PersistenceHandle::await_durable_append(ack).await,
+            )?;
         }
         Ok(params)
     }
@@ -223,11 +244,13 @@ async fn emit_current_mode_update(
             acp::SessionModeId::new(mode.as_id()),
         )),
     );
-    stamp_event_id(config, &mut notification.meta);
-    let _ = config.persistence.tx.send(PersistenceMsg::Update(
-        crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
-    ));
-    config.gateway.forward_fire_and_forget(notification);
+    crate::util::event_id::with_event_order(|| {
+        stamp_event_id(config, &mut notification.meta);
+        let _ = config.persistence.tx.send(PersistenceMsg::Update(
+            crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
+        ));
+        config.gateway.forward_fire_and_forget(notification);
+    });
 }
 /// Handle a single notification by forwarding it to the appropriate shell system.
 async fn handle_notification(
@@ -279,10 +302,15 @@ async fn handle_notification(
                     .raw_output(serde_json::to_value(&bash_output).ok()),
             ));
             let mut notification = acp::SessionNotification::new(config.session_id.clone(), update);
-            stamp_event_id(config, &mut notification.meta);
-            let _ = config.persistence.tx.send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
-            ));
+            // The gateway hop below is awaited (backpressured), so only the
+            // stamp and the durable enqueue are held in the ordered section —
+            // `updates.jsonl` order is what the reconnect cursor resolves against.
+            crate::util::event_id::with_event_order(|| {
+                stamp_event_id(config, &mut notification.meta);
+                let _ = config.persistence.tx.send(PersistenceMsg::Update(
+                    crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
+                ));
+            });
             if config
                 .gateway_enabled
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -333,22 +361,24 @@ async fn handle_notification(
                 },
                 meta: None,
             };
-            {
+            crate::util::event_id::with_event_order(|| {
                 let mut meta_map = None;
                 stamp_event_id(config, &mut meta_map);
                 notification.meta = meta_map.map(serde_json::Value::Object);
-            }
-            let _ = config.persistence.tx.send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
-            ));
-            let params = serde_json::to_value(&notification)
-                .and_then(|v| serde_json::value::to_raw_value(&v))
-                .ok();
-            if let Some(params) = params {
-                let ext_notification =
-                    acp::ExtNotification::new("x.ai/task_backgrounded", params.into());
-                config.gateway.forward_fire_and_forget(ext_notification);
-            }
+                let _ = config.persistence.tx.send(PersistenceMsg::Update(
+                    crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
+                ));
+                if let Ok(params) = serde_json::to_value(&notification)
+                    .and_then(|v| serde_json::value::to_raw_value(&v))
+                {
+                    config
+                        .gateway
+                        .forward_fire_and_forget(acp::ExtNotification::new(
+                            "x.ai/task_backgrounded",
+                            params.into(),
+                        ));
+                }
+            });
         }
         ToolNotification::FileWritten(written) => {
             let prompt_index = *config.prompt_index.lock().await;
@@ -577,22 +607,24 @@ async fn handle_notification(
                 },
                 meta: None,
             };
-            {
+            crate::util::event_id::with_event_order(|| {
                 let mut meta_map = None;
                 stamp_event_id(config, &mut meta_map);
                 notification.meta = meta_map.map(serde_json::Value::Object);
-            }
-            let _ = config.persistence.tx.send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
-            ));
-            let params = serde_json::to_value(&notification)
-                .and_then(|v| serde_json::value::to_raw_value(&v))
-                .ok();
-            if let Some(params) = params {
-                let notification: acp::ExtNotification =
-                    acp::ExtNotification::new("x.ai/task_completed", params.into());
-                config.gateway.forward_fire_and_forget(notification);
-            }
+                let _ = config.persistence.tx.send(PersistenceMsg::Update(
+                    crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
+                ));
+                if let Ok(params) = serde_json::to_value(&notification)
+                    .and_then(|v| serde_json::value::to_raw_value(&v))
+                {
+                    config
+                        .gateway
+                        .forward_fire_and_forget(acp::ExtNotification::new(
+                            "x.ai/task_completed",
+                            params.into(),
+                        ));
+                }
+            });
             let _ = config
                 .session_cmd_tx
                 .send(SessionCommand::DispatchNotificationHook {
@@ -793,31 +825,33 @@ async fn handle_notification(
         }
         ToolNotification::ScheduledTaskCreated(created) => {
             tracing::info!(task_id = %created.task_id, "Scheduled task created");
-            let mut meta = None;
-            stamp_scheduler_meta(config, &mut meta, &created.generation, created.revision);
-            let notification = crate::extensions::notification::SessionNotification {
-                session_id: config.session_id.clone(),
-                update: crate::extensions::notification::SessionUpdate::ScheduledTaskCreated {
-                    task_id: created.task_id,
-                    prompt: created.prompt,
-                    human_schedule: created.human_schedule,
-                    next_fire_at: created.next_fire_at,
-                },
-                meta: meta.map(serde_json::Value::Object),
-            };
-            let _ = config.persistence.tx.send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
-            ));
-            if let Ok(params) = serde_json::to_value(&notification)
-                .and_then(|v| serde_json::value::to_raw_value(&v))
-            {
-                config
-                    .gateway
-                    .forward_fire_and_forget(acp::ExtNotification::new(
-                        "x.ai/scheduled_task_created",
-                        params.into(),
-                    ));
-            }
+            crate::util::event_id::with_event_order(|| {
+                let mut meta = None;
+                stamp_scheduler_meta(config, &mut meta, &created.generation, created.revision);
+                let notification = crate::extensions::notification::SessionNotification {
+                    session_id: config.session_id.clone(),
+                    update: crate::extensions::notification::SessionUpdate::ScheduledTaskCreated {
+                        task_id: created.task_id,
+                        prompt: created.prompt,
+                        human_schedule: created.human_schedule,
+                        next_fire_at: created.next_fire_at,
+                    },
+                    meta: meta.map(serde_json::Value::Object),
+                };
+                let _ = config.persistence.tx.send(PersistenceMsg::Update(
+                    crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
+                ));
+                if let Ok(params) = serde_json::to_value(&notification)
+                    .and_then(|v| serde_json::value::to_raw_value(&v))
+                {
+                    config
+                        .gateway
+                        .forward_fire_and_forget(acp::ExtNotification::new(
+                            "x.ai/scheduled_task_created",
+                            params.into(),
+                        ));
+                }
+            });
         }
     }
 }

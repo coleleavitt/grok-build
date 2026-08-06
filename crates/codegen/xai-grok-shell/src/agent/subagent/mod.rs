@@ -1685,16 +1685,25 @@ pub(crate) fn subagent_harness_flavor_is_representable(agent_type: &str) -> bool
 /// Apply the harness-dependent toolset/prompt re-selection to a resolved
 /// agent definition.
 ///
-/// The harness flavor (alternate vs grok-build) normally follows the PARENT
-/// agent: `GrokBuildOrchestrator` parents give children
-/// the alternate harness; the orchestrator keeps children lean, and other parents
-/// inherit the file-tool override (hashline vs standard). A `/goal` role may
-/// pass `harness_agent_type` to OVERRIDE that flavor regardless of the parent
-/// (so a grok-build session can run an alternate-harness verifier and vice-versa);
-/// `None` for every non-goal spawn ⇒ the parent decides (unchanged). The base
-/// toolset stays role-dependent on `subagent_type` (general-purpose →
-/// implementer, else explorer), so the role keeps a capable toolset on the
-/// chosen harness.
+/// The harness flavor follows the PARENT agent unless overridden: a `/goal`
+/// role may pass `harness_agent_type` to re-flavor its child regardless of the
+/// parent (so a grok-build session can run a codex verifier and vice-versa);
+/// `None` for every non-goal spawn ⇒ the parent decides.
+///
+/// Re-flavoring applies only to the alternate harnesses this build carries
+/// (`codex`, `opencode` — see
+/// [`xai_grok_subagent_resolution::subagent_harness_flavor_is_representable`]).
+/// A stock `grok-build*` name takes the other arm instead, which swaps the
+/// parent's file tools (hashline vs standard) into the child's slots — children
+/// of a stock parent already run that flavor, so re-flavoring them would be a
+/// no-op that also swallowed the file-tool inheritance.
+///
+/// The base toolset stays role-dependent on `subagent_type` because the flavor
+/// is filtered through the ROLE's capability ceiling: a `general-purpose` child
+/// gets the flavor's full vocabulary (implementer), a read-only `explore` child
+/// gets only its read/search tools (explorer) and can never gain a shell by
+/// switching harness. The role keeps its own `prompt_body`; the flavor supplies
+/// the base system-prompt and user-message templates.
 ///
 /// Extracted so both [`run_shell_child`] (real spawn) and
 /// [`describe_subagent_type`] (read-only probe) build the SAME `tool_config`
@@ -1764,8 +1773,9 @@ fn summarize_tool_config(
 /// harness names but does NOT apply the main session's env / ACP-profile /
 /// strict-harness precedence. An unresolvable harness returns `Unknown` so the
 /// `/goal` caller fails open to the session harness; otherwise it decides the
-/// summarized toolset's flavor. `None` (every non-goal probe) defers the flavor
-/// to the parent agent (unchanged).
+/// summarized toolset's flavor via [`resolve_subagent_toolset`], so the summary
+/// the capability gate sees is the one the child will actually run. `None`
+/// (every non-goal probe) defers the flavor to the parent agent.
 pub(crate) fn describe_subagent_type(
     subagent_type: &str,
     harness_agent_type: Option<&str>,
@@ -2119,31 +2129,58 @@ async fn cancel_pending_shell_child(
     persist_subagent_completion(subagent_meta_dir, &result, gcs_ctx);
     result
 }
+/// Publish a subagent lifecycle event on the PARENT session's streams.
+///
+/// Lifecycle events are emitted from child tasks but belong to the parent's
+/// transcript, so they are handed to the parent `SessionActor`, which is the
+/// single serialized owner of the `eventId` mint, the `updates.jsonl` append,
+/// and the gateway fan-out (see `handle_xai_session_notification`).
+///
+/// Broadcasting from here instead would fork the event into two independently
+/// ordered paths: the live copy would leave immediately while the durable copy
+/// waited in the actor's command queue, so any other same-session producer
+/// (the tool notification bridge, goal snapshots) could mint AND persist a
+/// higher id in between. `updates.jsonl` would then read `N+1, N` while the
+/// client saw `N, N+1`, and a client that reconnects with cursor `N` resumes
+/// past `N+1`'s file position — losing it permanently.
+///
+/// With no parent actor there is no durable copy at all, so the fallback
+/// broadcast ships UNSTAMPED: a stamped-but-unpersisted id would become a
+/// client cursor that no line on disk carries, forcing a full replay on every
+/// later reconnect.
 fn emit_subagent_notification(
     gateway: &GatewaySender,
     parent_session_id: &str,
     update: SessionUpdate,
     parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
 ) {
-    let mut meta = None;
-    crate::util::event_id::ensure_event_id_meta(parent_session_id, &mut meta);
     let notification = SessionNotification {
         session_id: acp::SessionId::new(parent_session_id),
         update,
-        meta: meta.map(serde_json::Value::Object),
+        meta: None,
     };
-    if let Some(cmd_tx) = parent_cmd_tx {
-        let _ = cmd_tx.send(SessionCommand::XaiSessionNotification {
-            notification: notification.clone(),
-        });
-    }
-    let params = serde_json::to_value(&notification)
-        .and_then(|v| serde_json::value::to_raw_value(&v))
-        .ok();
-    if let Some(params) = params {
-        let ext_notification =
-            acp::ExtNotification::new("x.ai/session_notification", params.into());
-        gateway.forward_fire_and_forget(ext_notification);
+    let unowned = match parent_cmd_tx {
+        None => notification,
+        Some(cmd_tx) => match cmd_tx.send(SessionCommand::XaiSessionNotification {
+            notification,
+            broadcast: true,
+        }) {
+            Ok(()) => return,
+            // The actor is gone (session torn down mid-flight). Nothing will
+            // persist this, so fall through to the unstamped live-only path.
+            Err(mpsc::error::SendError(command)) => match command {
+                SessionCommand::XaiSessionNotification { notification, .. } => notification,
+                _ => unreachable!("the command we just built"),
+            },
+        },
+    };
+    if let Ok(params) =
+        serde_json::to_value(&unowned).and_then(|v| serde_json::value::to_raw_value(&v))
+    {
+        gateway.forward_fire_and_forget(acp::ExtNotification::new(
+            "x.ai/session_notification",
+            params.into(),
+        ));
     }
 }
 /// Progress notification emission interval.
@@ -2257,13 +2294,19 @@ fn spawn_progress_publisher(
             let params = serde_json::to_value(&notification)
                 .and_then(|v| serde_json::value::to_raw_value(&v))
                 .ok();
-            if let Some(ref cmd_tx) = parent_cmd_tx {
-                let _ = cmd_tx.send(SessionCommand::XaiSessionNotification { notification });
-            }
             if let Some(params) = params {
                 let ext_notification =
                     acp::ExtNotification::new("x.ai/session_notification", params.into());
                 gateway.forward_fire_and_forget(ext_notification);
+            }
+            if let Some(ref cmd_tx) = parent_cmd_tx {
+                // Accounting-only hop: the tick above already went out
+                // unstamped (it is never persisted), so the actor must not
+                // broadcast a second copy.
+                let _ = cmd_tx.send(SessionCommand::XaiSessionNotification {
+                    notification,
+                    broadcast: false,
+                });
             }
         }
     });

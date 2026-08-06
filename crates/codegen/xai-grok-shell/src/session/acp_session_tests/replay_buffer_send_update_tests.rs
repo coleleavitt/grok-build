@@ -474,6 +474,78 @@ async fn available_commands_update_is_forwarded_but_not_persisted() {
         })
         .await;
 }
+
+/// Producer half of the "persisted ⟺ stamped" contract, pinned on the REAL
+/// ACU path (`send_update` → event pipeline), not a direct emit.
+///
+/// `send_update_full` mints at ENQUEUE, so gating only `emit_notification_direct`
+/// would leave the id already attached by the time the append is skipped. The
+/// client adopts every `eventId` it receives as its reconnect cursor, and an id
+/// no `updates.jsonl` line carries can never be resolved by
+/// `prepare_replay_lines` — each stamped ACU downgrades every later reconnect
+/// to a full replay, and ACUs fire on every skill/MCP/plugin/model change.
+#[tokio::test(flavor = "current_thread")]
+async fn available_commands_update_is_enqueued_without_an_event_id() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ReplaySendUpdateFixture {
+                actor,
+                mut event_rx,
+                ..
+            } = make_replay_send_update_fixture().await;
+
+            actor
+                .send_update(
+                    acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(
+                        vec![],
+                    )),
+                    None,
+                )
+                .await;
+            actor.send_update(agent_msg_update("hello"), None).await;
+
+            let mut event_ids = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                let SessionEvent::Notification(
+                    crate::session::acp_session::SessionNotification::Acp(n),
+                ) = event
+                else {
+                    continue;
+                };
+                let stamped = n
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.get("eventId"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                event_ids.push((
+                    matches!(n.update, acp::SessionUpdate::AvailableCommandsUpdate(_)),
+                    stamped,
+                ));
+            }
+
+            let acu = event_ids
+                .iter()
+                .find(|(is_acu, _)| *is_acu)
+                .expect("the ACU must reach the pipeline");
+            assert!(
+                acu.1.is_none(),
+                "an unpersisted ACU must not hand the client a cursor id, got {:?}",
+                acu.1,
+            );
+            let persisted = event_ids
+                .iter()
+                .find(|(is_acu, _)| !*is_acu)
+                .expect("the agent chunk must reach the pipeline");
+            assert!(
+                persisted.1.is_some(),
+                "every persisted line must stay cursor-addressable",
+            );
+            drop(actor);
+        })
+        .await;
+}
 /// `handle_sampling_event::ChannelToken` for `Reasoning` and `Text`
 /// channels must accumulate into the session's streaming capture so
 /// the trace upload can serialize it even when the canonical

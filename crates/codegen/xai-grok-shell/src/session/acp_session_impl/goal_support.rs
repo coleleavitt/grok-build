@@ -1447,6 +1447,50 @@ impl SessionActor {
         )
     }
 
+    /// Seal a child's token record and make the resulting goal high-water
+    /// DURABLE, before its `SubagentFinished` is queued for `updates.jsonl`.
+    ///
+    /// The two artifacts have independent durability: the finish is a JSONL
+    /// line, the accounting is `PersistenceMsg::GoalModeState`. Persisting the
+    /// finish first opens a window where a crash or a cancelled actor task
+    /// leaves a durable terminal event whose token delta was never accounted —
+    /// unrecoverably, because on restart `collect_unfinished_subagents` sees
+    /// the child as paired and drops it from reconciliation while
+    /// `subagent_token_records` starts empty, so nothing can re-derive the
+    /// marginal. Writing the accounting first inverts the window into a benign
+    /// one: an over-accounted goal whose finish is missing is reconciled as an
+    /// orphan on load, and `tokens_used_high_water` only ever ratchets up.
+    ///
+    /// Deliberately synchronous. Re-anchoring on `last_session_tokens_seen`
+    /// instead of re-reading the live session total keeps this await-free, so
+    /// nothing can interleave between the checkpoint and the persist that
+    /// follows it; the parent's own spend is re-sampled by the full
+    /// `goal_tokens` call that emits the derived `GoalUpdated` right after.
+    pub(super) fn checkpoint_finished_subagent_tokens(&self, subagent_id: &str, tokens_used: u64) {
+        {
+            let mut records = self.subagent_token_records.lock();
+            let Some(rec) = records.get_mut(subagent_id) else {
+                return;
+            };
+            rec.last_cumulative_reported = rec.last_cumulative_reported.max(tokens_used);
+            rec.finished = true;
+        }
+        if !self.goal_harness_enabled() {
+            return;
+        }
+        let last_seen = {
+            let tracker = self.goal_tracker.lock();
+            match tracker.snapshot() {
+                Some(o) => o.last_session_tokens_seen.unwrap_or(o.token_baseline),
+                None => return,
+            }
+        };
+        // Ratchets `tokens_used_high_water` with the marginal just sealed.
+        let _ = self.goal_tokens(last_seen);
+        let notify = self.goal_notify_sender();
+        notify.checkpoint_goal_state(&mut self.goal_tracker.lock());
+    }
+
     /// Returns `(ratcheted_total, finished_subagent_marginal_sum)` for the
     /// active goal, or `(0, 0)` if no orchestration is loaded.
     ///

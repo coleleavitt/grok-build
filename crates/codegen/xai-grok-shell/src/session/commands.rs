@@ -349,9 +349,20 @@ pub enum SessionCommand {
     ReconcileRewindTracker {
         target_prompt_index: usize,
     },
-    /// xAI extension session notification - client-side events to store in persistence
+    /// xAI extension session notification the actor must own end-to-end.
+    ///
+    /// The actor is the single serialized owner of the `eventId` mint, the
+    /// `updates.jsonl` append, and (when `broadcast`) the live fan-out, so
+    /// nothing it derives from the event — a `GoalUpdated` snapshot, say —
+    /// can reach either channel ahead of the event itself.
     XaiSessionNotification {
         notification: SessionNotification,
+        /// `true` for agent-originated events the actor must also publish to
+        /// the client (subagent lifecycle). `false` for events that arrived
+        /// FROM the client (`_x.ai/session/update`), which only need storing,
+        /// and for `SubagentProgress` ticks, which the emitter already
+        /// broadcast unstamped because they are never persisted.
+        broadcast: bool,
     },
     /// Apply subagent usage into parent ledgers. Acks `()` once chat-state
     /// applied (prompt-attributed or session-only). Drop the oneshot on failure

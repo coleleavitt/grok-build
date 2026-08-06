@@ -787,6 +787,59 @@
         );
     }
 
+    /// The other half of the shell's "persisted ⇒ stamped" contract: whatever
+    /// the client is handed an `eventId` for becomes its reconnect cursor, so
+    /// a broadcast-only update carrying one would point the cursor at an id
+    /// absent from `updates.jsonl` — unresolvable, forcing a full replay on
+    /// every later reconnect. `AvailableCommandsUpdate` is the broadcast-only
+    /// ACP update (see `SessionActor::emit_notification_direct`), and it fires
+    /// on every skill/MCP/plugin/model change.
+    #[test]
+    fn available_commands_update_would_pin_the_cursor_if_stamped() {
+        let mut app = make_app_with_agent("sess-acu");
+        let id = AgentId(0);
+        assert!(handle(
+            make_agent_chunk_with_event("sess-acu", "a", "p1", Some("sess-acu-5")),
+            &mut app,
+        ));
+
+        let acu = |event_id: Option<&str>| {
+            let mut meta = serde_json::Map::new();
+            if let Some(event_id) = event_id {
+                meta.insert("eventId".to_string(), serde_json::json!(event_id));
+            }
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            AcpClientMessage::SessionNotification(xai_acp_lib::AcpArgs {
+                request: acp::SessionNotification::new(
+                    acp::SessionId::new("sess-acu"),
+                    acp::SessionUpdate::AvailableCommandsUpdate(
+                        acp::AvailableCommandsUpdate::new(Vec::new()),
+                    ),
+                )
+                .meta(serde_json::Value::Object(meta).as_object().cloned()),
+                response_tx: tx,
+            })
+        };
+
+        // Unstamped (the shell's contract): the catalog still applies, and the
+        // cursor stays on the last durable line.
+        let _ = handle(acu(None), &mut app);
+        assert_eq!(
+            app.agents[&id].last_seen_event_id.as_deref(),
+            Some("sess-acu-5"),
+            "an unstamped broadcast-only update must leave the cursor on disk",
+        );
+
+        // Characterization of the hazard this guards: an id on the wire IS
+        // adopted, so stamping an unpersisted update would strand the cursor.
+        let _ = handle(acu(Some("sess-acu-9")), &mut app);
+        assert_eq!(
+            app.agents[&id].last_seen_event_id.as_deref(),
+            Some("sess-acu-9"),
+            "the client adopts any eventId it is handed — hence the producer-side rule",
+        );
+    }
+
     /// xAI extension session updates: replay-stamped ones are gated like ACP
     /// updates, and applied ones advance the reconnect cursor.
     #[test]
@@ -851,6 +904,199 @@
             1,
             "the staged xAI block is the new transcript"
         );
+    }
+
+    fn app_with_completed_subagent(parent_sid: &str, child_sid: &str) -> AppView {
+        let mut app = make_app_with_agent(parent_sid);
+        let _ = handle(
+            make_ext_session_notification(
+                parent_sid,
+                test_subagent_spawned(parent_sid, child_sid),
+            ),
+            &mut app,
+        );
+        let _ = handle(
+            make_ext_session_notification(parent_sid, test_subagent_finished(child_sid)),
+            &mut app,
+        );
+        assert!(app.agents[&AgentId(0)].subagent_sessions[child_sid].finished);
+        app
+    }
+
+    fn app_with_terminal_tombstone(parent_sid: &str, child_sid: &str) -> AppView {
+        let mut app = make_app_with_agent(parent_sid);
+        let _ = handle(
+            make_ext_session_notification(parent_sid, test_subagent_finished(child_sid)),
+            &mut app,
+        );
+        let agent = &app.agents[&AgentId(0)];
+        assert!(agent.terminal_subagent_sessions.contains(child_sid));
+        assert!(!agent.subagent_sessions.contains_key(child_sid));
+        app
+    }
+
+    fn replayed_subagent_spawn(
+        parent_sid: &str,
+        child_sid: &str,
+        event_id: &str,
+    ) -> acp::ExtNotification {
+        let payload = SessionNotification {
+            session_id: acp::SessionId::new(parent_sid),
+            update: test_subagent_spawned(parent_sid, child_sid),
+            meta: Some(serde_json::json!({ "isReplay": true, "eventId": event_id })),
+        };
+        acp::ExtNotification::new(
+            "x.ai/session_notification",
+            serde_json::value::to_raw_value(&payload).unwrap().into(),
+        )
+    }
+
+    /// A failed full replay may have delivered the historical spawn but not
+    /// its finish. Restore the pre-outage terminal subset with the transcript.
+    #[test]
+    fn failed_reload_restores_terminal_subagent_over_replayed_spawn() {
+        let parent_sid = "sess-terminal-fail";
+        let child_sid = "child-terminal-fail";
+        let mut app = app_with_completed_subagent(parent_sid, child_sid);
+        let id = AgentId(0);
+        app.agents.get_mut(&id).unwrap().begin_session_reload(1);
+
+        assert!(handle_ext_notification(
+            &replayed_subagent_spawn(parent_sid, child_sid, "sess-terminal-fail-10"),
+            &mut app,
+        ));
+        assert!(!app.agents[&id].subagent_sessions[child_sid].finished);
+        assert!(app.agents.get_mut(&id).unwrap().finish_session_reload(1, false));
+
+        let agent = &app.agents[&id];
+        assert!(agent.subagent_sessions[child_sid].finished);
+        assert!(agent.terminal_subagent_sessions.contains(child_sid));
+        assert!(matches!(
+            agent.subagent_views[child_sid].session.state,
+            AgentState::Idle,
+        ));
+        assert_eq!(
+            crate::views::dashboard::classify_subagent(
+                &agent.subagent_sessions[child_sid],
+            ),
+            crate::views::dashboard::RowState::Completed,
+        );
+    }
+
+    /// Superseding a replay implicitly fails the old window before opening the
+    /// new one; that path must restore the same terminal subset.
+    #[test]
+    fn superseded_reload_restores_terminal_subagent_over_replayed_spawn() {
+        let parent_sid = "sess-terminal-supersede";
+        let child_sid = "child-terminal-supersede";
+        let mut app = app_with_completed_subagent(parent_sid, child_sid);
+        let id = AgentId(0);
+        app.agents.get_mut(&id).unwrap().begin_session_reload(1);
+        assert!(handle_ext_notification(
+            &replayed_subagent_spawn(
+                parent_sid,
+                child_sid,
+                "sess-terminal-supersede-10",
+            ),
+            &mut app,
+        ));
+        assert!(!app.agents[&id].subagent_sessions[child_sid].finished);
+
+        app.agents.get_mut(&id).unwrap().begin_session_reload(2);
+        assert!(app.agents[&id].subagent_sessions[child_sid].finished);
+        assert!(app.agents[&id].terminal_subagent_sessions.contains(child_sid));
+        app.agents.get_mut(&id).unwrap().abort_session_reload();
+        assert!(app.agents[&id].subagent_sessions[child_sid].finished);
+    }
+
+    /// A successful full replay is authoritative. If its branch contains a
+    /// spawn but no finish, it may intentionally replace the old terminal row.
+    #[test]
+    fn successful_full_reload_commits_replayed_running_subagent() {
+        let parent_sid = "sess-terminal-success";
+        let child_sid = "child-terminal-success";
+        let mut app = app_with_completed_subagent(parent_sid, child_sid);
+        let id = AgentId(0);
+        app.agents.get_mut(&id).unwrap().begin_session_reload(1);
+        assert!(handle_ext_notification(
+            &replayed_subagent_spawn(parent_sid, child_sid, "sess-terminal-success-10"),
+            &mut app,
+        ));
+        assert!(app.agents.get_mut(&id).unwrap().finish_session_reload(1, true));
+
+        let agent = &app.agents[&id];
+        assert!(!agent.subagent_sessions[child_sid].finished);
+        assert!(!agent.terminal_subagent_sessions.contains(child_sid));
+        assert_eq!(
+            crate::views::dashboard::classify_subagent(
+                &agent.subagent_sessions[child_sid],
+            ),
+            crate::views::dashboard::RowState::Working,
+        );
+    }
+
+    #[test]
+    fn failed_reload_removes_replayed_row_for_terminal_tombstone() {
+        let parent_sid = "sess-tombstone-fail";
+        let child_sid = "child-tombstone-fail";
+        let mut app = app_with_terminal_tombstone(parent_sid, child_sid);
+        let id = AgentId(0);
+        app.agents.get_mut(&id).unwrap().begin_session_reload(1);
+        assert!(handle_ext_notification(
+            &replayed_subagent_spawn(parent_sid, child_sid, "sess-tombstone-fail-10"),
+            &mut app,
+        ));
+        assert!(app.agents[&id].subagent_sessions.contains_key(child_sid));
+        assert!(app.agents.get_mut(&id).unwrap().finish_session_reload(1, false));
+
+        let agent = &app.agents[&id];
+        assert!(agent.terminal_subagent_sessions.contains(child_sid));
+        assert!(!agent.subagent_sessions.contains_key(child_sid));
+        assert!(!agent.subagent_views.contains_key(child_sid));
+    }
+
+    #[test]
+    fn superseded_reload_removes_replayed_row_for_terminal_tombstone() {
+        let parent_sid = "sess-tombstone-supersede";
+        let child_sid = "child-tombstone-supersede";
+        let mut app = app_with_terminal_tombstone(parent_sid, child_sid);
+        let id = AgentId(0);
+        app.agents.get_mut(&id).unwrap().begin_session_reload(1);
+        assert!(handle_ext_notification(
+            &replayed_subagent_spawn(
+                parent_sid,
+                child_sid,
+                "sess-tombstone-supersede-10",
+            ),
+            &mut app,
+        ));
+        assert!(app.agents[&id].subagent_sessions.contains_key(child_sid));
+
+        app.agents.get_mut(&id).unwrap().begin_session_reload(2);
+        assert!(app.agents[&id].terminal_subagent_sessions.contains(child_sid));
+        assert!(!app.agents[&id].subagent_sessions.contains_key(child_sid));
+        assert!(!app.agents[&id].subagent_views.contains_key(child_sid));
+        app.agents.get_mut(&id).unwrap().abort_session_reload();
+    }
+
+    #[test]
+    fn successful_full_reload_commits_replayed_row_over_terminal_tombstone() {
+        let parent_sid = "sess-tombstone-success";
+        let child_sid = "child-tombstone-success";
+        let mut app = app_with_terminal_tombstone(parent_sid, child_sid);
+        let id = AgentId(0);
+        app.agents.get_mut(&id).unwrap().begin_session_reload(1);
+        assert!(handle_ext_notification(
+            &replayed_subagent_spawn(parent_sid, child_sid, "sess-tombstone-success-10"),
+            &mut app,
+        ));
+        assert!(app.agents.get_mut(&id).unwrap().finish_session_reload(1, true));
+
+        let agent = &app.agents[&id];
+        assert!(!agent.terminal_subagent_sessions.contains(child_sid));
+        assert!(agent.subagent_sessions.contains_key(child_sid));
+        assert!(!agent.subagent_sessions[child_sid].finished);
+        assert!(agent.subagent_views.contains_key(child_sid));
     }
 
     /// Characterization (leader-relaunch orphan rows): a reconnect reload whose

@@ -1506,6 +1506,10 @@ mod generated_title_tests {
     }
 }
 
+/// Pending acknowledgement for [`PersistenceHandle::enqueue_update_durably`].
+pub type DurableAppendAck =
+    tokio::sync::oneshot::Receiver<Result<(), crate::session::storage::AppendUpdateError>>;
+
 #[derive(Clone)]
 pub struct PersistenceHandle {
     pub tx: mpsc::UnboundedSender<PersistenceMsg>,
@@ -1576,6 +1580,16 @@ impl PersistenceHandle {
         &self,
         update: SessionUpdate,
     ) -> Result<(), DurableAppendError> {
+        Self::await_durable_append(self.enqueue_update_durably(update)?).await
+    }
+
+    /// [`Self::append_update_durably`] split at the enqueue, so a caller can
+    /// perform the enqueue inside a synchronous ordering section (see
+    /// `event_id::with_event_order`) and await the barrier outside it.
+    pub fn enqueue_update_durably(
+        &self,
+        update: SessionUpdate,
+    ) -> Result<DurableAppendAck, DurableAppendError> {
         if self.noop {
             return Err(DurableAppendError::NotCommitted(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1591,8 +1605,12 @@ impl PersistenceHandle {
                     "session persistence actor stopped before durable append dispatch",
                 ))
             })?;
-        response
-            .await
+        Ok(response)
+    }
+
+    /// Await an acknowledgement returned by [`Self::enqueue_update_durably`].
+    pub async fn await_durable_append(ack: DurableAppendAck) -> Result<(), DurableAppendError> {
+        ack.await
             .map_err(|_| {
                 DurableAppendError::AcknowledgementLost(io::Error::new(
                     io::ErrorKind::BrokenPipe,

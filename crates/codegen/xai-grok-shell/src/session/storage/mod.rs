@@ -1757,6 +1757,15 @@ fn line_has_event_id(line: &str, cursor_id: &str) -> bool {
     line_event_id(line).as_deref() == Some(cursor_id)
 }
 
+/// The counter suffix of this line's `_meta.eventId`.
+///
+/// `eventId` is `{sessionId}-{counter}` and session ids contain dashes, so the
+/// counter is the suffix after the LAST '-'. This is the value the reconnect
+/// cursor is ordered by — see [`prepare_replay_lines`].
+fn line_event_seq(line: &str) -> Option<u64> {
+    line_event_id(line)?.rsplit('-').next()?.parse::<u64>().ok()
+}
+
 /// Rewind-filter, resolve the reconnect cursor, drop redundant command
 /// catalogs, and scan `totalTokens`. Pure data processing, no I/O.
 ///
@@ -1827,18 +1836,71 @@ pub fn prepare_replay_lines<'a>(contents: &'a str, cursor: Option<&str>) -> Prep
     let mark_replay = cursor_pos.is_none();
     let start = cursor_pos.map_or(0, |pos| pos + 1);
 
-    // Single pass: drop ACUs (kept on disk), collect the post-cursor tail to
-    // forward, and count the full ACU-free live set for the skip log.
-    let mut lines: Vec<&str> = Vec::with_capacity(filtered.len().saturating_sub(start));
+    // The forward set is chosen by `eventId` SEQUENCE, not file position.
+    //
+    // Position is only a PROXY for mint order, and one that the buffered
+    // streaming path cannot honour: `send_update_full` mints at ENQUEUE (so the
+    // id order matches delivery order, which the client's in-order dedup
+    // requires) while the append happens later, after `ReplayBuffer`
+    // merge/debounce. A concurrent producer that mints and appends in between —
+    // the tool notification bridge, say — therefore lands a HIGHER id EARLIER
+    // in the file, legitimately. Under position selection a client holding the
+    // lower id as its cursor would resume past the higher one and never receive
+    // it: an unrecoverable gap, since nothing later moves the cursor back.
+    //
+    // Ordering by the counter instead makes the choice independent of how the
+    // bytes happen to be interleaved, so it also holds for any future emitter
+    // that skips the `event_id::with_event_order` chokepoint. The forwarded set
+    // is then emitted in counter order: the client's dedup treats the counter
+    // as authoritative, so replaying a lower id after a higher one would make
+    // it drop the lower as stale. When the file is already in counter order
+    // (the common case) this is exactly the old tail, in the old order.
+    // Seq mode is an UPGRADE, not a requirement: it engages only when the
+    // cursor line and every forwardable line after it carry a parseable
+    // counter. A transcript from an older binary (or any foreign `eventId`
+    // shape) simply keeps the positional tail it has always had.
+    let cursor_seq = cursor_pos
+        .filter(|&pos| {
+            filtered[pos + 1..]
+                .iter()
+                .all(|l| line_is_available_commands_update(l) || line_event_seq(l).is_some())
+        })
+        .and_then(|pos| line_event_seq(filtered[pos]));
+
+    // Single pass: drop ACUs (kept on disk), collect the lines to forward, and
+    // count the full ACU-free live set for the skip log.
+    let mut selected: Vec<(u64, usize, &str)> = Vec::new();
+    let mut lines: Vec<&str> = Vec::new();
     let mut total_live = 0usize;
     for (i, &line) in filtered.iter().enumerate() {
         if line_is_available_commands_update(line) {
             continue;
         }
         total_live += 1;
-        if i >= start {
-            lines.push(line);
+        match cursor_seq {
+            // Every non-ACU line at/after `start` has a parseable counter (the
+            // guard above), so nothing forwardable is dropped by this arm.
+            Some(cursor_seq) => {
+                if let Some(seq) = line_event_seq(line)
+                    && seq > cursor_seq
+                {
+                    selected.push((seq, i, line));
+                }
+            }
+            // No cursor, or a legacy cursor id with no parseable counter:
+            // fall back to the positional tail (a full replay when unset).
+            None => {
+                if i >= start {
+                    lines.push(line);
+                }
+            }
         }
+    }
+    if cursor_seq.is_some() {
+        // `i` breaks ties only defensively; the counter is process-global and
+        // `fetch_add`-unique, so two live lines cannot share one.
+        selected.sort_unstable_by_key(|&(seq, i, _)| (seq, i));
+        lines = selected.into_iter().map(|(_, _, line)| line).collect();
     }
 
     PreparedReplay {
@@ -3853,6 +3915,98 @@ mod tests {
             prepared.unfinished_subagents,
             vec![("b".to_string(), "cb".to_string())]
         );
+    }
+
+    /// Regression: file position is only a PROXY for mint order, and the
+    /// buffered streaming path breaks it by design — `send_update_full` mints
+    /// at enqueue while the append happens after `ReplayBuffer` debounce, so a
+    /// concurrent producer legitimately lands a HIGHER id EARLIER in the file.
+    ///
+    /// A client that saw the lower id, disconnected, and reconnects with it as
+    /// its cursor must still receive the higher one. Selecting the tail by file
+    /// position skips it permanently: nothing later moves the cursor back.
+    #[test]
+    fn cursor_forwards_a_higher_id_written_before_it() {
+        let line = |seq: u64, text: &str| {
+            format!(
+                r#"{{"method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{text}"}}}},"_meta":{{"eventId":"s-{seq}"}}}}}}"#
+            )
+        };
+        // On disk: s-11 landed BEFORE s-10 (out-of-order append).
+        let raw = format!(
+            "{}\n{}\n{}\n{}\n",
+            line(9, "seen-a"),
+            line(11, "unseen-newer"),
+            line(10, "cursor"),
+            line(12, "after"),
+        );
+
+        let prepared = prepare_replay_lines(&raw, Some("s-10"));
+
+        assert!(
+            !prepared.mark_replay,
+            "the cursor resolved; stay incremental"
+        );
+        let texts: Vec<&str> = prepared
+            .lines
+            .iter()
+            .map(|l| {
+                if l.contains("unseen-newer") {
+                    "unseen-newer"
+                } else if l.contains("after") {
+                    "after"
+                } else if l.contains("cursor") {
+                    "cursor"
+                } else {
+                    "seen-a"
+                }
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["unseen-newer", "after"],
+            "everything above the cursor's counter must be forwarded, in counter order",
+        );
+    }
+
+    /// The converse: a line that landed AFTER the cursor's byte position but
+    /// carries a LOWER counter was already delivered, so re-forwarding it is
+    /// waste the client would only dedup away.
+    #[test]
+    fn cursor_skips_a_lower_id_written_after_it() {
+        let line = |seq: u64, text: &str| {
+            format!(
+                r#"{{"method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{text}"}}}},"_meta":{{"eventId":"s-{seq}"}}}}}}"#
+            )
+        };
+        let raw = format!(
+            "{}\n{}\n{}\n",
+            line(20, "cursor"),
+            line(19, "older-late-write"),
+            line(21, "newer"),
+        );
+
+        let prepared = prepare_replay_lines(&raw, Some("s-20"));
+
+        assert_eq!(prepared.lines.len(), 1);
+        assert!(
+            prepared.lines[0].contains("newer"),
+            "only the higher counter is forwarded",
+        );
+    }
+
+    /// An id-less line in the post-cursor tail still forces a full replay: it
+    /// cannot be ordered against the cursor, so incremental would drop it.
+    #[test]
+    fn cursor_refuses_a_tail_with_an_unorderable_line() {
+        let stamped = r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"cursor"}},"_meta":{"eventId":"s-30"}}}"#;
+        let idless = r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"idless"}}}}"#;
+        let raw = format!("{stamped}\n{idless}\n");
+
+        let prepared = prepare_replay_lines(&raw, Some("s-30"));
+
+        assert!(prepared.mark_replay, "unorderable tail ⇒ full replay");
+        assert_eq!(prepared.lines.len(), 2, "full replay forwards everything");
     }
 
     /// Legacy lines put `sessionId`/`update` at the top level (no `params`

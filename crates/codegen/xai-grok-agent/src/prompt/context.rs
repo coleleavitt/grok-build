@@ -39,12 +39,20 @@ impl<'de> Deserialize<'de> for TemplateOverride {
         impl<'de> de::Visitor<'de> for Visitor {
             type Value = TemplateOverride;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str(r#""none", "codex", "cursor", {"custom": "..."}, or a template string"#)
+                f.write_str(r#""none", "codex", {"custom": "..."}, or a template string"#)
             }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<TemplateOverride, E> {
                 match v {
                     "none" => Ok(TemplateOverride::None),
                     "codex" => Ok(TemplateOverride::Codex),
+                    // A built-in variant this build does not carry. Falling
+                    // through to `Custom` would make the system prompt the
+                    // literal word — silently replacing the whole prompt with
+                    // it — so reject instead.
+                    "cursor" => Err(de::Error::custom(
+                        "system_prompt \"cursor\" is not available in this build; \
+                         use {\"custom\": \"...\"} to supply the template inline",
+                    )),
                     other => Ok(TemplateOverride::Custom(other.to_owned())),
                 }
             }
@@ -373,6 +381,25 @@ mod tests {
         assert_eq!(
             v,
             TemplateOverride::Custom("You are a coding agent...".to_string())
+        );
+    }
+    /// A built-in variant name this build does not carry must be REJECTED, not
+    /// absorbed by the legacy bare-string arm. `Custom("cursor")` would make
+    /// the agent's entire system prompt the six-letter word, silently — and
+    /// the old `expecting()` text advertised `"cursor"` as valid, so a
+    /// `.grok/agents/*.md` author had every reason to write it.
+    #[test]
+    fn unavailable_builtin_template_name_is_rejected_not_absorbed() {
+        let err = serde_json::from_str::<TemplateOverride>(r#""cursor""#)
+            .expect_err("an unavailable built-in name must not parse");
+        assert!(
+            err.to_string().contains("not available in this build"),
+            "the error must say why, got: {err}",
+        );
+        // An explicit inline template of the same text still works.
+        assert_eq!(
+            serde_json::from_str::<TemplateOverride>(r#"{"custom":"cursor"}"#).unwrap(),
+            TemplateOverride::Custom("cursor".to_string()),
         );
     }
     #[test]

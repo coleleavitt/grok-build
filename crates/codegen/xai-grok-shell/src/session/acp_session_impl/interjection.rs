@@ -196,19 +196,24 @@ impl SessionActor {
             text.to_string(),
         ))];
         content_blocks.extend(images.iter().cloned().map(acp::ContentBlock::Image));
-        let notification_meta = self.build_notification_meta();
-        for content_block in content_blocks {
-            let update = acp::SessionUpdate::UserMessageChunk(
-                acp::ContentChunk::new(content_block).meta(user_chunk_meta.clone()),
-            );
-            let _ = self
-                .notifications
-                .persistence_tx
-                .send(PersistenceMsg::Update(SessionUpdate::Acp(Box::new(
-                    acp::SessionNotification::new(self.session_info.id.clone(), update)
-                        .meta(notification_meta.clone().as_object().cloned()),
-                ))));
-        }
+        // One ordered section for the whole batch: these chunks share a single
+        // `eventId` by design, and nothing may interleave a higher id between
+        // the mint and the appends that carry it.
+        crate::util::event_id::with_event_order(|| {
+            let notification_meta = self.build_notification_meta();
+            for content_block in content_blocks {
+                let update = acp::SessionUpdate::UserMessageChunk(
+                    acp::ContentChunk::new(content_block).meta(user_chunk_meta.clone()),
+                );
+                let _ = self
+                    .notifications
+                    .persistence_tx
+                    .send(PersistenceMsg::Update(SessionUpdate::Acp(Box::new(
+                        acp::SessionNotification::new(self.session_info.id.clone(), update)
+                            .meta(notification_meta.clone().as_object().cloned()),
+                    ))));
+            }
+        });
 
         // Notify pager (skipped for interjections — pager has local block).
         if notify_pager {

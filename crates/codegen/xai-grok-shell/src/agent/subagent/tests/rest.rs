@@ -1288,20 +1288,26 @@ fn durable_fallback_rejects_running_status() {
         );
     let _ = std::fs::remove_dir_all(&dir);
 }
-/// Count persisted `SubagentFinished{status:"cancelled"}` for `id` on a
-/// session cmd channel, asserting field consistency.
+/// Count `SubagentFinished{status:"cancelled"}` hand-offs for `id` on a
+/// session cmd channel, asserting field consistency and that the parent
+/// actor was asked to publish the live copy too.
 fn drain_cancelled_finish_cmds(
     cmd_rx: &mut mpsc::UnboundedReceiver<SessionCommand>,
     id: &str,
 ) -> usize {
     let mut count = 0;
     while let Ok(cmd) = cmd_rx.try_recv() {
-        if let SessionCommand::XaiSessionNotification { notification } = cmd
+        if let SessionCommand::XaiSessionNotification { notification, broadcast } = cmd
             && let SessionUpdate::SubagentFinished { subagent_id, status, error, .. } = &notification
                 .update && subagent_id == id
         {
             assert_eq!(status, "cancelled");
             assert_eq!(error.as_deref(), Some("interrupted by process restart"));
+            assert!(broadcast, "the actor owns the live copy of a lifecycle event");
+            assert!(
+                notification.meta.is_none(),
+                "the id is minted by the actor, inside its ordered section",
+            );
             count += 1;
         }
     }
@@ -1435,9 +1441,11 @@ async fn reconcile_orphan_flips_running_meta_to_cancelled() {
     assert_eq!(reread.tool_calls, Some(0));
     assert_eq!(reread.turns, Some(0));
     assert_eq!(drain_cancelled_finish_cmds(&mut cmd_rx, id), 1);
+    // Single owner: with a parent actor present the reaper must NOT also
+    // broadcast, or the durable and live copies would be ordered separately.
     assert_eq!(
             drain_cancelled_finish_broadcasts(&mut gateway_rx, id),
-            1
+            0
         );
 }
 #[tokio::test]
@@ -1497,7 +1505,7 @@ async fn reconcile_reemits_shared_actor_terminal_outcome() {
         .await;
     let finish = std::iter::from_fn(|| cmd_rx.try_recv().ok())
         .find_map(|command| {
-            let SessionCommand::XaiSessionNotification { notification } = command else {
+            let SessionCommand::XaiSessionNotification { notification, .. } = command else {
                 return None;
             };
             let SessionUpdate::SubagentFinished { status, tool_calls, .. } = notification
@@ -2875,7 +2883,7 @@ async fn progress_publisher_delivers_ticks_to_parent_cmd_channel() {
                 .expect("a tick must arrive within the publish interval")
                 .expect("channel open");
             cancel.cancel();
-            let SessionCommand::XaiSessionNotification { notification } = cmd else {
+            let SessionCommand::XaiSessionNotification { notification, .. } = cmd else {
                 panic!("expected XaiSessionNotification");
             };
             let SessionUpdate::SubagentProgress {

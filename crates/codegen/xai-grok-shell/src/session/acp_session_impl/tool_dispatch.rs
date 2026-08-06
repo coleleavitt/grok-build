@@ -189,14 +189,16 @@ impl SessionActor {
             let update = acp::SessionUpdate::UserMessageChunk(
                 acp::ContentChunk::new(block.clone()).meta(user_chunk_meta.clone()),
             );
-            let notification_meta = self.build_notification_meta();
-            let _ = self
-                .notifications
-                .persistence_tx
-                .send(PersistenceMsg::Update(SessionUpdate::Acp(Box::new(
-                    acp::SessionNotification::new(self.session_info.id.clone(), update)
-                        .meta(notification_meta.as_object().cloned()),
-                ))));
+            crate::util::event_id::with_event_order(|| {
+                let notification_meta = self.build_notification_meta();
+                let _ = self
+                    .notifications
+                    .persistence_tx
+                    .send(PersistenceMsg::Update(SessionUpdate::Acp(Box::new(
+                        acp::SessionNotification::new(self.session_info.id.clone(), update)
+                            .meta(notification_meta.as_object().cloned()),
+                    ))));
+            });
         }
 
         // Persist the user message for session history

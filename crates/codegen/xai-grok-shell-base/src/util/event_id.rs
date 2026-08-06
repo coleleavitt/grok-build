@@ -10,6 +10,45 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Shared across all sessions to ensure monotonically increasing IDs.
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Serializes "mint an id" with "publish the copies that carry it".
+///
+/// Process-global, like [`EVENT_COUNTER`]: a session's durable log and its
+/// live stream are both fed by unbounded MPSC channels, so the order two
+/// producers *reach* those channels is the order they land — and that has to
+/// agree with the id order, not merely be close to it.
+static EVENT_ORDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Mint-and-publish an event as one indivisible step.
+///
+/// `updates.jsonl` order is decided by the order producers reach the
+/// persistence channel. Stamping and enqueuing as separate steps lets a
+/// producer that minted `N` lose the race to a concurrent producer that minted
+/// `N+1`, writing `N+1` ahead of `N` on disk. Running the stamp and every
+/// enqueue it feeds (persistence and gateway) under this lock keeps file order,
+/// broadcast order, and `eventId` order identical for producers that route
+/// through it — see [`ensure_event_id_meta`] for the list.
+///
+/// It does NOT make that a global invariant, and must not be relied on as one.
+/// The buffered streaming path deliberately opts out: `send_update_full` mints
+/// at ENQUEUE, because the id order has to match *delivery* order for the
+/// client's in-order dedup, while the append happens later — after
+/// `ReplayBuffer` merge/debounce. A concurrent producer therefore lands a
+/// higher id earlier in the file as a matter of course, not as a race.
+/// `prepare_replay_lines` is what closes the loop: it selects the replay tail
+/// by `eventId` counter rather than by file position, so an interleaved append
+/// can never strand an event ahead of a client's cursor. This lock narrows the
+/// window; the counter ordering is the correctness boundary.
+///
+/// `publish` runs with the lock held, so it must only enqueue — it is `FnOnce`
+/// and synchronous by construction (no `.await` can appear inside), and it
+/// must not itself call [`with_event_order`]: the lock is not reentrant.
+pub fn with_event_order<T>(publish: impl FnOnce() -> T) -> T {
+    // A panic inside `publish` leaves nothing to corrupt — the guarded state
+    // is `()`, the counter is atomic — so poison is recovered, not propagated.
+    let _order = EVENT_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    publish()
+}
+
 /// Generates a unique event ID for correlation across agent/relay/client.
 ///
 /// Format: `{session_id}-{counter}` where counter is a monotonically increasing
@@ -38,15 +77,25 @@ pub fn generate_event_id(session_id: &str) -> String {
 /// full replay on every reconnect.
 ///
 /// Stamping chokepoints (stamp BEFORE the persist/broadcast fork, so both
-/// copies share one id): `SessionActor::emit_notification_direct` (all actor
-/// ACP notifications, incl. the buffered pipeline), `send_xai_notification` /
-/// `persist_xai_update_only` / `handle_xai_session_notification` (actor xAI),
-/// `notification_bridge::stamp_event_id` (bridge), `emit_subagent_notification`
-/// (subagent), `GoalNotifySender::send_update` (goal mode), plus the inline
+/// copies share one id, and stamp INSIDE [`with_event_order`] so the id order
+/// is also the on-disk order): `SessionActor::emit_notification_direct` (all
+/// actor ACP notifications, incl. the buffered pipeline),
+/// `send_xai_notification` / `persist_xai_update_only` /
+/// `handle_xai_session_notification` (actor xAI — the last one is also the
+/// sole owner of subagent-lifecycle persist+broadcast, which `subagent::
+/// emit_subagent_notification` hands to it), `notification_bridge::
+/// stamp_event_id` (bridge), `GoalNotifySender::dispatch_update` (goal mode),
+/// `workflow::notify::WorkflowNotifier::dispatch`, plus the inline
 /// `build_notification_meta` user-echo persists. An emitter outside these is
 /// not a correctness bug — `prepare_replay_lines` refuses cursors over id-less
 /// tails (full replay, safe) — but it silently disables incremental reconnect
 /// for affected sessions.
+///
+/// The converse is a real bug: stamping a notification that is NOT persisted
+/// hands the client a cursor id that no line on disk carries, so every
+/// reconnect falls back to a full replay. Transient emitters (`SubagentProgress`
+/// ticks, `emit_goal_updated_ephemeral`, non-persisting workflow broadcasts)
+/// must therefore stay unstamped.
 pub fn ensure_event_id_meta(
     session_id: &str,
     meta: &mut Option<serde_json::Map<String, serde_json::Value>>,
@@ -86,6 +135,53 @@ pub fn ensure_event_counter_at_least(next: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant `with_event_order` exists to hold: across concurrent
+    /// producers, the order events reach a shared queue is their `eventId`
+    /// order. Without the lock, a thread can mint `N` and be preempted before
+    /// enqueuing, letting a thread that minted `N+1` enqueue first — which
+    /// writes `N+1` ahead of `N` and makes a position-resolved reconnect
+    /// cursor skip the newer event permanently.
+    #[test]
+    fn with_event_order_keeps_queue_order_equal_to_id_order() {
+        use std::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel::<u64>();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..250 {
+                        with_event_order(|| {
+                            let mut meta = None;
+                            ensure_event_id_meta("sess-order", &mut meta);
+                            let seq: u64 = meta.unwrap()["eventId"]
+                                .as_str()
+                                .unwrap()
+                                .rsplit('-')
+                                .next()
+                                .unwrap()
+                                .parse()
+                                .unwrap();
+                            // Stand-in for the persistence/gateway enqueues.
+                            tx.send(seq).unwrap();
+                        });
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        let received: Vec<u64> = rx.iter().collect();
+        assert_eq!(received.len(), 8 * 250);
+        assert!(
+            received.windows(2).all(|w| w[0] < w[1]),
+            "queue order diverged from eventId order",
+        );
+    }
 
     #[test]
     fn test_generate_event_id_format() {

@@ -96,9 +96,85 @@ pub(super) fn drop_unexpected_replay(
 /// Advance the reconnect cursor to an APPLIED update's eventId. Called from
 /// every applied arm (Plan, bg-stdout, tracker) — dropped updates (dedup,
 /// promptId gate, unexpected replay) deliberately don't move it.
+///
+/// Exception: a subagent lifecycle event dropped by the semantic state machine
+/// DOES advance it. Such an event is settled, not deferred — re-delivering it
+/// would be dropped identically — so withholding the acknowledgement would
+/// only pin the cursor and force every later reconnect to re-send the tail.
 pub(super) fn advance_reconnect_cursor(agent: &mut AgentView, meta: &mut NotificationMeta) {
     if let Some(id) = meta.event_id.take() {
         agent.last_seen_event_id = Some(id);
+    }
+}
+
+fn is_subagent_lifecycle_update(update: &XaiSessionUpdate) -> bool {
+    matches!(
+        update,
+        XaiSessionUpdate::SubagentSpawned { .. }
+            | XaiSessionUpdate::SubagentProgress { .. }
+            | XaiSessionUpdate::SubagentFinished { .. }
+    )
+}
+
+/// Subagent lifecycle events come from child tasks while goal snapshots come
+/// from the parent actor, so their globally stamped event ids are not a FIFO
+/// delivery order. Deduplicate lifecycle transitions by child state instead:
+/// spawn is one-shot, terminal is absorbing, and progress is running-only.
+fn drop_duplicate_or_invalid_subagent_lifecycle(
+    agent: &AgentView,
+    update: &XaiSessionUpdate,
+) -> bool {
+    let (subagent_id, child_session_id, transition) = match update {
+        XaiSessionUpdate::SubagentSpawned {
+            subagent_id,
+            child_session_id,
+            ..
+        } => (subagent_id, child_session_id, "spawn"),
+        XaiSessionUpdate::SubagentProgress {
+            subagent_id,
+            child_session_id,
+            ..
+        } => (subagent_id, child_session_id, "progress"),
+        XaiSessionUpdate::SubagentFinished {
+            subagent_id,
+            child_session_id,
+            ..
+        } => (subagent_id, child_session_id, "finish"),
+        _ => return false,
+    };
+
+    if let Some(info) = agent.subagent_sessions.get(child_session_id)
+        && info.subagent_id.as_ref() != subagent_id.as_str()
+    {
+        tracing::warn!(
+            child_session_id,
+            subagent_id,
+            tracked_subagent_id = info.subagent_id.as_ref(),
+            transition,
+            "Dropping subagent lifecycle update with conflicting identity"
+        );
+        return true;
+    }
+
+    match update {
+        XaiSessionUpdate::SubagentSpawned { .. } => {
+            agent.terminal_subagent_sessions.contains(child_session_id)
+                || agent.subagent_sessions.contains_key(child_session_id)
+        }
+        XaiSessionUpdate::SubagentProgress { .. } => agent
+            .subagent_sessions
+            .get(child_session_id)
+            .is_none_or(|info| {
+                info.finished || agent.terminal_subagent_sessions.contains(child_session_id)
+            }),
+        XaiSessionUpdate::SubagentFinished { .. } => {
+            agent.terminal_subagent_sessions.contains(child_session_id)
+                || agent
+                    .subagent_sessions
+                    .get(child_session_id)
+                    .is_some_and(|info| info.finished)
+        }
+        _ => false,
     }
 }
 /// Handle `x.ai/session_notification` and replay-path `x.ai/session/update`.
@@ -154,7 +230,8 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         );
         return changed && is_active;
     }
-    let meta = NotificationMeta::from_json(session_notif.meta.as_ref().and_then(|v| v.as_object()));
+    let mut meta =
+        NotificationMeta::from_json(session_notif.meta.as_ref().and_then(|v| v.as_object()));
     if drop_unexpected_replay(
         agent,
         &meta,
@@ -164,10 +241,24 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         return false;
     }
     let is_workflow_update = matches!(
-        session_notif.update,
+        &session_notif.update,
         XaiSessionUpdate::WorkflowUpdated { .. }
     );
+    let is_subagent_lifecycle = is_subagent_lifecycle_update(&session_notif.update);
+    if is_subagent_lifecycle
+        && !meta.is_replay
+        && drop_duplicate_or_invalid_subagent_lifecycle(agent, &session_notif.update)
+    {
+        // Acknowledge it anyway. The event was delivered and deliberately
+        // absorbed by the state machine above, so it is settled — but the
+        // cursor only ever moves on the applied path below, so leaving it
+        // pinned would make every later reconnect re-deliver this same tail
+        // until some unrelated accepted event finally advances it.
+        advance_reconnect_cursor(agent, &mut meta);
+        return false;
+    }
     if !is_workflow_update
+        && !is_subagent_lifecycle
         && !meta.is_replay
         && meta.event_seq.is_some_and(|seq| {
             agent
@@ -309,6 +400,12 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 subagent_type = %subagent_type,
                 "Subagent spawned"
             );
+            if meta.is_replay {
+                // A full replay is the authoritative branch. Clear any
+                // terminal tombstone retained from the pre-reload live map;
+                // a later replayed finish will restore it when present.
+                agent.terminal_subagent_sessions.remove(&child_session_id);
+            }
             let is_background = agent
                 .session
                 .tracker
@@ -559,6 +656,9 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 duration_ms = duration_ms,
                 "Subagent finished"
             );
+            agent
+                .terminal_subagent_sessions
+                .insert(child_session_id.clone());
             let elapsed_dur = std::time::Duration::from_millis(duration_ms);
             let info_ref = agent.subagent_sessions.get(&child_session_id);
             let entry_id = info_ref.and_then(|s| s.scrollback_entry_id);
@@ -1060,12 +1160,11 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         if let Some(seq) = meta.event_seq
             && !meta.is_replay
             && !is_workflow_update
+            && !is_subagent_lifecycle
         {
             agent.last_applied_xai_event_seq = Some(seq);
         }
-        if let Some(id) = meta.event_id {
-            agent.last_seen_event_id = Some(id);
-        }
+        advance_reconnect_cursor(agent, &mut meta);
     }
     if let Some(outcome) = terminal_outcome {
         return super::super::turn_completion::apply_terminal_outcome(

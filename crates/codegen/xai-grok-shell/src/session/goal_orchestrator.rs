@@ -83,6 +83,16 @@ impl GoalNotifySender {
             .send(PersistenceMsg::GoalModeState(tracker.snapshot().cloned()));
     }
 
+    /// Make the current accounting durable WITHOUT emitting the derived wire
+    /// snapshot. Used when a lifecycle event has to be persisted between the
+    /// accounting and its `GoalUpdated`, so the durable goal state leads the
+    /// durable lifecycle line — see
+    /// `SessionActor::checkpoint_finished_subagent_tokens`.
+    pub(crate) fn checkpoint_goal_state(&self, tracker: &mut GoalTracker) {
+        tracker.account_elapsed();
+        self.persist_goal_state(tracker);
+    }
+
     /// Persist + fire-and-forget a notification to the gateway. Used for
     /// snapshot-derived payloads and for the "planning…" / "Verifying…"
     /// latch updates that must not run the `send_xai_notification`
@@ -92,33 +102,56 @@ impl GoalNotifySender {
     }
 
     /// Stamp, optionally persist, and fire-and-forget a notification.
+    ///
     /// `persist == false` ships the update to the gateway only (no JSONL
     /// append) for recurring/transient ticks — see
-    /// [`Self::emit_goal_updated_ephemeral`].
+    /// [`Self::emit_goal_updated_ephemeral`] — and therefore leaves the
+    /// notification UNSTAMPED: an `eventId` the client adopts as its reconnect
+    /// cursor must exist on disk, or `prepare_replay_lines` can never resolve
+    /// it and every reconnect degrades to a full replay. Ephemeral ticks are
+    /// idempotent snapshots, so losing relay dedup on them costs nothing.
     fn dispatch_update(&self, update: XaiSessionUpdate, persist: bool) {
-        // Stamped before the persist/broadcast fork — see `ensure_event_id_meta`.
-        let mut meta = None;
-        crate::util::event_id::ensure_event_id_meta(&self.session_id.0, &mut meta);
-        let notification = XaiSessionNotification {
-            session_id: self.session_id.clone(),
-            update,
-            meta: meta.map(serde_json::Value::Object),
-        };
-        let raw = serde_json::to_value(&notification)
-            .and_then(|v| serde_json::value::to_raw_value(&v))
-            .ok();
-        if persist {
+        if !persist {
+            let notification = XaiSessionNotification {
+                session_id: self.session_id.clone(),
+                update,
+                meta: None,
+            };
+            if let Ok(raw) = serde_json::to_value(&notification)
+                .and_then(|v| serde_json::value::to_raw_value(&v))
+            {
+                self.gateway
+                    .forward_fire_and_forget(agent_client_protocol::ExtNotification::new(
+                        "x.ai/session_notification",
+                        raw.into(),
+                    ));
+            }
+            return;
+        }
+        // Stamp and both enqueues in one ordered section — see
+        // `with_event_order` for why the id order must be the on-disk order.
+        crate::util::event_id::with_event_order(|| {
+            let mut meta = None;
+            crate::util::event_id::ensure_event_id_meta(&self.session_id.0, &mut meta);
+            let notification = XaiSessionNotification {
+                session_id: self.session_id.clone(),
+                update,
+                meta: meta.map(serde_json::Value::Object),
+            };
+            let raw = serde_json::to_value(&notification)
+                .and_then(|v| serde_json::value::to_raw_value(&v))
+                .ok();
             let _ = self.persistence_tx.send(PersistenceMsg::Update(
                 crate::session::storage::SessionUpdate::Xai(Box::new(notification)),
             ));
-        }
-        if let Some(raw) = raw {
-            let ext = agent_client_protocol::ExtNotification::new(
-                "x.ai/session_notification",
-                raw.into(),
-            );
-            self.gateway.forward_fire_and_forget(ext);
-        }
+            if let Some(raw) = raw {
+                self.gateway
+                    .forward_fire_and_forget(agent_client_protocol::ExtNotification::new(
+                        "x.ai/session_notification",
+                        raw.into(),
+                    ));
+            }
+        });
     }
 }
 

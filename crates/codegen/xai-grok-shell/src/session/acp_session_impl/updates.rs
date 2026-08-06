@@ -116,18 +116,28 @@ impl SessionActor {
         let (stream_start_ms, turn_start_ms) = meta_info
             .map(|m| (m.stream_start_ms, m.turn_start_ms))
             .unwrap_or((None, None));
-        let event_id = self.generate_event_id();
+        // `AvailableCommandsUpdate` is the one update on this path that is
+        // never appended (see `emit_notification_direct`), so it must not be
+        // stamped either: the client adopts every `eventId` it receives as its
+        // reconnect cursor, and an id absent from `updates.jsonl` can never be
+        // resolved by `prepare_replay_lines` — each stamped ACU silently
+        // downgrades every later reconnect to a full replay. ACUs fire on
+        // every skill / MCP / plugin / model change and right after each
+        // `session/load`, so that downgrade is effectively permanent.
+        let persisted = !matches!(update, acp::SessionUpdate::AvailableCommandsUpdate(_));
         let agent_timestamp_ms =
             agent_timestamp_ms_override.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
         let (update_type, update_params) = Self::extract_update_info(&update);
         let mut meta = json!({
             "totalTokens": total_tokens,
-            "eventId": event_id,
             "agentTimestampMs": agent_timestamp_ms,
         });
         let obj = meta
             .as_object_mut()
             .expect("json! literal is always an Object");
+        if persisted {
+            obj.insert("eventId".to_string(), self.generate_event_id().into());
+        }
         if let Some(pid) = self.current_prompt_id.lock().ok().and_then(|g| g.clone()) {
             obj.insert("promptId".to_string(), pid.into());
         }
@@ -274,35 +284,52 @@ impl SessionActor {
             "Sending session update"
         );
     }
+    /// The actor's ACP persist/broadcast fork: mint the `eventId`, append, and
+    /// publish inside one ordered section so the durable order, the live
+    /// order, and the id order agree.
+    ///
+    /// `AvailableCommandsUpdate` is the one carve-out — the catalog is
+    /// re-advertised in full after every `session/load`, so historical copies
+    /// are redundant on replay and dominate large transcripts. Being
+    /// broadcast-only, it must also stay UNSTAMPED: the client adopts every
+    /// `eventId` it receives as its reconnect cursor, and an id no line on
+    /// disk carries can never be resolved by `prepare_replay_lines`, so each
+    /// stamped ACU silently downgrades every later reconnect to a full replay.
+    /// ACUs fire on every skill / MCP / plugin / model change, so that is a
+    /// near-permanent downgrade. Losing relay dedup on them is harmless: the
+    /// catalog is idempotent (a duplicate just re-replaces it).
     pub(crate) async fn emit_notification_direct(
         &self,
         mut notification: acp::SessionNotification,
     ) {
-        crate::util::event_id::ensure_event_id_meta(
-            &self.session_info.id.0,
-            &mut notification.meta,
-        );
-        self.log_outbound_notification(&notification);
-        if !matches!(
+        let persist = !matches!(
             notification.update,
             acp::SessionUpdate::AvailableCommandsUpdate(_)
-        ) {
-            let _ = self
+        );
+        crate::util::event_id::with_event_order(|| {
+            if persist {
+                crate::util::event_id::ensure_event_id_meta(
+                    &self.session_info.id.0,
+                    &mut notification.meta,
+                );
+                let _ = self
+                    .notifications
+                    .persistence_tx
+                    .send(PersistenceMsg::Update(
+                        crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
+                    ));
+            }
+            self.log_outbound_notification(&notification);
+            if self
                 .notifications
-                .persistence_tx
-                .send(PersistenceMsg::Update(
-                    crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
-                ));
-        }
-        if self
-            .notifications
-            .gateway_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            self.notifications
-                .gateway
-                .forward_fire_and_forget(notification);
-        }
+                .gateway_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.notifications
+                    .gateway
+                    .forward_fire_and_forget(notification);
+            }
+        });
     }
     /// Send a notification to the live client **without persisting** it.
     ///
@@ -405,26 +432,70 @@ impl SessionActor {
             "agentTimestampMs": agent_timestamp_ms,
         })
     }
-    /// Handle xAI session notifications - store them in persistence
-    /// These are client-side events (like diff reviews) that should be part of session history.
-    /// Exception: `SubagentProgress` ticks are transient and return before the store.
+    /// Own an xAI extension notification end-to-end: mint its `eventId`,
+    /// append it to `updates.jsonl`, publish it to the client when the actor
+    /// is the emitter, and only then run the side effects it derives.
+    ///
+    /// This is the single serialized owner for subagent lifecycle events
+    /// (`subagent::emit_subagent_notification` hands them here rather than
+    /// broadcasting from the child task) as well as for client-originated
+    /// events arriving over `_x.ai/session/update`. Minting, persisting, and
+    /// broadcasting happen inside one `with_event_order` section, so no other
+    /// producer can interleave a higher id into either channel; the derived
+    /// `GoalUpdated` snapshots below therefore always carry ids ABOVE the
+    /// event that caused them and land after it on disk.
+    ///
+    /// Exception: `SubagentProgress` ticks are transient and never persisted,
+    /// so they stay unstamped (a cursor id absent from disk would force a full
+    /// replay) and their live copy was already sent by the progress publisher.
     pub(super) async fn handle_xai_session_notification(
         &self,
         mut notification: XaiSessionNotification,
+        broadcast: bool,
     ) {
-        if !matches!(
+        let transient = matches!(
             notification.update,
             XaiSessionUpdate::SubagentProgress { .. }
-        ) {
+        );
+        if !transient {
             tracing::debug!("storing xAI session notification");
         }
+        // Seal token accounting BEFORE the terminal event becomes durable —
+        // see `checkpoint_finished_subagent_tokens` for why the order matters.
+        if let XaiSessionUpdate::SubagentFinished {
+            subagent_id,
+            tokens_used,
+            ..
+        } = &notification.update
         {
+            self.checkpoint_finished_subagent_tokens(subagent_id, *tokens_used);
+        }
+        if !transient {
             let mut meta_map = notification.meta.take().and_then(|v| match v {
                 serde_json::Value::Object(m) => Some(m),
                 _ => None,
             });
-            crate::util::event_id::ensure_event_id_meta(&self.session_info.id.0, &mut meta_map);
-            notification.meta = meta_map.map(serde_json::Value::Object);
+            crate::util::event_id::with_event_order(|| {
+                crate::util::event_id::ensure_event_id_meta(&self.session_info.id.0, &mut meta_map);
+                notification.meta = meta_map.map(serde_json::Value::Object);
+                let _ = self
+                    .notifications
+                    .persistence_tx
+                    .send(PersistenceMsg::Update(
+                        crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
+                    ));
+                if broadcast
+                    && let Ok(params) = serde_json::to_value(&notification)
+                        .and_then(|v| serde_json::value::to_raw_value(&v))
+                {
+                    self.notifications
+                        .gateway
+                        .forward_fire_and_forget(acp::ExtNotification::new(
+                            "x.ai/session_notification",
+                            params.into(),
+                        ));
+                }
+            });
         }
         match &notification.update {
             XaiSessionUpdate::SubagentSpawned {
@@ -509,19 +580,9 @@ impl SessionActor {
                     .await;
                 }
             }
-            XaiSessionUpdate::SubagentFinished {
-                subagent_id,
-                tokens_used,
-                ..
-            } => {
-                {
-                    let mut records = self.subagent_token_records.lock();
-                    if let Some(rec) = records.get_mut(subagent_id) {
-                        rec.last_cumulative_reported =
-                            rec.last_cumulative_reported.max(*tokens_used);
-                        rec.finished = true;
-                    }
-                }
+            XaiSessionUpdate::SubagentFinished { .. } => {
+                // The record was already sealed and the resulting high-water
+                // checkpointed before this event was persisted.
                 {
                     let mut tracker = self.goal_tracker.lock();
                     if let Some(o) = tracker.snapshot_mut() {
@@ -608,34 +669,28 @@ impl SessionActor {
                         );
                     }
                 }
-                return;
             }
             _ => {}
         }
-        let _ = self
-            .notifications
-            .persistence_tx
-            .send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Xai(Box::new(notification)),
-            ));
     }
     /// Persist an xAI extension notification to `updates.jsonl` **without** sending it
     /// to the gateway/UI. Used for internal bookkeeping updates like `CompactionCheckpoint`
     /// and `RewindMarker` that are only relevant during replay.
     pub(super) fn persist_xai_update_only(&self, update: XaiSessionUpdate) {
-        let notification = XaiSessionNotification {
-            session_id: self.session_info.id.clone(),
-            update,
-            meta: Some(self.build_notification_meta()),
-        };
-        if self
-            .notifications
-            .persistence_tx
-            .send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Xai(Box::new(notification)),
-            ))
-            .is_err()
-        {
+        let sent = crate::util::event_id::with_event_order(|| {
+            let notification = XaiSessionNotification {
+                session_id: self.session_info.id.clone(),
+                update,
+                meta: Some(self.build_notification_meta()),
+            };
+            self.notifications
+                .persistence_tx
+                .send(PersistenceMsg::Update(
+                    crate::session::storage::SessionUpdate::Xai(Box::new(notification)),
+                ))
+                .is_ok()
+        });
+        if !sent {
             tracing::warn!("Failed to send xAI update to persistence channel");
         }
     }
@@ -717,34 +772,37 @@ impl SessionActor {
         extra_meta: Option<serde_json::Map<String, serde_json::Value>>,
     ) {
         self.close_rewind_window().await;
-        let meta = {
-            let mut meta = self.build_notification_meta();
-            if let (Some(obj), Some(extra)) = (meta.as_object_mut(), extra_meta) {
-                obj.extend(extra);
+        let notification = crate::util::event_id::with_event_order(|| {
+            let meta = {
+                let mut meta = self.build_notification_meta();
+                if let (Some(obj), Some(extra)) = (meta.as_object_mut(), extra_meta) {
+                    obj.extend(extra);
+                }
+                meta
+            };
+            let notification = XaiSessionNotification {
+                session_id: self.session_info.id.clone(),
+                update,
+                meta: Some(meta),
+            };
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(PersistenceMsg::Update(
+                    crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
+                ));
+            if let Ok(params) = serde_json::to_value(&notification)
+                .and_then(|v| serde_json::value::to_raw_value(&v))
+            {
+                self.notifications
+                    .gateway
+                    .forward_fire_and_forget(acp::ExtNotification::new(
+                        "x.ai/session_notification",
+                        params.into(),
+                    ));
             }
-            meta
-        };
-        let notification = XaiSessionNotification {
-            session_id: self.session_info.id.clone(),
-            update,
-            meta: Some(meta),
-        };
-        let _ = self
-            .notifications
-            .persistence_tx
-            .send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
-            ));
-        let params = serde_json::to_value(&notification)
-            .and_then(|v| serde_json::value::to_raw_value(&v))
-            .ok();
-        if let Some(params) = params {
-            let ext_notification =
-                acp::ExtNotification::new("x.ai/session_notification", params.into());
-            self.notifications
-                .gateway
-                .forward_fire_and_forget(ext_notification);
-        }
+            notification
+        });
         if let Some((notification_type, message, title, level)) =
             notification_hook_for_update(&notification.update)
         {
@@ -755,7 +813,7 @@ impl SessionActor {
 }
 #[cfg(test)]
 mod xai_event_id_stamping_tests {
-    use super::support::create_test_actor;
+    use super::support::{create_test_actor, set_goal_harness_for_tests};
     use super::*;
     fn persisted_xai_event_id(
         prx: &mut tokio::sync::mpsc::UnboundedReceiver<PersistenceMsg>,
@@ -798,13 +856,16 @@ mod xai_event_id_stamping_tests {
                 let own_id = persisted_xai_event_id(&mut prx);
                 assert!(own_id.starts_with("test-actor-"));
                 actor
-                    .handle_xai_session_notification(XaiSessionNotification {
-                        session_id: acp::SessionId::new("test-actor"),
-                        update: XaiSessionUpdate::HookAnnotation {
-                            message: "inbound".into(),
+                    .handle_xai_session_notification(
+                        XaiSessionNotification {
+                            session_id: acp::SessionId::new("test-actor"),
+                            update: XaiSessionUpdate::HookAnnotation {
+                                message: "inbound".into(),
+                            },
+                            meta: None,
                         },
-                        meta: None,
-                    })
+                        false,
+                    )
                     .await;
                 let inbound_id = persisted_xai_event_id(&mut prx);
                 assert!(inbound_id.starts_with("test-actor-"));
@@ -818,6 +879,294 @@ mod xai_event_id_stamping_tests {
             })
             .await;
     }
+
+    /// The actor is the sole publisher of subagent lifecycle events, so the
+    /// durable line and the live copy must be one mint: divergent ids let a
+    /// client acknowledge a cursor absent from `updates.jsonl` (full replay
+    /// forever), and an unstamped live copy never advances the cursor at all.
+    #[tokio::test]
+    async fn subagent_lifecycle_broadcast_shares_the_persisted_event_id() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, mut gateway_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+                let (persistence_tx, mut persistence_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+                let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+                actor
+                    .handle_xai_session_notification(
+                        spawn_notification("sub-live", "child-live"),
+                        true,
+                    )
+                    .await;
+
+                let persisted_id = persisted_xai_event_id(&mut persistence_rx);
+                let broadcast_id = loop {
+                    match gateway_rx.try_recv().expect("the actor must broadcast") {
+                        xai_acp_lib::AcpClientMessage::ExtNotification(args) => {
+                            let params: serde_json::Value =
+                                serde_json::from_str(args.request.params.get()).unwrap();
+                            break params["_meta"]["eventId"].as_str().unwrap().to_string();
+                        }
+                        _ => continue,
+                    }
+                };
+                assert_eq!(persisted_id, broadcast_id);
+            })
+            .await;
+    }
+
+    /// A client-originated event (`_x.ai/session/update`) is stored, never
+    /// echoed: the client already has it, and a second copy would duplicate.
+    #[tokio::test]
+    async fn client_originated_notification_is_stored_without_echo() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, mut gateway_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+                let (persistence_tx, mut persistence_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+                let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+                actor
+                    .handle_xai_session_notification(
+                        XaiSessionNotification {
+                            session_id: acp::SessionId::new("test-actor"),
+                            update: XaiSessionUpdate::HookAnnotation {
+                                message: "from the client".into(),
+                            },
+                            meta: None,
+                        },
+                        false,
+                    )
+                    .await;
+
+                assert!(!persisted_xai_event_id(&mut persistence_rx).is_empty());
+                assert!(
+                    gateway_rx.try_recv().is_err(),
+                    "must not echo to the client"
+                );
+            })
+            .await;
+    }
+
+    /// Ordering contract around a terminal subagent event, in the exact order
+    /// the persistence channel must see it:
+    ///
+    /// 1. `GoalModeState` — the sealed token high-water, DURABLE FIRST so a
+    ///    crash can't strand a finished child whose delta was never accounted
+    ///    (on restart the finish un-lists it from reconciliation and the
+    ///    record map starts empty, so the delta would be unrecoverable);
+    /// 2. the `SubagentFinished` line;
+    /// 3. the `GoalUpdated` snapshot derived from it.
+    ///
+    /// Persisted `eventId`s must rise across 2 → 3, because the reconnect
+    /// cursor is resolved by file position: a lower id written later is a hole
+    /// a client can never be sent again.
+    #[tokio::test]
+    async fn subagent_finish_orders_accounting_then_lifecycle_then_goal() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+                let (persistence_tx, mut persistence_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+                let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                set_goal_harness_for_tests(&actor);
+                actor.goal_tracker.lock().create_goal(
+                    "goal-order".into(),
+                    "verify ordering".into(),
+                    None,
+                    0,
+                    chrono::Utc::now().to_rfc3339(),
+                    None,
+                );
+                actor
+                    .handle_xai_session_notification(
+                        spawn_notification("sub-order", "child-order"),
+                        true,
+                    )
+                    .await;
+                while persistence_rx.try_recv().is_ok() {}
+
+                actor
+                    .handle_xai_session_notification(
+                        finish_notification("sub-order", "child-order", 100),
+                        true,
+                    )
+                    .await;
+
+                let mut kinds = Vec::new();
+                let mut event_seqs = Vec::new();
+                while let Ok(message) = persistence_rx.try_recv() {
+                    match message {
+                        PersistenceMsg::GoalModeState(_) => kinds.push("accounting"),
+                        PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(
+                            notification,
+                        )) => {
+                            event_seqs.push(
+                                notification
+                                    .meta
+                                    .as_ref()
+                                    .and_then(|m| m.get("eventId"))
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|id| id.rsplit('-').next())
+                                    .and_then(|c| c.parse::<u64>().ok())
+                                    .expect("persisted xAI lines must carry an eventId"),
+                            );
+                            kinds.push(match notification.update {
+                                XaiSessionUpdate::SubagentFinished { .. } => "finished",
+                                XaiSessionUpdate::GoalUpdated { .. } => "goal",
+                                _ => "other",
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                let tokens_high_water = actor
+                    .goal_tracker
+                    .lock()
+                    .snapshot()
+                    .map(|o| o.tokens_used_high_water);
+                actor.goal_tracker.lock().clear();
+
+                let first_finish = kinds
+                    .iter()
+                    .position(|k| *k == "finished")
+                    .expect("the terminal event must be persisted");
+                assert!(
+                    kinds[..first_finish].contains(&"accounting"),
+                    "durable token accounting must lead the durable finish: {kinds:?}",
+                );
+                assert!(
+                    kinds
+                        .iter()
+                        .position(|k| *k == "goal")
+                        .is_some_and(|goal| goal > first_finish),
+                    "the derived snapshot must follow the event it derives from: {kinds:?}",
+                );
+                assert!(
+                    event_seqs.windows(2).all(|w| w[0] < w[1]),
+                    "persisted eventIds must rise with file order: {event_seqs:?}",
+                );
+                assert_eq!(
+                    tokens_high_water,
+                    Some(100),
+                    "the sealed child's marginal must be in the high-water before the finish",
+                );
+            })
+            .await;
+    }
+
+    /// Regression: the checkpoint has to fire even when the terminal event
+    /// arrives with an id already stamped upstream, and it must not double
+    /// count a `tokens_used` below the child's last reported high-water.
+    #[tokio::test]
+    async fn finished_subagent_token_checkpoint_ratchets_without_double_counting() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+                let (persistence_tx, _prx) =
+                    tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+                let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                set_goal_harness_for_tests(&actor);
+                actor.goal_tracker.lock().create_goal(
+                    "goal-ratchet".into(),
+                    "verify ratchet".into(),
+                    None,
+                    0,
+                    chrono::Utc::now().to_rfc3339(),
+                    None,
+                );
+                actor
+                    .handle_xai_session_notification(
+                        spawn_notification("sub-ratchet", "child-ratchet"),
+                        true,
+                    )
+                    .await;
+                actor
+                    .subagent_token_records
+                    .lock()
+                    .get_mut("sub-ratchet")
+                    .expect("spawn registers the record")
+                    .last_cumulative_reported = 900;
+
+                // A stale terminal report below the ratchet must not lower it.
+                actor.checkpoint_finished_subagent_tokens("sub-ratchet", 400);
+                assert_eq!(
+                    actor
+                        .goal_tracker
+                        .lock()
+                        .snapshot()
+                        .map(|o| o.tokens_used_high_water),
+                    Some(900),
+                );
+
+                // A re-delivered terminal event with a higher report still raises it.
+                actor.checkpoint_finished_subagent_tokens("sub-ratchet", 1_500);
+                let high_water = actor
+                    .goal_tracker
+                    .lock()
+                    .snapshot()
+                    .map(|o| o.tokens_used_high_water);
+                actor.goal_tracker.lock().clear();
+                assert_eq!(high_water, Some(1_500));
+            })
+            .await;
+    }
+
+    fn spawn_notification(subagent_id: &str, child_session_id: &str) -> XaiSessionNotification {
+        XaiSessionNotification {
+            session_id: acp::SessionId::new("test-actor"),
+            update: XaiSessionUpdate::SubagentSpawned {
+                subagent_id: subagent_id.into(),
+                child_session_id: child_session_id.into(),
+                parent_session_id: "test-actor".into(),
+                parent_prompt_id: None,
+                subagent_type: "general-purpose".into(),
+                description: "task".into(),
+                effective_context_source: None,
+                context_normalized: false,
+                capability_mode: None,
+                persona: None,
+                role: None,
+                model: None,
+                resumed_from: None,
+                workflow_run_id: None,
+            },
+            meta: None,
+        }
+    }
+
+    fn finish_notification(
+        subagent_id: &str,
+        child_session_id: &str,
+        tokens_used: u64,
+    ) -> XaiSessionNotification {
+        XaiSessionNotification {
+            session_id: acp::SessionId::new("test-actor"),
+            update: XaiSessionUpdate::SubagentFinished {
+                subagent_id: subagent_id.into(),
+                child_session_id: child_session_id.into(),
+                status: "completed".into(),
+                error: None,
+                tool_calls: 1,
+                turns: 1,
+                duration_ms: 10,
+                tokens_used,
+                output: None,
+                will_wake: false,
+            },
+            meta: None,
+        }
+    }
+
     /// `emit_notification_direct` is the actor's ACP persist/broadcast fork:
     /// it must stamp any direct caller that didn't stamp at enqueue (none
     /// exist today — this is the safety net for the next one), so every
@@ -857,6 +1206,63 @@ mod xai_event_id_stamping_tests {
             })
             .await;
     }
+    /// `AvailableCommandsUpdate` is the one ACP update the chokepoint
+    /// deliberately does NOT persist (the catalog is re-advertised in full
+    /// after every `session/load`, and the historical copies dominate large
+    /// transcripts). Broadcast-only therefore means UNSTAMPED: the client
+    /// adopts `eventId` as its reconnect cursor, and an id no line on disk
+    /// carries can never be resolved by `prepare_replay_lines` — every later
+    /// reconnect silently degrades to a full replay. ACUs fire on every
+    /// skill/MCP/plugin/model change, so a stamped one poisons the cursor
+    /// almost immediately.
+    #[tokio::test]
+    async fn available_commands_update_is_broadcast_unstamped() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, mut gateway_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+                let (persistence_tx, mut prx) =
+                    tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+                let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                actor
+                    .notifications
+                    .gateway_enabled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+
+                actor
+                    .emit_notification_direct(acp::SessionNotification::new(
+                        acp::SessionId::new("test-actor"),
+                        acp::SessionUpdate::AvailableCommandsUpdate(
+                            acp::AvailableCommandsUpdate::new(Vec::new()),
+                        ),
+                    ))
+                    .await;
+
+                assert!(
+                    prx.try_recv().is_err(),
+                    "the ACU carve-out must still skip persistence",
+                );
+                match gateway_rx
+                    .try_recv()
+                    .expect("the ACU must reach the client")
+                {
+                    xai_acp_lib::AcpClientMessage::SessionNotification(args) => {
+                        assert!(
+                            args.request
+                                .meta
+                                .as_ref()
+                                .and_then(|m| m.get("eventId"))
+                                .is_none(),
+                            "an unpersisted ACU must not hand the client a cursor id",
+                        );
+                    }
+                    other => panic!("expected a SessionNotification, got {other:?}"),
+                }
+            })
+            .await;
+    }
+
     /// Mid-stream plan toggle: the plan-mode `CurrentModeUpdate` must ride
     /// the FIFO event pipeline BEHIND already-queued chunks, with its id
     /// minted at ENQUEUE time. A direct emit would mint a higher id yet

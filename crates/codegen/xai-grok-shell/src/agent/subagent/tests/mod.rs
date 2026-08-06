@@ -459,56 +459,74 @@ fn subagent_bypass_permission_mode_gated_by_policy_pin() {
             PermissionMode::Default,
         );
 }
-/// Persisted⇒stamped chokepoint for the subagent emitter: the
-/// `SessionCommand` persist hop and the live broadcast must carry the
-/// SAME `eventId`, minted before the fork (divergent or missing ids
-/// degrade cursor reconnects to full replays or re-applied lines).
+/// Single-owner contract for the subagent emitter: a lifecycle event goes to
+/// the parent actor UNSTAMPED and is NOT broadcast here. The actor mints the
+/// id and publishes both copies inside one ordered section, so the durable and
+/// the live stream can never disagree about order.
 #[tokio::test]
-async fn emit_subagent_notification_stamps_one_event_id_on_both_paths() {
+async fn emit_subagent_notification_hands_lifecycle_to_the_parent_actor() {
     use crate::test_support::lsp_runtime::test_gateway_with_receiver;
     let (gateway, mut gateway_rx) = test_gateway_with_receiver();
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
     emit_subagent_notification(
         &gateway,
         "parent-sess",
-        SessionUpdate::SubagentFinished {
-            subagent_id: "sa-1".into(),
-            child_session_id: "child-1".into(),
-            status: "completed".into(),
-            error: None,
-            tool_calls: 0,
-            turns: 0,
-            duration_ms: 5,
-            tokens_used: 0,
-            output: None,
-            will_wake: false,
-        },
+        test_finish_update(),
         Some(&cmd_tx),
     );
-    let persisted_id = match cmd_rx.try_recv().expect("persist hop must fire") {
-        SessionCommand::XaiSessionNotification { notification } => {
-            notification
-                .meta
-                .as_ref()
-                .and_then(|m| m.get("eventId"))
-                .and_then(|v| v.as_str())
-                .expect("persisted subagent lines must carry an eventId")
-                .to_string()
+    match cmd_rx.try_recv().expect("hand-off must fire") {
+        SessionCommand::XaiSessionNotification {
+            notification,
+            broadcast,
+        } => {
+            assert!(broadcast, "the actor must publish the live copy");
+            assert!(
+                notification.meta.is_none(),
+                "the id is minted by the actor, inside its ordered section",
+            );
         }
         _ => panic!("expected XaiSessionNotification"),
-    };
-    assert!(persisted_id.starts_with("parent-sess-"));
-    let broadcast_id = match gateway_rx.try_recv().expect("broadcast must fire") {
+    }
+    assert!(
+        gateway_rx.try_recv().is_err(),
+        "a second live path would reorder against the durable one",
+    );
+}
+
+/// Without a parent actor nothing will ever persist the event, so the
+/// fallback live copy must stay UNSTAMPED — a cursor id absent from
+/// `updates.jsonl` never resolves and forces a full replay on every reconnect.
+#[tokio::test]
+async fn emit_subagent_notification_without_actor_broadcasts_unstamped() {
+    use crate::test_support::lsp_runtime::test_gateway_with_receiver;
+    let (gateway, mut gateway_rx) = test_gateway_with_receiver();
+    emit_subagent_notification(&gateway, "parent-sess", test_finish_update(), None);
+    match gateway_rx.try_recv().expect("broadcast must fire") {
         xai_acp_lib::AcpClientMessage::ExtNotification(args) => {
-            let params: serde_json::Value = serde_json::from_str(
-                    args.request.params.get(),
-                )
-                .unwrap();
-            params["_meta"]["eventId"].as_str().unwrap().to_string()
+            let params: serde_json::Value =
+                serde_json::from_str(args.request.params.get()).unwrap();
+            assert!(
+                params["_meta"].get("eventId").is_none(),
+                "an unpersisted event must not hand the client a cursor id",
+            );
         }
         _ => panic!("expected ExtNotification"),
-    };
-    assert_eq!(persisted_id, broadcast_id);
+    }
+}
+
+fn test_finish_update() -> SessionUpdate {
+    SessionUpdate::SubagentFinished {
+        subagent_id: "sa-1".into(),
+        child_session_id: "child-1".into(),
+        status: "completed".into(),
+        error: None,
+        tool_calls: 0,
+        turns: 0,
+        duration_ms: 5,
+        tokens_used: 0,
+        output: None,
+        will_wake: false,
+    }
 }
 #[test]
 fn subagent_max_turns_definition_wins_else_inherits_parent() {
@@ -2030,7 +2048,7 @@ async fn cancel_pending_shell_child_presents_one_cancelled_finish() {
         },
         &gateway,
     );
-    let mut persisted = 0;
+    let mut handed_off = 0;
     while let Ok(command) = parent_cmd_rx.try_recv() {
         if matches!(
                 command,
@@ -2038,24 +2056,21 @@ async fn cancel_pending_shell_child_presents_one_cancelled_finish() {
                     notification: SessionNotification {
                         update: SessionUpdate::SubagentFinished { status, .. },
                         ..
-                    }
+                    },
+                    broadcast: true,
                 } if status == "cancelled"
             ) {
-            persisted += 1;
+            handed_off += 1;
         }
     }
-    assert_eq!(persisted, 1);
-    let mut live = 0;
-    while let Ok(message) = gateway_rx.try_recv() {
-        if matches!(
-                message,
-                xai_acp_lib::AcpClientMessage::ExtNotification(args)
-                    if args.request.params.get().contains("\"status\":\"cancelled\"")
-            ) {
-            live += 1;
-        }
-    }
-    assert_eq!(live, 1);
+    assert_eq!(handed_off, 1);
+    // The actor owns the fan-out; emitting live from here too would fork the
+    // event onto two independently ordered paths.
+    let direct_live = gateway_rx.try_recv().is_ok();
+    assert!(
+        !direct_live,
+        "the child task must not broadcast a lifecycle event it handed to the actor",
+    );
 }
 async fn run_promote_cancel_with_worktree(
     worktree: &Path,
@@ -2457,3 +2472,32 @@ fn spawn_test_parent_chat_state(model_slug: &str) -> xai_chat_state::ChatStateHa
     )
 }
 mod rest;
+
+/// End-to-end: a `/goal` role configured with `agent_type: codex` must now
+/// produce a codex-flavored child summary instead of the stock one — this is
+/// the behavior the guard in `goal.rs` used to have to fail open on.
+#[test]
+fn goal_harness_override_reflavors_the_described_child() {
+    let ctx = ctx_with_toggle(HashMap::new());
+    let stock = match describe_subagent_type("general-purpose", None, &ctx) {
+        SubagentDescribeOutcome::Ok(s) => s,
+        other => panic!("stock probe failed: {other:?}"),
+    };
+    let codex = match describe_subagent_type("general-purpose", Some("codex"), &ctx) {
+        SubagentDescribeOutcome::Ok(s) => s,
+        other => panic!("codex probe failed: {other:?}"),
+    };
+    assert_ne!(
+        stock.tool_names, codex.tool_names,
+        "the codex harness override must change the child's tool vocabulary",
+    );
+    assert!(
+        codex.can_read && codex.can_execute,
+        "a general-purpose child must stay capable on the codex harness",
+    );
+    // And the strict-harness fail-open in goal.rs no longer trips for codex.
+    assert!(
+        crate::agent::subagent::subagent_harness_flavor_is_representable("codex"),
+        "codex must be representable so the /goal role stops failing open",
+    );
+}

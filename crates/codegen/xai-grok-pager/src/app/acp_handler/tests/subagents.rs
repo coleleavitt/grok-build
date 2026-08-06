@@ -320,6 +320,156 @@
         );
     }
 
+    /// Regression: goal snapshots are emitted by the parent actor while it
+    /// handles a subagent lifecycle event. The snapshot can therefore carry a
+    /// higher event id and reach the pager before the lifecycle event. A
+    /// terminal event must still settle a row that was visibly Responding.
+    #[test]
+    fn out_of_order_goal_snapshot_does_not_drop_subagent_finish() {
+        fn xai_event(update: XaiSessionUpdate, event_id: &str) -> acp::ExtNotification {
+            let payload = SessionNotification {
+                session_id: acp::SessionId::new("sess-parent"),
+                update,
+                meta: Some(serde_json::json!({ "eventId": event_id })),
+            };
+            acp::ExtNotification::new(
+                "x.ai/session_notification",
+                serde_json::value::to_raw_value(&payload).unwrap().into(),
+            )
+        }
+
+        let mut app = make_app_with_agent("sess-parent");
+        let child_sid = "child-out-of-order-finish";
+        assert!(handle_ext_notification(
+            &xai_event(
+                test_subagent_spawned("sess-parent", child_sid),
+                "sess-parent-10",
+            ),
+            &mut app,
+        ));
+
+        let _ = handle(
+            make_agent_chunk_with_event(child_sid, "child text", "p-child", None),
+            &mut app,
+        );
+        assert_eq!(
+            app.agents[&AgentId(0)].subagent_sessions[child_sid]
+                .activity_label
+                .as_deref(),
+            Some("Responding"),
+        );
+
+        let goal_update: XaiSessionUpdate =
+            serde_json::from_value(goal_update_value("goal-1", "active", 1)).unwrap();
+        assert!(handle_ext_notification(
+            &xai_event(goal_update, "sess-parent-12"),
+            &mut app,
+        ));
+        assert_eq!(
+            app.agents[&AgentId(0)].last_applied_xai_event_seq,
+            Some(12),
+        );
+        assert!(handle_ext_notification(
+            &xai_event(test_subagent_finished(child_sid), "sess-parent-11"),
+            &mut app,
+        ));
+
+        let scrollback_len = {
+            let agent = &app.agents[&AgentId(0)];
+            let info = &agent.subagent_sessions[child_sid];
+            assert!(info.finished, "the lower-id terminal event must still apply");
+            assert!(
+                info.activity_label.is_none(),
+                "a finished row must not remain Responding",
+            );
+            assert!(matches!(
+                agent.subagent_views[child_sid].session.state,
+                AgentState::Idle,
+            ));
+            assert_eq!(
+                crate::views::dashboard::classify_subagent(info),
+                crate::views::dashboard::RowState::Completed,
+            );
+            assert_eq!(
+                agent.last_applied_xai_event_seq,
+                Some(12),
+                "lifecycle events use semantic state, not the generic xAI highwater",
+            );
+            assert_eq!(
+                agent.last_seen_event_id.as_deref(),
+                Some("sess-parent-11"),
+                "the applied terminal event must become the reconnect cursor",
+            );
+            agent.scrollback.len()
+        };
+
+        // Terminal is absorbing: re-delivery and late lifecycle traffic must
+        // neither append blocks nor resurrect Responding.
+        assert!(!handle_ext_notification(
+            &xai_event(test_subagent_finished(child_sid), "sess-parent-13"),
+            &mut app,
+        ));
+        assert!(!handle_ext_notification(
+            &xai_event(
+                test_subagent_progress("sess-parent", child_sid),
+                "sess-parent-14",
+            ),
+            &mut app,
+        ));
+        assert!(!handle_ext_notification(
+            &xai_event(
+                test_subagent_spawned("sess-parent", child_sid),
+                "sess-parent-15",
+            ),
+            &mut app,
+        ));
+        let agent = &app.agents[&AgentId(0)];
+        assert_eq!(agent.scrollback.len(), scrollback_len);
+        assert!(agent.subagent_sessions[child_sid].finished);
+        assert!(agent.subagent_sessions[child_sid].activity_label.is_none());
+        // A semantically absorbed event is settled, not deferred: it must still
+        // be acknowledged, or the cursor stays pinned at the last APPLIED id
+        // and every reconnect re-delivers this whole tail forever.
+        assert_eq!(
+            agent.last_seen_event_id.as_deref(),
+            Some("sess-parent-15"),
+            "dropped lifecycle events must still advance the reconnect cursor",
+        );
+    }
+
+    #[test]
+    fn finish_before_spawn_cannot_resurrect_subagent_row() {
+        fn xai_event(update: XaiSessionUpdate, event_id: &str) -> acp::ExtNotification {
+            let payload = SessionNotification {
+                session_id: acp::SessionId::new("sess-parent"),
+                update,
+                meta: Some(serde_json::json!({ "eventId": event_id })),
+            };
+            acp::ExtNotification::new(
+                "x.ai/session_notification",
+                serde_json::value::to_raw_value(&payload).unwrap().into(),
+            )
+        }
+
+        let mut app = make_app_with_agent("sess-parent");
+        let child_sid = "child-finish-first";
+        assert!(handle_ext_notification(
+            &xai_event(test_subagent_finished(child_sid), "sess-parent-1"),
+            &mut app,
+        ));
+        assert!(!handle_ext_notification(
+            &xai_event(
+                test_subagent_spawned("sess-parent", child_sid),
+                "sess-parent-2",
+            ),
+            &mut app,
+        ));
+        let agent = &app.agents[&AgentId(0)];
+        assert!(agent.terminal_subagent_sessions.contains(child_sid));
+        assert!(!agent.subagent_sessions.contains_key(child_sid));
+        assert!(!agent.subagent_views.contains_key(child_sid));
+    }
+
     /// Regression: replayed SubagentSpawned (resumed_from unset) must load child
     /// updates.jsonl so fullscreen scrollback is not prompt-only.
     #[test]

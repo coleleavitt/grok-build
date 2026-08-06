@@ -68,28 +68,47 @@ impl WorkflowNotifySender {
         );
     }
 
+    /// Stamp, optionally persist, and fire-and-forget a `WorkflowUpdated`.
+    ///
+    /// A non-persisting dispatch stays UNSTAMPED: the client adopts `eventId`
+    /// as its reconnect cursor, and a cursor that no `updates.jsonl` line
+    /// carries never resolves, degrading every later reconnect to a full
+    /// replay. See `ensure_event_id_meta`.
     fn dispatch(&self, update: XaiSessionUpdate, persist: bool) {
-        let mut meta = None;
-        crate::util::event_id::ensure_event_id_meta(&self.session_id.0, &mut meta);
-        let notification = XaiSessionNotification {
-            session_id: self.session_id.clone(),
-            update,
-            meta: meta.map(serde_json::Value::Object),
-        };
-        let raw = serde_json::to_value(&notification)
-            .and_then(|v| serde_json::value::to_raw_value(&v))
-            .ok();
-        if persist {
-            let _ = self.persistence_tx.send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Xai(Box::new(notification)),
-            ));
+        if !persist {
+            self.forward(XaiSessionNotification {
+                session_id: self.session_id.clone(),
+                update,
+                meta: None,
+            });
+            return;
         }
-        if let Some(raw) = raw {
-            let ext = agent_client_protocol::ExtNotification::new(
-                "x.ai/session_notification",
-                raw.into(),
-            );
-            self.gateway.forward_fire_and_forget(ext);
+        // Stamp and both enqueues in one ordered section — see
+        // `with_event_order` for why the id order must be the on-disk order.
+        crate::util::event_id::with_event_order(|| {
+            let mut meta = None;
+            crate::util::event_id::ensure_event_id_meta(&self.session_id.0, &mut meta);
+            let notification = XaiSessionNotification {
+                session_id: self.session_id.clone(),
+                update,
+                meta: meta.map(serde_json::Value::Object),
+            };
+            let _ = self.persistence_tx.send(PersistenceMsg::Update(
+                crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
+            ));
+            self.forward(notification);
+        });
+    }
+
+    fn forward(&self, notification: XaiSessionNotification) {
+        if let Ok(raw) =
+            serde_json::to_value(&notification).and_then(|v| serde_json::value::to_raw_value(&v))
+        {
+            self.gateway
+                .forward_fire_and_forget(agent_client_protocol::ExtNotification::new(
+                    "x.ai/session_notification",
+                    raw.into(),
+                ));
         }
     }
 }

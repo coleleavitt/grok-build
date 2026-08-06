@@ -613,12 +613,15 @@ pub(crate) struct PendingForkBanner {
 /// Restore scope: the stash covers the transcript-critical state below (plus
 /// the todo list). Satellite state the replay also mutates —
 /// `subagent_sessions`/`subagent_views`, bg/scheduled tasks,
-/// `available_commands`, context usage — is NOT restored on failure: live
-/// updates keep routing through those maps during the window, so stashing
+/// `available_commands`, context usage — is NOT restored wholesale on failure:
+/// live updates keep routing through those maps during the window, so stashing
 /// them would break mid-window routing, and they re-converge on the next
-/// successful reload. A `SubagentInfo::scrollback_entry_id` replayed during a
-/// failed window dangles into the discarded staging state (harmless no-op
-/// lookups; never aliased, thanks to the shared `EntryId` space).
+/// successful reload. Terminal subagent state is the exception: a replayed
+/// historical spawn can temporarily overwrite it, so the terminal subset is
+/// snapshotted and restored on failure/supersession to prevent resurrection.
+/// A `SubagentInfo::scrollback_entry_id` from other replay-only rows may still
+/// dangle into discarded staging (a harmless no-op lookup; never aliased,
+/// thanks to the shared `EntryId` space).
 pub(crate) struct SessionReload {
     /// Reconnect generation (from `ConnectionStatus::Connected`) this reload
     /// was opened for; finalization is rejected for any other generation.
@@ -633,6 +636,10 @@ pub(crate) struct SessionReload {
     workflow_runs: Vec<crate::views::workflows::WorkflowRunSnapshot>,
     workflow_run_revisions: std::collections::HashMap<String, u64>,
     cleared_workflow_runs: std::collections::HashSet<String>,
+    /// Terminal subset retained across a failed/superseded replay. Full
+    /// subagent maps remain live during the window; see the restore-scope docs.
+    terminal_subagent_infos: HashMap<String, SubagentInfo>,
+    terminal_subagent_sessions: HashSet<String>,
     /// Reconnect cursor as of window open, restored with the stash so a
     /// later reload doesn't skip events the restored transcript never got.
     last_seen_event_id: Option<String>,
@@ -799,7 +806,9 @@ pub struct AgentView {
     /// chunks look stale (silent live-text loss).
     pub last_applied_event_seq: Option<u64>,
     /// xAI-stream sibling of [`Self::last_applied_event_seq`] (see there for
-    /// why the highwaters are split). Same drop rule, replay-exempt.
+    /// why the highwaters are split). Same drop rule, replay-exempt, for
+    /// globally ordered xAI updates. Subagent lifecycle uses its own semantic
+    /// state machine because child and parent emitters are not FIFO together.
     pub last_applied_xai_event_seq: Option<u64>,
     /// Raw `eventId` of the most recent update APPLIED to this root session —
     /// replay or live, on both the ACP and xAI paths; dropped updates (dedup,
@@ -1383,6 +1392,10 @@ pub struct AgentView {
     /// `SubagentSpawned` notifications, used for permission routing
     /// (which agent owns a session) and provenance display.
     pub subagent_sessions: HashMap<String, SubagentInfo>,
+    /// Child sessions that have received an absorbing terminal lifecycle event.
+    /// Kept separately so a delayed/duplicate `SubagentSpawned` cannot
+    /// resurrect a row when `SubagentFinished` arrived first.
+    pub(crate) terminal_subagent_sessions: HashSet<String>,
     /// Child subagent views. Keyed by child_session_id.
     /// Created eagerly on SubagentSpawned so updates are tracked from the start.
     pub subagent_views: HashMap<String, Box<AgentView>>,

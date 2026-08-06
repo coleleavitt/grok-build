@@ -4068,6 +4068,8 @@ impl acp::Agent for MvpAgent {
                         .cmd_tx
                         .send(crate::session::SessionCommand::XaiSessionNotification {
                             notification,
+                            // Client-originated: the client already has it.
+                            broadcast: false,
                         });
                 } else {
                     tracing::warn!(

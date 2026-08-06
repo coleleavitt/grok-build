@@ -37,13 +37,96 @@ pub struct HarnessToolsetContext<'a> {
     pub parent_model_agent_type: Option<&'a str>,
     pub file_tool_overrides: Option<&'a [ToolConfig]>,
 }
-/// `false` twin: the alternate flavors re-select toolset presets and
-/// templates, so none is representable when the optional harness is compiled
-/// out. Keeps ungated call sites compiling.
-pub fn subagent_harness_flavor_is_representable(_agent_type: &str) -> bool {
-    false
+/// The built-in harness definition whose child flavor this build can reproduce,
+/// or `None` when re-flavoring onto `agent_type` is not a thing we can do.
+///
+/// A flavor is reproducible when the name resolves to a built-in harness that
+/// carries its own tool vocabulary — the definition then supplies everything a
+/// child needs: toolset, base system-prompt template, and user-message
+/// template. Deliberately an explicit allow-list rather than a heuristic:
+///
+/// - `Codex` / `Opencode` — alternate harnesses with a bespoke tool vocabulary
+///   (and, for codex, a bespoke base prompt). Re-flavoring a child onto these
+///   is the whole point of the override.
+/// - The stock `grok-build*` family — children ALREADY run this flavor, so
+///   re-flavoring would be a no-op that also swallows the file-tool override in
+///   [`apply_harness_toolset`]'s other arm (children would silently stop
+///   inheriting the parent's hashline/standard file tools).
+/// - Subagent roles (`general-purpose`, `explore`, …) — what a child IS, not a
+///   harness it can become.
+fn builtin_harness_flavor(agent_type: &str) -> Option<AgentDefinition> {
+    use std::str::FromStr;
+    use xai_grok_agent::config::BuiltinAgentName as Builtin;
+    match Builtin::from_str(agent_type).ok()? {
+        builtin @ (Builtin::Codex | Builtin::Opencode) => Some(builtin.definition()),
+        _ => None,
+    }
+}
+/// Whether a child can be re-flavored onto `agent_type`'s harness.
+///
+/// Callers use it to decide up front whether a requested harness override can
+/// be honored; `/goal` role resolution fails a role open rather than silently
+/// running the wrong flavor when this is `false`.
+pub fn subagent_harness_flavor_is_representable(agent_type: &str) -> bool {
+    builtin_harness_flavor(agent_type).is_some()
+}
+/// Re-flavor `definition` onto `flavor`'s harness, preserving the child ROLE's
+/// capability ceiling.
+///
+/// Only tool kinds the role already had are carried over, so switching harness
+/// can never widen a role: a read-only `explore` child re-flavored onto codex
+/// gets codex's read/search tools and NOT its shell. This is what makes the
+/// role-dependent base toolset ("general-purpose → implementer, else explorer")
+/// fall out of the role's own definition instead of needing a second set of
+/// per-harness presets to be kept in sync.
+///
+/// Kind-less entries (`from_id`/MCP/custom) are dropped: they carry no
+/// capability signal, so they cannot be ceiling-checked, and granting one to a
+/// restricted role could hand it a shell by another name.
+///
+/// The base prompt/template come from the flavor while the role keeps its own
+/// `prompt_body`, giving "codex base template + general-purpose role body".
+/// A ceiling that filters the flavor down to nothing leaves `definition`
+/// untouched — an empty curated toolset is a hard build error, and silently
+/// producing a capability-less child would be worse than not re-flavoring.
+fn adopt_harness_flavor(definition: &mut AgentDefinition, flavor: &AgentDefinition) {
+    let ceiling: std::collections::HashSet<ToolKind> = definition
+        .tool_config
+        .tools
+        .iter()
+        .filter_map(|tool| tool.kind)
+        .collect();
+    let tools: Vec<ToolConfig> = flavor
+        .tool_config
+        .tools
+        .iter()
+        .filter(|tool| tool.kind.is_some_and(|kind| ceiling.contains(&kind)))
+        .cloned()
+        .collect();
+    if tools.is_empty() {
+        return;
+    }
+    definition.tool_config.tools = tools;
+    definition
+        .tool_config
+        .behavior_preset
+        .clone_from(&flavor.tool_config.behavior_preset);
+    definition.system_prompt = flavor.system_prompt.clone();
+    definition
+        .user_message_template
+        .clone_from(&flavor.user_message_template);
+    definition.inject_default_tools = flavor.inject_default_tools;
 }
 /// Apply the production parent/harness-dependent child toolset selection.
+///
+/// Two arms. When the requested flavor is reproducible, re-flavor the child
+/// onto it ([`adopt_harness_flavor`]). Otherwise swap the parent's file tools
+/// (hashline vs standard) into the child's existing slots — the stock path,
+/// which every grok-build-family parent takes.
+///
+/// The override precedence is: an explicit `/goal` `harness_override` wins;
+/// otherwise the parent agent's own harness, if reproducible; otherwise the
+/// agent type of the parent's model.
 pub fn apply_harness_toolset(
     #[allow(unused_variables)] subagent_type: &str,
     context: &HarnessToolsetContext<'_>,
@@ -55,7 +138,8 @@ pub fn apply_harness_toolset(
             .filter(|name| subagent_harness_flavor_is_representable(name))
             .or(context.parent_model_agent_type)
     });
-    if flavor_agent.is_some_and(subagent_harness_flavor_is_representable) {
+    if let Some(flavor) = flavor_agent.and_then(builtin_harness_flavor) {
+        adopt_harness_flavor(definition, &flavor);
     } else if let Some(file_tools) = context.file_tool_overrides {
         definition.override_file_tools(file_tools.to_vec());
     }
@@ -316,6 +400,129 @@ mod tests {
             toggles,
             allowed_types: None,
         }
+    }
+    fn harness_context(harness: Option<&'static str>) -> HarnessToolsetContext<'static> {
+        HarnessToolsetContext {
+            harness_override: harness,
+            parent_agent_name: None,
+            parent_model_agent_type: None,
+            file_tool_overrides: None,
+        }
+    }
+    fn kinds_of(definition: &AgentDefinition) -> std::collections::HashSet<ToolKind> {
+        definition
+            .tool_config
+            .tools
+            .iter()
+            .filter_map(|tool| tool.kind)
+            .collect()
+    }
+    /// Only the alternate harnesses this build carries are reproducible. The
+    /// stock family must NOT be, or `apply_harness_toolset` would take the
+    /// re-flavor arm for every grok-build parent and silently stop applying
+    /// the parent's file-tool override.
+    #[test]
+    fn only_alternate_harnesses_are_representable_flavors() {
+        for reproducible in ["codex", "opencode"] {
+            assert!(
+                subagent_harness_flavor_is_representable(reproducible),
+                "{reproducible} must be re-flavorable",
+            );
+        }
+        for stock in [
+            "grok-build",
+            "grok-build-plan",
+            "grok-build-concise",
+            "general-purpose",
+            "explore",
+            "totally-bogus-harness",
+            "",
+        ] {
+            assert!(
+                !subagent_harness_flavor_is_representable(stock),
+                "{stock} must not take the re-flavor arm",
+            );
+        }
+    }
+    /// A general-purpose child re-flavored onto codex adopts codex's tool
+    /// vocabulary and its bespoke base prompt.
+    #[test]
+    fn general_purpose_child_adopts_the_codex_flavor() {
+        let cwd = tempfile::tempdir().unwrap();
+        let toggles = HashMap::new();
+        let mut definition =
+            resolve_agent_definition("general-purpose", &context(cwd.path(), &toggles)).unwrap();
+        let stock_kinds = kinds_of(&definition);
+        apply_harness_toolset(
+            "general-purpose",
+            &harness_context(Some("codex")),
+            &mut definition,
+        );
+
+        let codex = xai_grok_agent::config::AgentDefinition::codex();
+        assert_eq!(
+            definition.system_prompt, codex.system_prompt,
+            "the flavor supplies the base prompt template",
+        );
+        let adopted = kinds_of(&definition);
+        assert!(
+            !adopted.is_empty(),
+            "re-flavoring must leave a usable toolset"
+        );
+        assert!(
+            adopted.is_subset(&stock_kinds),
+            "re-flavoring must never widen the role's capabilities",
+        );
+        assert!(
+            adopted.is_subset(&kinds_of(&codex)),
+            "every adopted kind must come from the flavor",
+        );
+    }
+    /// The capability ceiling is the whole point: a read-only role must not
+    /// gain a shell by being re-flavored onto a harness that has one.
+    #[test]
+    fn read_only_child_does_not_gain_execute_from_the_flavor() {
+        let cwd = tempfile::tempdir().unwrap();
+        let toggles = HashMap::new();
+        let mut definition =
+            resolve_agent_definition("explore", &context(cwd.path(), &toggles)).unwrap();
+        assert!(
+            !kinds_of(&definition).contains(&ToolKind::Execute),
+            "precondition: the explore role is read-only",
+        );
+        assert!(
+            kinds_of(&xai_grok_agent::config::AgentDefinition::codex())
+                .contains(&ToolKind::Execute),
+            "precondition: the codex flavor does carry a shell",
+        );
+
+        apply_harness_toolset("explore", &harness_context(Some("codex")), &mut definition);
+
+        assert!(
+            !kinds_of(&definition).contains(&ToolKind::Execute),
+            "a read-only role must stay read-only across a harness switch",
+        );
+    }
+    /// Stock parents keep the existing behavior exactly: no re-flavor, and the
+    /// parent's file-tool override still lands.
+    #[test]
+    fn stock_harness_still_applies_the_file_tool_override() {
+        let cwd = tempfile::tempdir().unwrap();
+        let toggles = HashMap::new();
+        let mut definition =
+            resolve_agent_definition("general-purpose", &context(cwd.path(), &toggles)).unwrap();
+        let before = definition.clone();
+        apply_harness_toolset(
+            "general-purpose",
+            &harness_context(Some("grok-build")),
+            &mut definition,
+        );
+        assert_eq!(
+            kinds_of(&definition),
+            kinds_of(&before),
+            "a stock harness override must not re-flavor the child",
+        );
+        assert_eq!(definition.system_prompt, before.system_prompt);
     }
     #[test]
     fn builtin_explore_uses_production_read_only_toolset() {
