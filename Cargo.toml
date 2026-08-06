@@ -27,6 +27,7 @@ members = [
     "crates/codegen/xai-grok-config-types",
     "crates/codegen/xai-grok-env",
     "crates/codegen/xai-grok-economy",
+    "crates/codegen/xai-grok-got",
     "crates/codegen/xai-grok-hooks",
     "crates/codegen/xai-grok-http",
     "crates/codegen/xai-grok-markdown",
