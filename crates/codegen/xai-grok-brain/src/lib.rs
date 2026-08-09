@@ -13,6 +13,8 @@
 
 mod backfill;
 mod engine_impl;
+mod health;
+mod procedure;
 mod search;
 mod service;
 mod store;
@@ -26,6 +28,8 @@ pub use backfill::{
     BackfillSelection, PersistedBrainSession, build_bounded_run_context, read_bounded_run_context,
     read_persisted_sessions,
 };
+pub use health::{GraphHealth, GraphRegime, HealthThresholds};
+pub use procedure::{Procedure, ProcedureOutcome, ProcedureRecallOptions, RecalledProcedure};
 pub use search::{
     BrainEmbeddingProvider, BrainSearchEngine, BrainSearchMode, BrainSearchOptions,
     BrainSearchOutcome, PreparedBrainSearch,
@@ -73,6 +77,9 @@ pub enum BrainError {
     /// The extraction provider failed.
     #[error("extraction provider error: {0}")]
     Provider(#[source] anyhow::Error),
+    /// A caller-supplied value failed a store precondition.
+    #[error("invalid brain input: {0}")]
+    Validation(String),
 }
 
 /// Convenience result alias for Brain operations.

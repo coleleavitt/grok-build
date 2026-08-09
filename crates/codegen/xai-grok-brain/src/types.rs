@@ -307,6 +307,16 @@ pub struct BrainStatus {
     pub workspace_count: usize,
     /// Total revision rows.
     pub revision_count: usize,
+    /// Total stored procedures (procedural memory).
+    #[serde(default)]
+    pub procedure_count: usize,
+    /// Relation-graph health, or `None` when the store has no pages.
+    ///
+    /// Surfaced here so graph degeneration is actually reported somewhere
+    /// rather than being computable in principle: a memory graph only accretes,
+    /// and both degenerate directions are silent unless something reads them.
+    #[serde(default)]
+    pub graph_regime: Option<crate::GraphRegime>,
 }
 
 /// One recorded page revision.

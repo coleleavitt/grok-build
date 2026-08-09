@@ -29,6 +29,14 @@ pub struct BrainStore {
     conn: Connection,
 }
 
+impl BrainStore {
+    /// Crate-internal connection access, so sibling modules (procedural
+    /// memory, graph health) can add stores without reopening the database.
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+}
+
 impl std::fmt::Debug for BrainStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrainStore").finish_non_exhaustive()
@@ -628,6 +636,10 @@ impl BrainStore {
             global_count: global_count as usize,
             workspace_count: workspace_count as usize,
             revision_count: revision_count as usize,
+            procedure_count: self.procedure_count()? as usize,
+            graph_regime: self
+                .graph_health(crate::HealthThresholds::default())?
+                .map(|health| health.regime()),
         })
     }
 
@@ -954,6 +966,10 @@ fn query_mentions_current_state(query_terms: &[String]) -> bool {
     })
 }
 
+/// Schema revision for the `memory_procedure` repair. Bump when the repair
+/// itself changes and must run again on stores it has already visited.
+const MEMORY_PROCEDURE_SCHEMA_VERSION: i64 = 1;
+
 fn migrate_schema(conn: &Connection) -> Result<()> {
     add_column_if_missing(
         conn,
@@ -983,13 +999,168 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS ix_memory_scope ON memory(scope_kind, scope_id);
-        CREATE INDEX IF NOT EXISTS ix_memory_revision_memory ON memory_revision(memory_id);",
+        CREATE INDEX IF NOT EXISTS ix_memory_revision_memory ON memory_revision(memory_id);
+
+CREATE TABLE IF NOT EXISTS memory_procedure (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signature TEXT NOT NULL,
+    signature_key TEXT NOT NULL,
+    plan TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    scope_id TEXT,
+    uses INTEGER NOT NULL DEFAULT 0,
+    failures INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_memory_procedure_key ON memory_procedure(signature_key);
+CREATE INDEX IF NOT EXISTS ix_memory_procedure_outcome ON memory_procedure(outcome);",
     )?;
+
+    // `failures` must exist BEFORE the repair below, which folds it. Ordering
+    // this after the fold would silently drop duplicates' failure counts.
+    add_column_if_missing(
+        conn,
+        "memory_procedure",
+        "failures",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+
+    // Repair, then collapse, then constrain. Creating the unique index over a
+    // table that already violates it fails hard inside `migrate_schema`, and
+    // `BrainService::open` goes through `BrainStore::open` — so one bad
+    // procedure row would make the whole store permanently unopenable: pages,
+    // search, graph and self-improvement too.
+    //
+    // One transaction, because the steps are not independently valid: a crash
+    // between the fold and the delete would leave counters folded AND
+    // duplicates present, and the next open would fold them a second time.
     add_column_if_missing(
         conn,
         "memory_revision",
         "freshness",
         "TEXT NOT NULL DEFAULT 'durable'",
+    )?;
+
+    // IMMEDIATE, not the default DEFERRED: the repair reads (SELECT DISTINCT)
+    // before it writes, and a deferred read-then-write upgrade that loses the
+    // race returns SQLITE_BUSY_SNAPSHOT WITHOUT invoking the busy handler — so
+    // the timeout would not apply and `BrainStore::open` would simply fail when
+    // two processes open the same store at once. Taken by hand because
+    // `migrate_schema` holds `&Connection`, not `&mut`.
+    // Gate on a schema version so the repair runs ONCE, not on every open.
+    // Ungated it drops and rebuilds the identity index and runs two grouped
+    // scans every time `BrainStore::open` is called — and open backs
+    // memory_get, memory_search, the brain tools and the session hooks, so an
+    // ungated write transaction on those read paths is a concurrency hazard,
+    // not just wasted work.
+    //
+    // The gate checks the INVARIANT, not just the stamp. Guarding on the stamp
+    // alone lets a store be marked migrated while the identity index is absent
+    // — the table is created by the ungated schema batch but the index only by
+    // this repair, so the two are otherwise guarded by different conditions —
+    // and the index is then never restored. The extra check is one catalogue
+    // lookup and makes the index self-healing.
+    let applied: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if applied < MEMORY_PROCEDURE_SCHEMA_VERSION || !identity_index_present(conn)? {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let repaired = repair_memory_procedure(conn).and_then(|()| {
+            // Stamped inside the transaction, so a rollback also un-stamps it
+            // and the repair is retried rather than silently skipped.
+            conn.execute_batch(&format!(
+                "PRAGMA user_version = {MEMORY_PROCEDURE_SCHEMA_VERSION}"
+            ))
+            .map_err(Into::into)
+        });
+        if repaired.is_err() {
+            // Leave no open transaction behind for the caller's next statement.
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        repaired?;
+        conn.execute_batch("COMMIT")?;
+    }
+
+    Ok(())
+}
+
+/// Whether `memory_procedure`'s identity index exists on the right table.
+fn identity_index_present(conn: &Connection) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = ?1 AND tbl_name = 'memory_procedure'",
+        params!["ux_memory_procedure_identity"],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Canonicalize scopes, fold duplicates, and restore the identity index.
+///
+/// Split out so the caller can roll back as a unit; every statement here
+/// assumes it runs inside a transaction.
+fn repair_memory_procedure(tx: &Connection) -> Result<()> {
+    // The index must go FIRST. `CREATE UNIQUE INDEX IF NOT EXISTS` is a no-op
+    // on a store an earlier build already migrated, but the canonicalization
+    // below is not — and collapsing two slash-spellings onto one key violates
+    // an index that already exists, bricking the store on the upgrade path the
+    // repair was written to protect. It is recreated at the end of this same
+    // transaction, so no other connection ever observes the table unconstrained.
+    // Qualified by table: SQLite index names are global to the database, so an
+    // unqualified drop by name would silently remove an identically-named index
+    // belonging to some other table.
+    if identity_index_present(tx)? {
+        tx.execute("DROP INDEX ux_memory_procedure_identity", [])?;
+    }
+
+    // Canonicalize scopes in RUST, not SQL. SQLite's one-argument `trim()`
+    // strips U+0020 only, while `str::trim()` strips every Unicode whitespace
+    // character, so an SQL rewrite leaves a scope like "/repo/a\n" — exactly
+    // what an earlier unnormalized build would store from a captured path — in
+    // a spelling `normalize_procedure_scope` can never produce, and therefore
+    // in a row no query can ever reach. Sharing the one normalizer is the only
+    // way the two cannot drift apart again.
+    let stale: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT DISTINCT scope_id FROM memory_procedure WHERE scope_id IS NOT NULL")?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for raw in stale {
+        let canonical = crate::procedure::normalize_procedure_scope(Some(&raw));
+        if canonical.as_deref() != Some(raw.as_str()) {
+            tx.execute(
+                "UPDATE memory_procedure SET scope_id = ?1 WHERE scope_id = ?2",
+                params![canonical, raw],
+            )?;
+        }
+    }
+
+    // Fold every duplicate's counters into the lowest-id survivor. BOTH
+    // counters, or the survivor's reliability is computed from successes it
+    // kept and failures it lost.
+    tx.execute_batch(
+        "UPDATE memory_procedure SET
+             uses = MIN(9223372036854775807, uses + COALESCE((
+                 SELECT SUM(dup.uses) FROM memory_procedure dup
+                 WHERE dup.signature_key = memory_procedure.signature_key
+                   AND dup.plan = memory_procedure.plan
+                   AND COALESCE(dup.scope_id, '') = COALESCE(memory_procedure.scope_id, '')
+                   AND dup.id > memory_procedure.id), 0)),
+             failures = MIN(9223372036854775807, failures + COALESCE((
+                 SELECT SUM(dup.failures) FROM memory_procedure dup
+                 WHERE dup.signature_key = memory_procedure.signature_key
+                   AND dup.plan = memory_procedure.plan
+                   AND COALESCE(dup.scope_id, '') = COALESCE(memory_procedure.scope_id, '')
+                   AND dup.id > memory_procedure.id), 0))
+         WHERE id IN (
+             SELECT MIN(id) FROM memory_procedure
+             GROUP BY signature_key, plan, COALESCE(scope_id, '')
+             HAVING COUNT(*) > 1);
+         DELETE FROM memory_procedure WHERE id NOT IN (
+             SELECT MIN(id) FROM memory_procedure
+             GROUP BY signature_key, plan, COALESCE(scope_id, ''));
+         CREATE UNIQUE INDEX ux_memory_procedure_identity
+             ON memory_procedure(signature_key, plan, COALESCE(scope_id, ''));",
     )?;
     Ok(())
 }

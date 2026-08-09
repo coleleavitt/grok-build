@@ -150,10 +150,30 @@ where
     F: FnMut(Option<String>, Option<String>, String) -> Fut,
     Fut: std::future::Future<Output = Result<String, E>>,
 {
+    // Measurement only. Emitted on EVERY path so the inherit baseline and the
+    // configured treatment are both in the log; `GoalRoleModelFailOpen` alone
+    // is a failures-only sample and cannot show that a pairing worked.
+    // Selection behaviour below is unchanged.
+    let record = |succeeded: bool, fell_back: bool| {
+        if let Some(ev) = events {
+            ev.emit(Event::GoalRoleAssignment {
+                role,
+                skeptic_idx,
+                explicit: override_.is_explicit(),
+                model: override_.model.clone(),
+                agent_type: override_.agent_type.clone(),
+                succeeded,
+                fell_back,
+            });
+        }
+    };
+
     // Inherit path: single attempt on the current model + session harness; move
     // the prompt.
     if !override_.is_explicit() {
-        return spawn(None, None, prompt.primary).await;
+        let inherited = spawn(None, None, prompt.primary).await;
+        record(inherited.is_ok(), false);
+        return inherited;
     }
     let first = spawn(
         override_.model.clone(),
@@ -166,6 +186,7 @@ where
         Err(e) => !e.is_cancelled(),
     };
     if !should_retry {
+        record(first.is_ok(), false);
         return first;
     }
     if let Some(ev) = events {
@@ -177,7 +198,11 @@ where
     }
     // Retry on the session harness — use the matching `fallback` render so the
     // prompt names the toolset the retry actually runs on.
-    spawn(None, None, prompt.fallback).await
+    let retried = spawn(None, None, prompt.fallback).await;
+    // `succeeded && fell_back` means the ROLE completed but the configured
+    // PAIRING did not — the case a naive success rate would miscount.
+    record(retried.is_ok(), true);
+    retried
 }
 
 // Constants
@@ -1683,5 +1708,291 @@ mod tests {
         );
         drop(coord);
         let _ = std::fs::remove_file(&plan_file);
+    }
+}
+
+/// G003 — role-assignment outcome instrumentation.
+///
+/// Measurement only. These tests prove the record carries the tuple needed to
+/// evaluate static assignment, AND that adding it changed no selection
+/// behaviour: same attempts, same model/harness arguments, same return value.
+#[cfg(test)]
+mod role_assignment_instrumentation_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use xai_file_utils::events::EventWriter;
+
+    /// Read back every `goal_role_assignment` record the writer emitted.
+    /// Going through the real file is deliberate: it exercises the serde
+    /// attributes (notably the `skip_serializing_if` omissions) rather than
+    /// asserting on an in-memory enum that never round-tripped.
+    fn assignment_records(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let raw = std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
+        raw.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            // `EventEntry` flattens the event, so its fields sit at the top
+            // level alongside `ts` rather than nested under an `event` key.
+            .filter(|entry| entry["type"] == "goal_role_assignment")
+            .collect()
+    }
+
+    fn explicit() -> RoleSpawnOverride {
+        RoleSpawnOverride {
+            model: Some("cfg-model".into()),
+            agent_type: Some("cfg-type".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicit_pairing_that_succeeds_is_recorded_with_its_tuple() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = EventWriter::open(dir.path());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+
+        let out: Result<String, SpawnError> = spawn_with_fail_open_retry(
+            "planner",
+            None,
+            &explicit(),
+            Some(&writer),
+            RoleRenderedPrompt {
+                primary: "PRIMARY".to_string(),
+                fallback: "FALLBACK".to_string(),
+            },
+            move |model, harness, _prompt| {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    // Selection unchanged: the configured pair is still what
+                    // gets attempted.
+                    assert_eq!(model.as_deref(), Some("cfg-model"));
+                    assert_eq!(harness.as_deref(), Some("cfg-type"));
+                    Ok("ok".to_string())
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(out.unwrap(), "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "still exactly one attempt");
+
+        let records = assignment_records(dir.path());
+        assert_eq!(records.len(), 1, "one record per role spawn: {records:?}");
+        let record = &records[0];
+        assert_eq!(record["role"], "planner");
+        assert_eq!(record["explicit"], true);
+        assert_eq!(record["model"], "cfg-model");
+        assert_eq!(record["agent_type"], "cfg-type");
+        assert_eq!(record["succeeded"], true);
+        assert_eq!(record["fell_back"], false);
+        assert!(
+            record.get("skeptic_idx").is_none(),
+            "skeptic_idx is omitted for non-panel roles",
+        );
+    }
+
+    /// The case a naive success rate miscounts: the ROLE completed, but only
+    /// because the configured pairing failed and the session harness ran.
+    /// Without `fell_back` this is indistinguishable from the pairing working.
+    #[tokio::test]
+    async fn a_pairing_that_failed_into_a_successful_fallback_is_not_counted_as_a_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = EventWriter::open(dir.path());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+
+        let out: Result<String, SpawnError> = spawn_with_fail_open_retry(
+            "skeptic",
+            Some(2),
+            &explicit(),
+            Some(&writer),
+            RoleRenderedPrompt {
+                primary: "PRIMARY".to_string(),
+                fallback: "FALLBACK".to_string(),
+            },
+            move |model, _harness, prompt| {
+                let c = c.clone();
+                async move {
+                    let n = c.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        assert_eq!(model.as_deref(), Some("cfg-model"));
+                        assert_eq!(prompt, "PRIMARY");
+                        Err(SpawnError::Transport("boom".into()))
+                    } else {
+                        // Selection unchanged: the retry still drops the pin.
+                        assert_eq!(model, None);
+                        assert_eq!(prompt, "FALLBACK");
+                        Ok("recovered".to_string())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(out.unwrap(), "recovered");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "still one retry");
+
+        let records = assignment_records(dir.path());
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["role"], "skeptic");
+        assert_eq!(record["skeptic_idx"], 2);
+        assert_eq!(record["explicit"], true);
+        assert_eq!(record["succeeded"], true, "the role produced a result");
+        assert_eq!(
+            record["fell_back"], true,
+            "but the configured pairing did not; a naive success rate would miscount this",
+        );
+        assert_eq!(
+            record["model"], "cfg-model",
+            "the record names the pairing that was attempted, not the fallback",
+        );
+    }
+
+    /// The inherit path is the baseline. Without it in the log there is nothing
+    /// to compare configured pairings against.
+    #[tokio::test]
+    async fn the_inherit_baseline_is_recorded_without_a_pinned_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = EventWriter::open(dir.path());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+
+        let out: Result<String, SpawnError> = spawn_with_fail_open_retry(
+            "strategist",
+            None,
+            &RoleSpawnOverride::default(),
+            Some(&writer),
+            RoleRenderedPrompt {
+                primary: "PRIMARY".to_string(),
+                fallback: "FALLBACK".to_string(),
+            },
+            move |model, harness, prompt| {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(model, None);
+                    assert_eq!(harness, None);
+                    assert_eq!(prompt, "PRIMARY", "inherit still moves the primary render");
+                    Ok("ok".to_string())
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(out.unwrap(), "ok");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "inherit is still one attempt"
+        );
+
+        let records = assignment_records(dir.path());
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["explicit"], false);
+        assert_eq!(record["succeeded"], true);
+        assert_eq!(record["fell_back"], false);
+        assert!(record.get("model").is_none(), "nothing was pinned");
+        assert!(record.get("agent_type").is_none());
+    }
+
+    /// A failing pairing whose retry also fails is still recorded — otherwise
+    /// the log would only contain outcomes that eventually worked.
+    #[tokio::test]
+    async fn a_total_failure_is_still_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = EventWriter::open(dir.path());
+
+        let out: Result<String, SpawnError> = spawn_with_fail_open_retry(
+            "planner",
+            None,
+            &explicit(),
+            Some(&writer),
+            RoleRenderedPrompt {
+                primary: "PRIMARY".to_string(),
+                fallback: "FALLBACK".to_string(),
+            },
+            |_model, _harness, _prompt| async move { Err(SpawnError::Transport("boom".into())) },
+        )
+        .await;
+
+        assert!(out.is_err());
+        let records = assignment_records(dir.path());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["succeeded"], false);
+        assert_eq!(records[0]["fell_back"], true);
+    }
+
+    /// A cancelled explicit spawn must still propagate without a retry — the
+    /// pre-existing semantic the instrumentation must not disturb.
+    #[tokio::test]
+    async fn cancellation_still_propagates_without_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = EventWriter::open(dir.path());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+
+        let out: Result<String, SpawnError> = spawn_with_fail_open_retry(
+            "planner",
+            None,
+            &explicit(),
+            Some(&writer),
+            RoleRenderedPrompt {
+                primary: "PRIMARY".to_string(),
+                fallback: "FALLBACK".to_string(),
+            },
+            move |_model, _harness, _prompt| {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Err(SpawnError::Runtime {
+                        message: "cancelled".into(),
+                        cancelled: true,
+                    })
+                }
+            },
+        )
+        .await;
+
+        assert!(out.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a cancelled explicit spawn must NOT fail-open retry",
+        );
+        let records = assignment_records(dir.path());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["succeeded"], false);
+        assert_eq!(records[0]["fell_back"], false, "no fallback was attempted");
+    }
+
+    /// Instrumentation must be optional: with no writer, nothing is recorded
+    /// and behaviour is identical.
+    #[tokio::test]
+    async fn without_an_event_writer_nothing_is_recorded_and_behaviour_is_identical() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let out: Result<String, SpawnError> = spawn_with_fail_open_retry(
+            "planner",
+            None,
+            &explicit(),
+            None,
+            RoleRenderedPrompt {
+                primary: "PRIMARY".to_string(),
+                fallback: "FALLBACK".to_string(),
+            },
+            move |_model, _harness, _prompt| {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok("ok".to_string())
+                }
+            },
+        )
+        .await;
+        assert_eq!(out.unwrap(), "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

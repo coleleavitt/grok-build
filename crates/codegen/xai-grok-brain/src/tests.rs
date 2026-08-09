@@ -667,6 +667,15 @@ fn status_scopes_revisions_and_query_recall_work() {
     assert_eq!(status.workspace_count, 1);
     assert_eq!(status.source_count, 1);
     assert_eq!(status.revision_count, 2, "create records revisions");
+    assert_eq!(
+        status.procedure_count, 0,
+        "procedural memory is reported in status",
+    );
+    assert_eq!(
+        status.graph_regime,
+        Some(crate::GraphRegime::Fragmented),
+        "two unrelated pages are an unintegrated graph, and status says so",
+    );
 
     let recall = store
         .recall_pages(RecallOptions {

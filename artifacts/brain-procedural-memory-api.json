@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "surface": "package",
+  "description": "xai-grok-brain procedural memory (memory_procedure table, record/recall/reliability ranking, gated repair migration) exercised through the crate's public API and through forged legacy database states.",
+  "commands": [
+    "cargo test -p xai-grok-brain",
+    "cargo test -p xai-grok-brain --lib procedure",
+    "cargo check --workspace --all-targets"
+  ],
+  "results": [
+    {"case": "record_and_recall_round_trip", "verdict": "passed"},
+    {"case": "recall_ranks_the_closer_signature_higher", "verdict": "passed"},
+    {"case": "an_unrelated_goal_recalls_nothing", "verdict": "passed", "note": "returning best-of-a-bad-set would hand the agent a plan for a different problem"},
+    {"case": "failed_procedures_are_recorded_but_never_recalled", "verdict": "passed"},
+    {"case": "a_repeatedly_failed_plan_does_not_outrank_a_clean_success", "verdict": "passed", "note": "gen-2 red-team BLOCKER-A repro"},
+    {"case": "a_worse_success_rate_does_not_outrank_a_perfect_one", "verdict": "passed", "note": "2 successes/50 failures vs 1 success/0 failures"},
+    {"case": "volume_breaks_ties_between_equally_reliable_plans", "verdict": "passed", "note": "verified mutation-sensitive by deleting the comparator"},
+    {"case": "reliability_is_smoothed_so_one_lucky_success_is_not_perfect", "verdict": "passed"},
+    {"case": "an_unscoped_recall_does_not_leak_other_workspaces", "verdict": "passed"},
+    {"case": "concurrent_identical_records_collapse_to_one_row", "verdict": "passed", "note": "8 threads x 25 records; asserts uses == accepted writes"},
+    {"case": "a_store_with_pre_existing_duplicates_still_opens_and_collapses_them", "verdict": "passed", "note": "gen-2 BLOCKER-B: a duplicate row previously bricked the entire store"},
+    {"case": "a_legacy_empty_string_scope_is_repaired_rather_than_stranded", "verdict": "passed", "note": "gen-3 BLOCKER-G"},
+    {"case": "the_dedup_fold_absorbs_failures_as_well_as_successes", "verdict": "passed"},
+    {"case": "the_procedure_repair_runs_once_and_is_stamped", "verdict": "passed"},
+    {"case": "a_lost_identity_index_is_restored_despite_the_migration_stamp", "verdict": "passed", "note": "final red-team MEDIUM-A; verified mutation-sensitive by removing the invariant clause"},
+    {"case": "procedures_survive_reopening_an_existing_database", "verdict": "passed"},
+    {"case": "corrupt_negative_counters_cannot_produce_an_infinite_score", "verdict": "passed"}
+  ],
+  "redTeamEvidence": "Independent executor red-team lane ran 94 throwaway probes across 7 generations against forged legacy database states (pre-index shape, pre-stamped, index-dropped, name-collision, i64::MAX counters) and real thread races (120 first opens, 320 healthy opens, 120 racing heals, heal-storm against 120 duplicate-insert attempts). Filed 8 blockers; all closed and re-verified on the final frozen hash."
+}

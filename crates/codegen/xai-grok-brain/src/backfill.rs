@@ -355,8 +355,16 @@ fn read_jsonl_artifact_file(
         if line.is_empty() {
             continue;
         }
-        let excerpt = serde_json::from_str::<serde_json::Value>(line)
-            .ok()
+        let parsed = serde_json::from_str::<serde_json::Value>(line).ok();
+        if parsed.as_ref().is_some_and(is_measurement_only_event) {
+            // Instrumentation carries no content for memory extraction, and
+            // this window keeps only the last few lines — so a high-frequency
+            // measurement event silently evicts the session events that DO
+            // carry meaning, and contributes a content-free excerpt in their
+            // place.
+            continue;
+        }
+        let excerpt = parsed
             .and_then(|value| summarize_json_artifact(&value))
             .unwrap_or_else(|| truncate_chars(line, BRAIN_MAX_CHARS_PER_ARTIFACT));
         if excerpt.trim().is_empty() {
@@ -368,6 +376,18 @@ fn read_jsonl_artifact_file(
         kept += 1;
     }
     Ok(())
+}
+
+/// Event types that exist purely to be counted later.
+///
+/// They are deliberately excluded from the self-improvement extraction context:
+/// they describe the harness measuring itself, never anything about the user's
+/// project, and they are emitted often enough to crowd out events that do.
+fn is_measurement_only_event(value: &serde_json::Value) -> bool {
+    matches!(
+        value.get("type").and_then(serde_json::Value::as_str),
+        Some("goal_role_assignment"),
+    )
 }
 
 fn read_text_artifact_dir(
@@ -858,6 +878,62 @@ mod tests {
                 .any(|d| d.id == "/repo/notes.txt")
         );
     }
+    /// Generation-1 red-team finding: the events window keeps only the last
+    /// few lines, so appending high-frequency instrumentation evicted real
+    /// session events AND replaced them with a content-free excerpt.
+    #[test]
+    fn measurement_events_do_not_evict_real_session_events() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("sessions/cwd/session-evict");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("summary.json"),
+            r#"{"info":{"id":"session-evict"},"session_summary":"Eviction check","updated_at":"2026-07-21T12:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("chat_history.jsonl"),
+            "{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"do the thing\"}]}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("events.jsonl"),
+            concat!(
+                r#"{"ts":"1","type":"goal_planner_fired"}"#,
+                "\n",
+                r#"{"ts":"2","type":"goal_planner_completed"}"#,
+                "\n",
+                r#"{"ts":"3","type":"turn_completed"}"#,
+                "\n",
+                r#"{"ts":"4","type":"turn_ended"}"#,
+                "\n",
+                r#"{"ts":"5","type":"goal_role_assignment","role":"planner","succeeded":true}"#,
+                "\n",
+                r#"{"ts":"6","type":"goal_role_assignment","role":"skeptic","succeeded":true}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let sessions = read_persisted_sessions(tmp.path()).unwrap();
+        let joined = sessions[0].lines.join("\n");
+        assert!(
+            !joined.contains("goal_role_assignment"),
+            "instrumentation must not enter the extraction context: {joined}",
+        );
+        for kept in [
+            "goal_planner_fired",
+            "goal_planner_completed",
+            "turn_completed",
+            "turn_ended",
+        ] {
+            assert!(
+                joined.contains(kept),
+                "{kept} must survive; it was evicted before the filter: {joined}",
+            );
+        }
+    }
+
     #[test]
     fn reads_grok_artifacts_into_bounded_session_context() {
         let tmp = tempfile::TempDir::new().unwrap();

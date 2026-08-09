@@ -305,6 +305,46 @@ pub enum Event {
         reason: &'static str,
     },
 
+    /// A goal role finished a spawn on a `{model, agent_type}` pairing —
+    /// measurement only, emitted for EVERY role spawn whether the pairing was
+    /// explicitly configured or inherited from the session.
+    ///
+    /// Exists so static role assignment can be evaluated from durable data
+    /// before anyone argues for learned selection. Today the harness picks a
+    /// pairing from static config and the outcome is observed and discarded, so
+    /// there is no evidence about whether the configured priors are any good.
+    /// `GoalRoleModelFailOpen` only fires when a pairing FAILED, which is a
+    /// biased sample: it can never show that a pairing succeeded, nor how
+    /// often, so it cannot answer the question on its own.
+    ///
+    /// `explicit` distinguishes a pairing that reached the spawn from the
+    /// inherit path. It is NOT the same as "no pairing was configured": a
+    /// pairing rejected before the spawn (unknown model, unauthorized model,
+    /// unusable toolset) fails open to the session harness and is recorded here
+    /// as `explicit: false`. Any configured-vs-inherit comparison must
+    /// therefore join against `goal_role_model_fail_open` for the same
+    /// `(role, skeptic_idx)` to separate a true baseline from a rejected
+    /// pairing; the raw `explicit: false` bucket contains both. `model` and `agent_type` are `None` on the inherit path because
+    /// nothing was pinned. `fell_back` records that the configured pairing was
+    /// attempted and failed, and the session harness ran instead — so
+    /// `succeeded && fell_back` means the ROLE completed but the PAIRING did
+    /// not, which is precisely the case a naive success rate would miscount.
+    GoalRoleAssignment {
+        role: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        skeptic_idx: Option<u32>,
+        /// Whether a `{model, agent_type}` pair was explicitly configured.
+        explicit: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_type: Option<String>,
+        /// Whether the spawn ultimately produced a result.
+        succeeded: bool,
+        /// Whether the configured pairing failed and the session harness ran.
+        fell_back: bool,
+    },
+
     /// One skeptic in the adversarial panel returned a verdict. Fires
     /// `N` times per verification stage (where N is
     /// `goal_verifier_count`). `confidence` is the JSON `confidence`
@@ -887,6 +927,51 @@ mod tests {
         assert_eq!(v["role"], "skeptic");
         assert_eq!(v["skeptic_idx"], 1);
         assert_eq!(v["reason"], "toolset_unavailable");
+    }
+
+    /// The wire shape must be pinned in the crate that OWNS it. Without this
+    /// the three `skip_serializing_if` omissions were only covered from
+    /// xai-grok-shell, so this crate could break the contract with its own
+    /// suite green.
+    #[test]
+    fn goal_role_assignment_tags_and_omits_correctly() {
+        let explicit = Event::GoalRoleAssignment {
+            role: "planner",
+            skeptic_idx: None,
+            explicit: true,
+            model: Some("m-1".to_owned()),
+            agent_type: Some("codex".to_owned()),
+            succeeded: true,
+            fell_back: false,
+        };
+        let obj = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(obj["type"], "goal_role_assignment");
+        assert_eq!(obj["role"], "planner");
+        assert_eq!(obj["explicit"], true);
+        assert_eq!(obj["model"], "m-1");
+        assert_eq!(obj["agent_type"], "codex");
+        assert_eq!(obj["succeeded"], true);
+        assert_eq!(obj["fell_back"], false);
+        assert!(
+            obj.get("skeptic_idx").is_none(),
+            "skeptic_idx must be omitted when None, got {obj}"
+        );
+
+        let inherited = Event::GoalRoleAssignment {
+            role: "skeptic",
+            skeptic_idx: Some(1),
+            explicit: false,
+            model: None,
+            agent_type: None,
+            succeeded: false,
+            fell_back: false,
+        };
+        let obj = serde_json::to_value(&inherited).unwrap();
+        assert_eq!(obj["skeptic_idx"], 1);
+        assert!(
+            obj.get("model").is_none() && obj.get("agent_type").is_none(),
+            "an unpinned pairing must omit both fields, got {obj}"
+        );
     }
 
     #[test]

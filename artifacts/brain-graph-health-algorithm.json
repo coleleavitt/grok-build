@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "kind": "algorithm-boundary-report",
+  "surface": "algorithm",
+  "description": "xai-grok-brain relation-graph health metric: hub_excess = (hub_share - k/n)/(1 - k/n) with hub_k clamped to (nodes/2).max(1), thresholded at 0.25, and a MIN_NODES_FOR_HUB_VERDICT=5 refusal floor.",
+  "commands": ["cargo test -p xai-grok-brain --lib health", "cargo test -p xai-grok-brain"],
+  "boundaryCases": [
+    {"case": "empty graph", "expected": "None (no verdict on nothing)", "verdict": "passed"},
+    {"case": "complete graphs K2..K12", "expected": "hub_excess exactly 0.0, Healthy at every size", "verdict": "passed"},
+    {"case": "rings n=5..12", "expected": "hub_excess exactly 0.0, Healthy", "verdict": "passed"},
+    {"case": "paths n=2..16", "expected": "Healthy", "verdict": "passed"},
+    {"case": "stars n=5..17", "expected": "HubDominated, excess 0.375 rising to 0.4688", "verdict": "passed"},
+    {"case": "4-node star vs 4-node path", "expected": "bit-identical excess 0.3333; both refuse a hub verdict rather than flag one wrongly", "verdict": "passed"},
+    {"case": "hub_k = 6/7/50/usize::MAX on a 6-node star", "expected": "still HubDominated; widening the knob cannot disable detection", "verdict": "passed"},
+    {"case": "threshold boundary", "expected": "5-node star 0.375 above, 6-node path 0.2 below", "verdict": "passed"},
+    {"case": "edgeless graph", "expected": "hub_share 0.0 not NaN (0/0 guarded)", "verdict": "passed"},
+    {"case": "fragmentation below the verdict floor", "expected": "still reported at n=1..4", "verdict": "passed"},
+    {"case": "GraphRegime wire spelling", "expected": "fragmented/hub_dominated/healthy round-trip", "verdict": "passed"}
+  ],
+  "adversarialHistory": "The red-team lane falsified this metric twice: gen-2 (every graph with <6 nodes and >=1 edge forced HubDominated by the unnormalized share) and gen-4 (the 0.35 cutoff sat inside the star ramp so 3- and 4-node stars read Healthy). Both closed; both directions now swept."
+}

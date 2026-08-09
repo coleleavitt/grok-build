@@ -565,7 +565,7 @@ fn format_brain_status(service: &xai_grok_brain::BrainService) -> String {
                 .collect::<Vec<_>>()
                 .join("\n");
             format!(
-                "Brain status\nenabled: {}\nconnectors: {}\nlast_run_at: {}\npages: {} (global {}, workspace {})\nsources: {}\nrelations: {}\nrevisions: {}\ncategories:\n{}",
+                "Brain status\nenabled: {}\nconnectors: {}\nlast_run_at: {}\npages: {} (global {}, workspace {})\nsources: {}\nrelations: {}\nrevisions: {}\nprocedures: {}\ngraph: {}\ncategories:\n{}",
                 status.settings.enabled,
                 status.settings.use_connectors,
                 status
@@ -579,6 +579,18 @@ fn format_brain_status(service: &xai_grok_brain::BrainService) -> String {
                 status.source_count,
                 status.relation_count,
                 status.revision_count,
+                status.procedure_count,
+                // The relation graph only accretes and both degenerate
+                // directions are silent unless something prints them. `n/a`
+                // rather than a guessed verdict when the store has no pages.
+                status
+                    .graph_regime
+                    .map(|regime| match regime {
+                        xai_grok_brain::GraphRegime::Fragmented => "fragmented",
+                        xai_grok_brain::GraphRegime::HubDominated => "hub-dominated",
+                        xai_grok_brain::GraphRegime::Healthy => "healthy",
+                    })
+                    .unwrap_or("n/a"),
                 categories,
             )
         }
