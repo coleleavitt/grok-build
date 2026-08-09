@@ -308,14 +308,18 @@ mod tests {
             health.isolated_fraction, 0.0,
             "every page is connected, so this is not fragmentation",
         );
-        // Asserted on hub_excess, never the raw share: the module documents the
-        // raw share as unthresholdable, and `small_uniform_graphs_are_not_
-        // mistaken_for_hubs` exists to disprove exactly a 0.5 share cutoff. A
-        // test asserting the rule its own module rejects is what a maintainer
-        // trusts over the prose.
+        // Pins the VALUE, not the verdict. Asserting `hub_excess >= threshold`
+        // would only re-derive the classifier's own decision — with no
+        // fragmentation and n >= the verdict floor, `regime()` reduces to
+        // exactly that comparison, so it restates the assertion below it and
+        // survives a mutation of the excess formula. 0.4 = (0.7 - 0.5) / 0.5
+        // for this fixture, and a change to the formula moves it.
+        //
+        // Epsilon rather than `assert_eq!` because neither 0.7 nor 0.4 is
+        // binary-exact, unlike the ring's exact 0.0.
         assert!(
-            health.hub_excess >= health.thresholds().hub_dominated_at_excess,
-            "hub excess was {} for a star",
+            (health.hub_excess - 0.4).abs() < 1e-9,
+            "expected hub excess ~0.4 for a 6-node star, got {}",
             health.hub_excess,
         );
         assert_eq!(health.regime(), GraphRegime::HubDominated);
