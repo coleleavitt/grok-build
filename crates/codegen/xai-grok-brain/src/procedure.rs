@@ -198,19 +198,25 @@ pub(crate) fn row_to_procedure(row: &rusqlite::Row<'_>) -> rusqlite::Result<Proc
         scope_id: row.get(4)?,
         uses: row.get(7)?,
         failures: row.get(8)?,
-        created_at: parse_ts(&created),
-        updated_at: parse_ts(&updated),
+        created_at: parse_procedure_ts(&created),
+        updated_at: parse_procedure_ts(&updated),
     })
 }
 
-/// Parse a stored timestamp, falling back to the minimum representable
-/// instant.
+/// Parse a stored procedure timestamp, falling back to the minimum
+/// representable instant.
 ///
 /// Deliberately NOT `Utc::now()`: `updated_at` is the recency tiebreak, so
 /// substituting the current time would rank a row with a corrupt timestamp as
 /// the freshest procedure in the store and let it win every tie. Sorting last
 /// is the direction that fails safe.
-fn parse_ts(value: &str) -> DateTime<Utc> {
+///
+/// Named distinctly from `store::parse_ts`, which falls back to the Unix epoch
+/// (`DateTime::default()`) instead. Both fail safe for recency ordering, but two
+/// module-private helpers sharing one name while substituting different
+/// constants is a trap for the next reader, so the difference is in the name
+/// rather than only in the body.
+fn parse_procedure_ts(value: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(value)
         .map(|ts| ts.with_timezone(&Utc))
         .unwrap_or(DateTime::<Utc>::MIN_UTC)
@@ -1260,8 +1266,11 @@ mod tests {
     /// every recency tiebreak.
     #[test]
     fn a_corrupt_timestamp_sorts_last_instead_of_freshest() {
-        assert_eq!(super::parse_ts("not-a-timestamp"), DateTime::<Utc>::MIN_UTC);
-        assert!(super::parse_ts("not-a-timestamp") < Utc::now());
+        assert_eq!(
+            super::parse_procedure_ts("not-a-timestamp"),
+            DateTime::<Utc>::MIN_UTC,
+        );
+        assert!(super::parse_procedure_ts("not-a-timestamp") < Utc::now());
     }
 
     /// An empty goal must match nothing rather than everything.

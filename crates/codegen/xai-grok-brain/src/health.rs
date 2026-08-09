@@ -308,10 +308,15 @@ mod tests {
             health.isolated_fraction, 0.0,
             "every page is connected, so this is not fragmentation",
         );
+        // Asserted on hub_excess, never the raw share: the module documents the
+        // raw share as unthresholdable, and `small_uniform_graphs_are_not_
+        // mistaken_for_hubs` exists to disprove exactly a 0.5 share cutoff. A
+        // test asserting the rule its own module rejects is what a maintainer
+        // trusts over the prose.
         assert!(
-            health.hub_share >= 0.5,
-            "hub share was {} for a star",
-            health.hub_share,
+            health.hub_excess >= health.thresholds().hub_dominated_at_excess,
+            "hub excess was {} for a star",
+            health.hub_excess,
         );
         assert_eq!(health.regime(), GraphRegime::HubDominated);
     }
@@ -335,7 +340,15 @@ mod tests {
         assert_eq!(health.edges, 8);
         assert_eq!(health.mean_degree, 2.0, "a ring gives every node degree 2");
         assert_eq!(health.isolated_fraction, 0.0);
-        assert!(health.hub_share < 0.5, "hub share was {}", health.hub_share);
+        // A ring is uniform, so its concentration above the k/n floor is zero at
+        // every size — the property the rescaling exists for. The raw share
+        // here is 0.375 only because hub_k clamps to 3 of 8, which is the
+        // size-dependence this metric removed.
+        assert_eq!(
+            health.hub_excess, 0.0,
+            "a uniform graph has no excess concentration (raw share {})",
+            health.hub_share,
+        );
         assert_eq!(health.regime(), GraphRegime::Healthy);
     }
 
