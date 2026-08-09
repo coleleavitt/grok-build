@@ -68,6 +68,38 @@ pub enum OpKind {
     },
     /// Refine each thought in place — the self-loop `(v, v)` of §3.2.
     Improve,
+    /// Refine, but never return something worse than what you were given.
+    ///
+    /// [`Self::Improve`] and [`Self::ValidateAndImprove`] both keep the LAST
+    /// attempt, which is only sound if refinement improves monotonically. It
+    /// does not: the GoT paper's own Table 9 shows improve steps returning
+    /// answers with 6, 8, and 10 errors after starting from fewer. Keeping the
+    /// last attempt means keeping those.
+    ///
+    /// This scores every attempt including the original and returns the best,
+    /// so `score(output) >= score(input)` by construction — the operation can
+    /// stall but can never regress.
+    ///
+    /// # Termination
+    ///
+    /// `num_tries` is what bounds the loop, and it is doing the real work. It
+    /// is tempting to argue that freezing accepted parts gives termination for
+    /// free — the accepted set only grows, so the loop must finish. That
+    /// argument is wrong twice over: a round that fixes nothing leaves the set
+    /// unchanged and makes no progress, and a rewrite can introduce new
+    /// material, so the total is not a fixed bound to converge against.
+    /// Monotonicity buys non-regression, not termination. The budget buys
+    /// termination.
+    Repair {
+        num_tries: u32,
+        /// Required: without a score there is no "worse", and the operation
+        /// degenerates into [`Self::Improve`].
+        scorer: ScoringFn,
+        higher_is_better: bool,
+        /// Stop early once a thought is good enough, so a run that succeeds on
+        /// the first try costs one score instead of `num_tries` round-trips.
+        accept_at: Option<f64>,
+    },
     /// Keep the `n` best-scoring inputs.
     ///
     /// `higher_is_better: false` for error-scope metrics, where zero is perfect.
@@ -90,6 +122,7 @@ impl OpKind {
             Self::Score { .. } => "Score",
             Self::ValidateAndImprove { .. } => "ValidateAndImprove",
             Self::Improve => "Improve",
+            Self::Repair { .. } => "Repair",
             Self::KeepBestN { .. } => "KeepBestN",
             Self::KeepValid => "KeepValid",
             Self::GroundTruth { .. } => "GroundTruth",

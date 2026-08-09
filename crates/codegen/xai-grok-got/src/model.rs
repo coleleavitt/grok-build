@@ -44,6 +44,26 @@ pub trait LanguageModel: Send + Sync {
     async fn query(&self, prompt: &str, num_responses: u32) -> Result<Completion, ModelError>;
 }
 
+/// Why a repair is being attempted, handed to [`Prompter::improve_prompt`].
+///
+/// A blind "that was wrong, try again" gives the model nothing to act on and
+/// makes each attempt an independent draw, which is why unguided refinement
+/// wanders instead of converging. Naming the failure turns the retry into a
+/// constrained rewrite.
+///
+/// Beware the fixed point: feedback that hands the model the ground truth
+/// verbatim converges to the model restating it, at which point the model has
+/// contributed nothing the verifier did not already know. Feedback should say
+/// what is wrong, not dictate what to say instead.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RepairContext<'a> {
+    /// Why the previous attempt was rejected. `None` on an unprompted refine.
+    pub failure: Option<&'a str>,
+    /// 0 for the first attempt, incrementing per retry, so a prompt can
+    /// escalate (hedge, or drop the claim) rather than repeat itself.
+    pub attempt: u32,
+}
+
 /// Builds the prompt for each operation that talks to the model.
 ///
 /// Kept synchronous and separate from [`Parser`] so a use case can be unit
@@ -56,7 +76,10 @@ pub trait Prompter: Send + Sync {
     /// sampling the prompt k times.
     fn generate_prompt(&self, branches: u32, state: &ThoughtState) -> String;
     fn aggregation_prompt(&self, states: &[ThoughtState]) -> String;
-    fn improve_prompt(&self, state: &ThoughtState) -> String;
+    /// `repair` carries why the previous attempt was rejected, so the prompt
+    /// can constrain the rewrite instead of asking for a blind retry — the
+    /// difference between "try again" and "do not assert X; ground truth is Y".
+    fn improve_prompt(&self, state: &ThoughtState, repair: &RepairContext<'_>) -> String;
     fn validation_prompt(&self, state: &ThoughtState) -> String;
     fn score_prompt(&self, states: &[ThoughtState]) -> String;
 }

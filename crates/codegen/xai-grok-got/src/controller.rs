@@ -1,7 +1,7 @@
 //! The Controller: drives a [`GraphOfOperations`] to completion against a model.
 
 use crate::graph::{GraphOfOperations, OpId};
-use crate::model::{LanguageModel, ModelError, Parser, Prompter, Usage};
+use crate::model::{LanguageModel, ModelError, Parser, Prompter, RepairContext, Usage};
 use crate::operations::OpKind;
 use crate::thought::{Thought, ThoughtState, merge_states};
 use std::collections::VecDeque;
@@ -173,6 +173,7 @@ impl<'a> Controller<'a> {
             OpKind::Score { .. } => self.run_score(id, previous).await,
             OpKind::ValidateAndImprove { .. } => self.run_validate_and_improve(id, previous).await,
             OpKind::Improve => self.run_improve(previous).await,
+            OpKind::Repair { .. } => self.run_repair(id, previous).await,
             OpKind::KeepBestN {
                 n,
                 higher_is_better,
@@ -397,7 +398,13 @@ impl<'a> Controller<'a> {
                 if !improve || valid || tries >= num_tries {
                     break;
                 }
-                let prompt = self.prompter.improve_prompt(&current.state);
+                let prompt = self.prompter.improve_prompt(
+                    &current.state,
+                    &RepairContext {
+                        failure: Some("validation rejected the previous attempt"),
+                        attempt: tries,
+                    },
+                );
                 let texts = self.ask(&prompt, 1).await?;
                 let update = self.parser.parse_improve(&current.state, &texts);
                 let state = merge_states(&current.state, &update);
@@ -415,7 +422,9 @@ impl<'a> Controller<'a> {
     async fn run_improve(&mut self, previous: Vec<Thought>) -> Result<Vec<Thought>, GotError> {
         let mut out = Vec::new();
         for thought in previous {
-            let prompt = self.prompter.improve_prompt(&thought.state);
+            let prompt = self
+                .prompter
+                .improve_prompt(&thought.state, &RepairContext::default());
             let texts = self.ask(&prompt, 1).await?;
             let update = self.parser.parse_improve(&thought.state, &texts);
             let state = merge_states(&thought.state, &update);
@@ -423,6 +432,95 @@ impl<'a> Controller<'a> {
             out.push(Thought::new(id, state));
         }
         Ok(out)
+    }
+
+    /// Refine while tracking the best attempt, so the result can never be worse
+    /// than the input. See [`OpKind::Repair`] for why the last attempt is the
+    /// wrong thing to keep.
+    async fn run_repair(
+        &mut self,
+        id: OpId,
+        previous: Vec<Thought>,
+    ) -> Result<Vec<Thought>, GotError> {
+        let (num_tries, higher_is_better, accept_at) = match &self.graph.node(id).kind {
+            OpKind::Repair {
+                num_tries,
+                higher_is_better,
+                accept_at,
+                ..
+            } => (*num_tries, *higher_is_better, *accept_at),
+            _ => unreachable!("matched Repair"),
+        };
+        let worst = if higher_is_better {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+        let better = |candidate: f64, incumbent: f64| {
+            if higher_is_better {
+                candidate > incumbent
+            } else {
+                candidate < incumbent
+            }
+        };
+        let good_enough = |score: f64| {
+            accept_at.is_some_and(|threshold| {
+                if higher_is_better {
+                    score >= threshold
+                } else {
+                    score <= threshold
+                }
+            })
+        };
+
+        let mut out = Vec::new();
+        for thought in previous {
+            let mut best_state = thought.state.clone();
+            let mut best_score = self.repair_score(id, &best_state, worst);
+            let mut current = thought.state.clone();
+
+            for attempt in 0..num_tries {
+                if good_enough(best_score) {
+                    break;
+                }
+                let prompt = self.prompter.improve_prompt(
+                    &current,
+                    &RepairContext {
+                        failure: Some("the previous attempt did not meet the bar"),
+                        attempt,
+                    },
+                );
+                let texts = self.ask(&prompt, 1).await?;
+                let update = self.parser.parse_improve(&current, &texts);
+                current = merge_states(&current, &update);
+
+                let score = self.repair_score(id, &current, worst);
+                if better(score, best_score) {
+                    best_score = score;
+                    best_state = current.clone();
+                }
+                // `current` carries the LATEST attempt, not the best: refining
+                // from the best would re-ask the same question and redraw the
+                // same answer. Exploring costs nothing because the best is
+                // preserved separately.
+            }
+
+            let minted = self.mint();
+            let mut repaired = Thought::new(minted, best_state);
+            repaired.set_score(best_score);
+            out.push(repaired);
+        }
+        Ok(out)
+    }
+
+    fn repair_score(&self, id: OpId, state: &ThoughtState, fallback: f64) -> f64 {
+        match &self.graph.node(id).kind {
+            OpKind::Repair { scorer, .. } => scorer(std::slice::from_ref(state))
+                .first()
+                .copied()
+                .unwrap_or(fallback),
+            _ => unreachable!("matched Repair"),
+        }
     }
 
     fn run_keep_best_n(

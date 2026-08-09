@@ -44,13 +44,13 @@
 //!
 //! ```
 //! use xai_grok_got::{Controller, GraphOfOperations, OpKind, ScriptedModel, ThoughtState};
-//! # use xai_grok_got::{Parser, Prompter};
+//! # use xai_grok_got::{Parser, Prompter, RepairContext};
 //! # use serde_json::json;
 //! # struct P;
 //! # impl Prompter for P {
 //! #     fn generate_prompt(&self, _: u32, _: &ThoughtState) -> String { "split".into() }
 //! #     fn aggregation_prompt(&self, _: &[ThoughtState]) -> String { "merge".into() }
-//! #     fn improve_prompt(&self, _: &ThoughtState) -> String { String::new() }
+//! #     fn improve_prompt(&self, _: &ThoughtState, _: &RepairContext<'_>) -> String { String::new() }
 //! #     fn validation_prompt(&self, _: &ThoughtState) -> String { String::new() }
 //! #     fn score_prompt(&self, _: &[ThoughtState]) -> String { String::new() }
 //! # }
@@ -106,7 +106,9 @@ mod thought;
 
 pub use controller::{Controller, GotError};
 pub use graph::{GraphOfOperations, OpId, OperationNode};
-pub use model::{Completion, LanguageModel, ModelError, Parser, Prompter, ScriptedModel, Usage};
+pub use model::{
+    Completion, LanguageModel, ModelError, Parser, Prompter, RepairContext, ScriptedModel, Usage,
+};
 pub use operations::{GroundTruthFn, OpKind, ScoringFn, SelectorFn, ValidateFn};
 pub use scoring::{positive_score, set_intersection_error_scope, sorting_error_scope};
 pub use thought::{Thought, ThoughtState, merge_states};

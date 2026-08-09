@@ -6,8 +6,8 @@
 
 use serde_json::json;
 use xai_grok_got::{
-    Controller, GraphOfOperations, OpKind, Parser, Prompter, ScriptedModel, ThoughtState, Usage,
-    positive_score, sorting_error_scope,
+    Controller, GraphOfOperations, OpKind, Parser, Prompter, RepairContext, ScriptedModel,
+    ThoughtState, Usage, positive_score, sorting_error_scope,
 };
 
 /// Reads/writes a list of numbers under the `"list"` key.
@@ -20,8 +20,13 @@ impl Prompter for ListPrompter {
     fn aggregation_prompt(&self, states: &[ThoughtState]) -> String {
         format!("merge {} sorted lists", states.len())
     }
-    fn improve_prompt(&self, state: &ThoughtState) -> String {
-        format!("fix: {:?}", state.get("list"))
+    fn improve_prompt(&self, state: &ThoughtState, repair: &RepairContext<'_>) -> String {
+        format!(
+            "fix (attempt {}, {}): {:?}",
+            repair.attempt,
+            repair.failure.unwrap_or("unprompted"),
+            state.get("list"),
+        )
     }
     fn validation_prompt(&self, state: &ThoughtState) -> String {
         format!("valid? {:?}", state.get("list"))
@@ -449,4 +454,123 @@ fn positive_score_reports_the_papers_higher_is_better_view() {
     let error = sorting_error_scope(&input, &[1, 2, 3]);
     assert_eq!(error, 1);
     assert_eq!(positive_score(input.len(), error), 3);
+}
+
+/// GoT's Table 9 reproduced: refinement is not monotone. Successive "improve"
+/// steps return answers with MORE errors than they started with, and `Improve`
+/// keeps whichever came last.
+#[tokio::test]
+async fn improve_can_return_a_worse_answer_than_it_was_given() {
+    let input: Vec<u32> = vec![1, 2, 3];
+    let mut graph = GraphOfOperations::new();
+    let generated = graph.append(generate(1, 1));
+    graph.add(OpKind::Improve, &[generated]);
+
+    let model = ScriptedModel::new(vec![
+        vec!["1,2,3".into()], // a correct answer
+        vec!["1,3".into()],   // the "improvement" drops an element
+    ]);
+    let mut controller = Controller::new(
+        graph,
+        &model,
+        &ListPrompter,
+        &ListParser,
+        list_state(input.clone()),
+    );
+    controller.run().await.unwrap();
+
+    let finals = controller.final_thoughts();
+    let result = state_list(&finals[0].state);
+    assert_eq!(result, vec![1, 3], "Improve keeps the last attempt");
+    assert!(
+        sorting_error_scope(&input, &result) > 0,
+        "which is measurably worse than what it started from",
+    );
+}
+
+/// `Repair` on the identical script returns the input it was given, because it
+/// scores every attempt and keeps the best. Non-regression by construction.
+#[tokio::test]
+async fn repair_never_returns_worse_than_its_input() {
+    let input: Vec<u32> = vec![1, 2, 3];
+    let mut graph = GraphOfOperations::new();
+    let generated = graph.append(generate(1, 1));
+    graph.add(
+        OpKind::Repair {
+            num_tries: 3,
+            scorer: error_scope_scorer(input.clone()),
+            higher_is_better: false,
+            accept_at: None,
+        },
+        &[generated],
+    );
+
+    let model = ScriptedModel::new(vec![
+        vec!["1,2,3".into()], // correct
+        vec!["1,3".into()],   // worse
+        vec!["3,1".into()],   // worse still
+        vec!["1".into()],     // worst
+    ]);
+    let mut controller = Controller::new(
+        graph,
+        &model,
+        &ListPrompter,
+        &ListParser,
+        list_state(input.clone()),
+    );
+    controller.run().await.unwrap();
+
+    let finals = controller.final_thoughts();
+    assert_eq!(
+        state_list(&finals[0].state),
+        vec![1, 2, 3],
+        "every attempt was worse, so the original survives",
+    );
+    assert_eq!(finals[0].score(), 0.0, "and its score comes with it");
+}
+
+/// The upside case: a bad start genuinely repaired, and the budget respected.
+#[tokio::test]
+async fn repair_adopts_a_genuine_improvement_and_stops_at_the_bar() {
+    let input: Vec<u32> = vec![1, 2, 3];
+    let mut graph = GraphOfOperations::new();
+    let generated = graph.append(generate(1, 1));
+    graph.add(
+        OpKind::Repair {
+            num_tries: 5,
+            scorer: error_scope_scorer(input.clone()),
+            higher_is_better: false,
+            // Stop as soon as the answer is perfect rather than burning budget.
+            accept_at: Some(0.0),
+        },
+        &[generated],
+    );
+
+    let model = ScriptedModel::new(vec![
+        vec!["3,2,1".into()], // bad start
+        vec!["1,3,2".into()], // better
+        vec!["1,2,3".into()], // perfect -> loop must stop here
+    ]);
+    let mut controller =
+        Controller::new(graph, &model, &ListPrompter, &ListParser, list_state(input));
+    controller.run().await.unwrap();
+
+    assert_eq!(
+        state_list(&controller.final_thoughts()[0].state),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        model.calls(),
+        3,
+        "the acceptance bar stops the loop instead of spending all 5 tries",
+    );
+}
+
+fn error_scope_scorer(input: Vec<u32>) -> xai_grok_got::ScoringFn {
+    Box::new(move |states| {
+        states
+            .iter()
+            .map(|state| sorting_error_scope(&input, &state_list(state)) as f64)
+            .collect()
+    })
 }
