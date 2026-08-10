@@ -31,9 +31,9 @@
 
 use crate::types::MemoryGraph;
 
-/// Below this node count a top-k endpoint share cannot distinguish a star from
-/// a path, so no hub verdict is issued. See [`GraphHealth::regime`].
-const MIN_NODES_FOR_HUB_VERDICT: usize = 5;
+/// Default for [`HealthThresholds::min_nodes_for_hub_verdict`]. 5 is the
+/// smallest size at which the default clamp separates a star from a path.
+const DEFAULT_MIN_NODES_FOR_HUB_VERDICT: usize = 5;
 
 /// Coarse classification of a graph's shape. See the module docs: this is a
 /// prompt to look at [`GraphHealth::degrees`], not a measurement.
@@ -115,6 +115,21 @@ pub struct HealthThresholds {
     pub hub_dominated_at_excess: f64,
     /// How many top nodes count as "the hubs".
     pub hub_k: usize,
+    /// Below this node count no hub verdict is issued at all.
+    ///
+    /// NOT because a top-k share is inherently blind at small sizes — it is the
+    /// `hub_k` CLAMP that blinds it. At `n = 4` the clamp forces `hub_k = 2`,
+    /// and a star `[3,1,1,1]` and a path `[2,2,1,1]` both put 4 of 6 endpoints
+    /// in the top 2, so the two shapes are literally the same number. A top-1
+    /// share would separate them cleanly (0.333 against 0.111) — but lowering
+    /// `hub_k` to keep tiny graphs decidable would blunt detection on the
+    /// larger graphs the metric actually exists for, which is the worse trade.
+    ///
+    /// So this is a threshold like the others rather than a hardcoded constant:
+    /// a caller who has chosen a smaller `hub_k` can lower it and get verdicts
+    /// on smaller graphs. Fragmentation is decidable at every size and is
+    /// reported regardless of this floor.
+    pub min_nodes_for_hub_verdict: usize,
 }
 
 impl Default for HealthThresholds {
@@ -123,6 +138,7 @@ impl Default for HealthThresholds {
             fragmented_at_isolated: 0.5,
             hub_dominated_at_excess: 0.25,
             hub_k: 3,
+            min_nodes_for_hub_verdict: DEFAULT_MIN_NODES_FOR_HUB_VERDICT,
         }
     }
 }
@@ -161,9 +177,16 @@ impl GraphHealth {
         };
         // The arithmetic floor any top-k holds by construction.
         let floor = hub_k as f64 / nodes as f64;
-        let hub_excess = if endpoints == 0 || floor >= 1.0 {
+        let hub_excess = if endpoints == 0 {
             0.0
         } else {
+            // `floor == 1.0` would divide by zero, but the clamp above makes it
+            // unreachable: `hub_k <= max(1, nodes/2)`, so `floor < 1` for every
+            // `nodes >= 2`, and `nodes == 1` has no edges and is caught above.
+            // Asserted rather than branched, so a future change to the clamp
+            // fails loudly in tests instead of silently returning 0.0 — which
+            // reads identically to "perfectly uniform".
+            debug_assert!(floor < 1.0, "hub_k clamp must keep the floor below 1");
             ((hub_share - floor) / (1.0 - floor)).clamp(0.0, 1.0)
         };
 
@@ -191,15 +214,14 @@ impl GraphHealth {
     /// remain will trivially concentrate in a few nodes. Reporting that as
     /// hub-dominated would name the symptom instead of the cause.
     pub fn regime(&self) -> GraphRegime {
-        if self.nodes < MIN_NODES_FOR_HUB_VERDICT
+        if self.nodes < self.thresholds.min_nodes_for_hub_verdict
             && self.isolated_fraction < self.thresholds.fragmented_at_isolated
         {
-            // Below this size a top-k endpoint share cannot separate shapes: a
-            // 4-node path (degrees [2,2,1,1]) and a 4-node star ([3,1,1,1])
-            // both score exactly 0.3333, so any hub verdict here would flag one
-            // of them wrongly. Refusing is the same principle as returning
-            // `None` for an empty graph — no verdict beats a meaningless one.
-            // Fragmentation is still decidable, so it is checked first.
+            // Too small for the clamped `hub_k` to separate shapes — see
+            // [`HealthThresholds::min_nodes_for_hub_verdict`]. Refusing is the
+            // same principle as returning `None` for an empty graph: no verdict
+            // beats a meaningless one. Fragmentation stays decidable, which is
+            // why it is checked first.
             return GraphRegime::Healthy;
         }
         if self.isolated_fraction >= self.thresholds.fragmented_at_isolated {
@@ -236,6 +258,50 @@ mod tests {
 
     fn store() -> BrainStore {
         BrainStore::open_in_memory().expect("open in-memory brain")
+    }
+
+    /// A star: one hub joined to `leaves` otherwise-unconnected pages.
+    fn star(leaves: usize) -> BrainStore {
+        let store = store();
+        let hub = page(&store, "hub");
+        for i in 0..leaves {
+            let leaf = page(&store, &format!("leaf {i}"));
+            store.add_relation(hub, leaf).unwrap();
+        }
+        store
+    }
+
+    /// A path of `n` pages joined end to end. Not a ring: the two endpoints
+    /// have degree 1, which is what makes it the tightest healthy shape.
+    fn path(n: usize) -> BrainStore {
+        let store = store();
+        let ids: Vec<i64> = (0..n).map(|i| page(&store, &format!("p{i}"))).collect();
+        for window in ids.windows(2) {
+            store.add_relation(window[0], window[1]).unwrap();
+        }
+        store
+    }
+
+    /// A ring of `n` pages: a path with the ends joined, so every degree is 2.
+    fn ring(n: usize) -> BrainStore {
+        let store = path(n);
+        let ids: Vec<i64> = store
+            .graph()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|node| node.id)
+            .collect();
+        let (first, last) = (ids.iter().min().unwrap(), ids.iter().max().unwrap());
+        store.add_relation(*first, *last).unwrap();
+        store
+    }
+
+    fn health_of(store: &BrainStore) -> GraphHealth {
+        store
+            .graph_health(HealthThresholds::default())
+            .unwrap()
+            .expect("non-empty graph")
     }
 
     fn page(store: &BrainStore, title: &str) -> i64 {
@@ -290,16 +356,7 @@ mod tests {
     /// everything, which is the same as returning nothing useful.
     #[test]
     fn a_star_topology_reads_as_hub_dominated() {
-        let store = store();
-        let hub = page(&store, "hub");
-        for i in 0..5 {
-            let leaf = page(&store, &format!("leaf {i}"));
-            store.add_relation(hub, leaf).unwrap();
-        }
-        let health = store
-            .graph_health(HealthThresholds::default())
-            .unwrap()
-            .expect("non-empty graph");
+        let health = health_of(&star(5));
 
         assert_eq!(health.nodes, 6);
         assert_eq!(health.edges, 5);
@@ -328,17 +385,7 @@ mod tests {
     /// An evenly-linked ring: every page connected, no page dominant.
     #[test]
     fn an_evenly_connected_graph_reads_healthy() {
-        let store = store();
-        let ids: Vec<i64> = (0..8).map(|i| page(&store, &format!("page {i}"))).collect();
-        for window in ids.windows(2) {
-            store.add_relation(window[0], window[1]).unwrap();
-        }
-        store.add_relation(ids[ids.len() - 1], ids[0]).unwrap();
-
-        let health = store
-            .graph_health(HealthThresholds::default())
-            .unwrap()
-            .expect("non-empty graph");
+        let health = health_of(&ring(8));
 
         assert_eq!(health.nodes, 8);
         assert_eq!(health.edges, 8);
@@ -464,45 +511,11 @@ mod tests {
     #[test]
     fn ring_verdicts_no_longer_depend_on_graph_size() {
         for n in 5..=8usize {
-            let store = store();
-            let ids: Vec<i64> = (0..n).map(|i| page(&store, &format!("r{i}"))).collect();
-            for window in ids.windows(2) {
-                store.add_relation(window[0], window[1]).unwrap();
-            }
-            store.add_relation(ids[n - 1], ids[0]).unwrap();
-
-            let health = store
-                .graph_health(HealthThresholds::default())
-                .unwrap()
-                .unwrap();
+            let health = health_of(&ring(n));
             assert_eq!(
                 health.regime(),
                 GraphRegime::Healthy,
                 "ring of {n} must read healthy at every size (excess {})",
-                health.hub_excess,
-            );
-        }
-    }
-
-    /// The star must still be caught at every size, or the fix traded a false
-    /// positive for a false negative.
-    #[test]
-    fn stars_are_still_caught_at_every_size() {
-        for leaves in [5usize, 10, 20] {
-            let store = store();
-            let hub = page(&store, "hub");
-            for i in 0..leaves {
-                let leaf = page(&store, &format!("leaf {i}"));
-                store.add_relation(hub, leaf).unwrap();
-            }
-            let health = store
-                .graph_health(HealthThresholds::default())
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                health.regime(),
-                GraphRegime::HubDominated,
-                "star with {leaves} leaves must stay hub-dominated (excess {})",
                 health.hub_excess,
             );
         }
@@ -573,22 +586,16 @@ mod tests {
         );
     }
 
-    /// Generation-2 BLOCKER: the 0.35 cutoff sat inside the star ramp, so
-    /// small stars read Healthy. Every star at or above the verdict floor must
-    /// be caught.
+    /// Every star at or above the verdict floor must be caught, at every size.
+    ///
+    /// One sweep over the union of what used to be two overlapping tests
+    /// (4..=8 and 5/10/20). Generation-2 BLOCKER: the earlier 0.35 cutoff sat
+    /// inside the star ramp, so small stars read Healthy — a false negative
+    /// traded for the false positive the raw share produced.
     #[test]
-    fn the_smallest_meaningful_stars_are_still_caught() {
-        for leaves in 4..=8usize {
-            let store = store();
-            let hub = page(&store, "hub");
-            for i in 0..leaves {
-                let leaf = page(&store, &format!("leaf {i}"));
-                store.add_relation(hub, leaf).unwrap();
-            }
-            let health = store
-                .graph_health(HealthThresholds::default())
-                .unwrap()
-                .unwrap();
+    fn every_judgeable_star_is_caught() {
+        for leaves in [4usize, 5, 6, 7, 8, 10, 20] {
+            let health = health_of(&star(leaves));
             assert_eq!(
                 health.regime(),
                 GraphRegime::HubDominated,
@@ -654,12 +661,7 @@ mod tests {
     /// Thresholds are configurable because the defaults are judgement calls.
     #[test]
     fn thresholds_are_configurable() {
-        let store = store();
-        let hub = page(&store, "hub");
-        for i in 0..5 {
-            let leaf = page(&store, &format!("leaf {i}"));
-            store.add_relation(hub, leaf).unwrap();
-        }
+        let store = star(5);
         let permissive = HealthThresholds {
             hub_dominated_at_excess: 0.99,
             ..HealthThresholds::default()
@@ -675,6 +677,37 @@ mod tests {
             permissive,
             "the summary carries the thresholds it was measured with",
         );
+    }
+
+    /// The verdict floor is a threshold, not a hardcoded constant.
+    ///
+    /// It gates on `HealthThresholds`, so a caller who has chosen a smaller
+    /// `hub_k` — where small graphs ARE decidable — can lower it and get
+    /// verdicts there. Previously it read a private const that no field in the
+    /// documented override surface could reach.
+    #[test]
+    fn the_verdict_floor_is_reachable_through_the_thresholds() {
+        // A 4-node star is refused under the defaults...
+        let store = star(3);
+        assert_eq!(health_of(&store).regime(), GraphRegime::Healthy);
+
+        // ...and at hub_k = 1, where a top-1 share genuinely separates a star
+        // from a path, lowering the floor makes it decidable again.
+        let decisive = HealthThresholds {
+            hub_k: 1,
+            min_nodes_for_hub_verdict: 4,
+            ..HealthThresholds::default()
+        };
+        let star_health = store.graph_health(decisive).unwrap().unwrap();
+        let path_health = path(4).graph_health(decisive).unwrap().unwrap();
+        assert!(
+            star_health.hub_excess > path_health.hub_excess,
+            "at hub_k=1 the shapes separate: star {} vs path {}",
+            star_health.hub_excess,
+            path_health.hub_excess,
+        );
+        assert_eq!(star_health.regime(), GraphRegime::HubDominated);
+        assert_eq!(path_health.regime(), GraphRegime::Healthy);
     }
 
     /// `hub_k` is clamped to at most half the graph.
@@ -709,12 +742,7 @@ mod tests {
     /// by a knob documented as making it more sensitive.
     #[test]
     fn a_large_hub_k_cannot_disable_detection() {
-        let store = store();
-        let hub = page(&store, "hub");
-        for i in 0..5 {
-            let leaf = page(&store, &format!("leaf {i}"));
-            store.add_relation(hub, leaf).unwrap();
-        }
+        let store = star(5);
         for hub_k in [3usize, 6, 7, 50, usize::MAX] {
             let health = store
                 .graph_health(HealthThresholds {

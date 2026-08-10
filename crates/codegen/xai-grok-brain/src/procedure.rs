@@ -51,11 +51,21 @@ impl ProcedureOutcome {
         }
     }
 
-    /// Parse a stored value, tolerating case drift. Anything unrecognised reads
-    /// as [`Self::Failed`] — the conservative direction, since an unreadable
-    /// outcome must not make a plan look reusable.
+    /// Parse a stored value. Anything that is not byte-exactly what
+    /// [`Self::as_str`] writes reads as [`Self::Failed`] — the conservative
+    /// direction, since an unreadable outcome must not make a plan look
+    /// reusable.
+    ///
+    /// Deliberately NOT case-tolerant. Recall filters in SQL with
+    /// `outcome = 'succeeded'`, which is byte-exact and cannot be made
+    /// case-insensitive without also widening what counts as reusable. A
+    /// lenient parser next to a strict filter means the two readers of this
+    /// column disagree: `get_procedure` would report a row stored as
+    /// `"Succeeded"` as a success while `recall_procedures` silently excluded
+    /// it. `as_str` is the only writer, so any other spelling is foreign to
+    /// this store and both readers now agree to distrust it.
     pub fn parse(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
+        match value {
             "succeeded" => Self::Succeeded,
             _ => Self::Failed,
         }
@@ -119,6 +129,11 @@ pub struct RecalledProcedure {
     pub similarity: f64,
 }
 
+/// Default for [`ProcedureRecallOptions::max_candidates`]. Large enough that a
+/// realistic store is never truncated, small enough to bound one recall's
+/// memory regardless of how big the table grows.
+const DEFAULT_MAX_RECALL_CANDIDATES: usize = 512;
+
 /// Options for [`crate::BrainStore::recall_procedures`].
 #[derive(Debug, Clone)]
 pub struct ProcedureRecallOptions {
@@ -131,6 +146,19 @@ pub struct ProcedureRecallOptions {
     /// best-of-a-bad-set hands the agent a plan for a different problem, which
     /// is worse than returning nothing and letting it plan fresh.
     pub min_similarity: f64,
+    /// Hard cap on how many rows are pulled out of SQLite before ranking.
+    ///
+    /// Similarity is Jaccard over token sets, which SQLite cannot express, so
+    /// ranking happens in Rust and every candidate must be materialised first —
+    /// signature and plan strings included. Scope narrows VISIBILITY, not
+    /// cardinality, so without this a store with many successful procedures in
+    /// one workspace loads all of them on every recall.
+    ///
+    /// The cap takes the most recently updated rows, so the cut is deterministic
+    /// rather than arbitrary. The cost is real and worth stating: a very old
+    /// procedure can fall outside the window even if it would have scored
+    /// highest. Raise it when recall quality matters more than the load.
+    pub max_candidates: usize,
 }
 
 impl ProcedureRecallOptions {
@@ -140,6 +168,7 @@ impl ProcedureRecallOptions {
             scope_id: None,
             limit: 3,
             min_similarity: 0.2,
+            max_candidates: DEFAULT_MAX_RECALL_CANDIDATES,
         }
     }
 
@@ -158,6 +187,12 @@ impl ProcedureRecallOptions {
     #[must_use]
     pub fn min_similarity(mut self, min_similarity: f64) -> Self {
         self.min_similarity = min_similarity;
+        self
+    }
+
+    #[must_use]
+    pub fn max_candidates(mut self, max_candidates: usize) -> Self {
+        self.max_candidates = max_candidates;
         self
     }
 }
@@ -340,9 +375,11 @@ impl crate::BrainStore {
             return Ok(Vec::new());
         }
 
-        // Scope filter in SQL; similarity in Rust. The token math is not
-        // expressible in SQLite without an extension, and the candidate set is
-        // bounded by the scope, so ranking in memory keeps the store portable.
+        // Scope filter in SQL; similarity in Rust, because Jaccard over token
+        // sets is not expressible in stock SQLite. Scope bounds VISIBILITY, not
+        // cardinality, so the row count is bounded explicitly by
+        // `max_candidates` — see its docs for what that trades away.
+        //
         // Globals are always visible; a workspace row only on exact match. The
         // previous `?1 IS NULL OR ...` form made an UNSCOPED query match every
         // row, leaking one checkout's procedures into another's recall.
@@ -351,14 +388,19 @@ impl crate::BrainStore {
                     failures
              FROM memory_procedure
              WHERE outcome = ?1 AND (scope_id IS NULL OR scope_id IS ?2)
-             ORDER BY updated_at DESC, id DESC",
+             ORDER BY updated_at DESC, id DESC
+             LIMIT ?3",
         )?;
         let scope = normalize_procedure_scope(options.scope_id.as_deref());
         let candidates = stmt
             .query_map(
                 // Bound from the enum rather than inlined, so the filter cannot
                 // drift from what `as_str` writes.
-                params![ProcedureOutcome::Succeeded.as_str(), scope],
+                params![
+                    ProcedureOutcome::Succeeded.as_str(),
+                    scope,
+                    options.max_candidates as i64
+                ],
                 row_to_procedure,
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -414,6 +456,63 @@ mod tests {
 
     fn store() -> BrainStore {
         BrainStore::open_in_memory().expect("open in-memory brain")
+    }
+
+    /// Create a `memory_procedure` table in the shape a previous build left
+    /// behind, so migration tests exercise the real upgrade path.
+    ///
+    /// `with_failures` selects between the two shipped shapes: the original had
+    /// no `failures` column, and defaults drifted from 1 to 0 when `uses`
+    /// started counting successes only. Pasting this DDL per test let those two
+    /// facts diverge silently between copies.
+    fn forge_legacy_table(path: &std::path::Path, with_failures: bool) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let failures = if with_failures {
+            "failures INTEGER NOT NULL DEFAULT 0,"
+        } else {
+            ""
+        };
+        let uses_default = if with_failures { 0 } else { 1 };
+        conn.execute_batch(&format!(
+            "CREATE TABLE memory_procedure (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 signature TEXT NOT NULL, signature_key TEXT NOT NULL,
+                 plan TEXT NOT NULL, outcome TEXT NOT NULL, scope_id TEXT,
+                 uses INTEGER NOT NULL DEFAULT {uses_default},
+                 {failures}
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL);"
+        ))
+        .unwrap();
+        conn
+    }
+
+    /// Insert a legacy row through the forged table. `failures` is ignored when
+    /// the forged shape predates that column.
+    fn forge_row(
+        conn: &rusqlite::Connection,
+        signature: &str,
+        scope: Option<&str>,
+        uses: i64,
+        failures: Option<i64>,
+    ) {
+        const TS: &str = "2026-01-01T00:00:00+00:00";
+        match failures {
+            Some(failures) => conn.execute(
+                "INSERT INTO memory_procedure
+                 (signature, signature_key, plan, outcome, scope_id, uses, failures,
+                  created_at, updated_at)
+                 VALUES (?1, ?1, 'p', 'succeeded', ?2, ?3, ?4, ?5, ?5)",
+                rusqlite::params![signature, scope, uses, failures, TS],
+            ),
+            None => conn.execute(
+                "INSERT INTO memory_procedure
+                 (signature, signature_key, plan, outcome, scope_id, uses,
+                  created_at, updated_at)
+                 VALUES (?1, ?1, 'p', 'succeeded', ?2, ?3, ?4, ?4)",
+                rusqlite::params![signature, scope, uses, TS],
+            ),
+        }
+        .unwrap();
     }
 
     #[test]
@@ -846,22 +945,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("brain.sqlite3");
         {
-            // Forge the pre-index table shape with a duplicate identity.
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE memory_procedure (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     signature TEXT NOT NULL, signature_key TEXT NOT NULL,
-                     plan TEXT NOT NULL, outcome TEXT NOT NULL, scope_id TEXT,
-                     uses INTEGER NOT NULL DEFAULT 1,
-                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-                 INSERT INTO memory_procedure
-                     (signature, signature_key, plan, outcome, scope_id, uses,
-                      created_at, updated_at)
-                 VALUES ('t','t','p','succeeded',NULL,3,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'),
-                        ('t','t','p','succeeded',NULL,4,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
-            )
-            .unwrap();
+            // The pre-index shape, with a duplicate identity.
+            let conn = forge_legacy_table(&path, false);
+            forge_row(&conn, "t", None, 3, None);
+            forge_row(&conn, "t", None, 4, None);
         }
 
         let store = BrainStore::open(&path).expect("a duplicate must not brick the store");
@@ -894,23 +981,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("brain.sqlite3");
         {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE memory_procedure (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     signature TEXT NOT NULL, signature_key TEXT NOT NULL,
-                     plan TEXT NOT NULL, outcome TEXT NOT NULL, scope_id TEXT,
-                     uses INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0,
-                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-                 INSERT INTO memory_procedure
-                     (signature, signature_key, plan, outcome, scope_id, uses, failures,
-                      created_at, updated_at)
-                 VALUES ('solo','solo','p','succeeded','',1,0,
-                         '2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00'),
-                        ('slash','slash','p','succeeded','/repo/a/',1,0,
-                         '2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00');",
-            )
-            .unwrap();
+            let conn = forge_legacy_table(&path, true);
+            forge_row(&conn, "solo", Some(""), 1, Some(0));
+            forge_row(&conn, "slash", Some("/repo/a/"), 1, Some(0));
         }
 
         let store = BrainStore::open(&path).unwrap();
@@ -944,22 +1017,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("brain.sqlite3");
         {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE memory_procedure (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     signature TEXT NOT NULL, signature_key TEXT NOT NULL,
-                     plan TEXT NOT NULL, outcome TEXT NOT NULL, scope_id TEXT,
-                     uses INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0,
-                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-                 INSERT INTO memory_procedure
-                     (signature, signature_key, plan, outcome, scope_id, uses, failures,
-                      created_at, updated_at)
-                 VALUES ('t','t','p','succeeded',NULL,1,0,'2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00'),
-                        ('t','t','p','succeeded',NULL,1,40,'2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00'),
-                        ('t','t','p','succeeded',NULL,1,60,'2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00');",
-            )
-            .unwrap();
+            let conn = forge_legacy_table(&path, true);
+            for failures in [0, 40, 60] {
+                forge_row(&conn, "t", None, 1, Some(failures));
+            }
         }
 
         let store = BrainStore::open(&path).unwrap();
@@ -1271,6 +1332,149 @@ mod tests {
             DateTime::<Utc>::MIN_UTC,
         );
         assert!(super::parse_procedure_ts("not-a-timestamp") < Utc::now());
+    }
+
+    /// A3: `get_procedure` and `recall_procedures` are two readers of one
+    /// column and must agree about what it says. A lenient parser beside a
+    /// byte-exact SQL filter meant a row stored as "Succeeded" read as a
+    /// success through one API and was silently excluded by the other.
+    #[test]
+    fn both_readers_agree_on_a_non_canonical_outcome() {
+        let store = store();
+        let id = store
+            .record_procedure("tampered", "p", ProcedureOutcome::Succeeded, None)
+            .unwrap();
+        for spelling in [
+            "Succeeded",
+            "SUCCEEDED",
+            " succeeded",
+            "succeeded ",
+            "SUCCESS",
+        ] {
+            store
+                .conn()
+                .execute(
+                    "UPDATE memory_procedure SET outcome = ?1 WHERE id = ?2",
+                    rusqlite::params![spelling, id],
+                )
+                .unwrap();
+
+            let typed = store.get_procedure(id).unwrap().unwrap().outcome;
+            let recalled = store
+                .recall_procedures(&ProcedureRecallOptions::new("tampered"))
+                .unwrap();
+            assert_eq!(
+                typed,
+                ProcedureOutcome::Failed,
+                "{spelling:?} is not what as_str writes, so it must not read as success",
+            );
+            assert!(
+                recalled.is_empty(),
+                "{spelling:?} must be excluded by recall too, agreeing with get_procedure",
+            );
+        }
+
+        // The canonical spelling still works through both readers.
+        store
+            .conn()
+            .execute(
+                "UPDATE memory_procedure SET outcome = 'succeeded' WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_procedure(id).unwrap().unwrap().outcome,
+            ProcedureOutcome::Succeeded,
+        );
+        assert_eq!(
+            store
+                .recall_procedures(&ProcedureRecallOptions::new("tampered"))
+                .unwrap()
+                .len(),
+            1,
+        );
+    }
+
+    /// A13: scope bounds visibility, not cardinality, so the candidate set is
+    /// capped explicitly. The cap takes the most recently updated rows, which
+    /// makes the cut deterministic rather than arbitrary.
+    #[test]
+    fn the_candidate_set_is_bounded_and_takes_the_freshest_rows() {
+        let store = store();
+        for i in 0..10 {
+            store
+                .record_procedure(
+                    "shared goal text",
+                    &format!("plan {i}"),
+                    ProcedureOutcome::Succeeded,
+                    None,
+                )
+                .unwrap();
+        }
+
+        let capped = store
+            .recall_procedures(
+                &ProcedureRecallOptions::new("shared goal text")
+                    .limit(10)
+                    .max_candidates(3),
+            )
+            .unwrap();
+        assert_eq!(capped.len(), 3, "the SQL cap bounds what ranking ever sees");
+
+        let uncapped = store
+            .recall_procedures(&ProcedureRecallOptions::new("shared goal text").limit(10))
+            .unwrap();
+        assert_eq!(
+            uncapped.len(),
+            10,
+            "the default is not truncating a small store"
+        );
+
+        // The cap keeps the freshest, so the last-written plan survives it.
+        let plans: Vec<&str> = capped.iter().map(|r| r.procedure.plan.as_str()).collect();
+        assert!(
+            plans.contains(&"plan 9"),
+            "the cap must take the most recently updated rows, got {plans:?}",
+        );
+    }
+
+    /// A2: the page-side scope normalizer used to check emptiness BEFORE
+    /// stripping trailing slashes, so a root workspace "/" became `Some("")` —
+    /// a workspace scope no checkout can match, invisible to scoped and
+    /// unscoped queries alike. Both normalizers now agree.
+    #[test]
+    fn a_root_workspace_scope_is_global_for_pages_and_procedures_alike() {
+        use crate::{MemoryCategory, NewPage};
+
+        let store = store();
+        for scope in ["/", "//", "  /  ", ""] {
+            assert_eq!(
+                normalize_procedure_scope(Some(scope)),
+                None,
+                "procedures: {scope:?} is not a workspace",
+            );
+        }
+
+        // A page scoped to "/" must be reachable, not stranded in Some("").
+        let page = store
+            .create_page_scoped(
+                NewPage {
+                    title: Some("root scoped".to_owned()),
+                    memory_text: "body".to_owned(),
+                    category: MemoryCategory::Notes,
+                    source: None,
+                },
+                Some("/"),
+            )
+            .unwrap();
+        assert_eq!(
+            page.scope_id, None,
+            "a root workspace reads as global rather than an unmatchable scope",
+        );
+        assert!(
+            store.get_page(page.id).unwrap().is_some(),
+            "and the page is retrievable",
+        );
     }
 
     /// An empty goal must match nothing rather than everything.

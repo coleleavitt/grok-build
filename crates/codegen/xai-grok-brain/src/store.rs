@@ -895,9 +895,17 @@ fn sort_recalled_pages(pages: &mut [RecalledMemoryPage]) {
     });
 }
 
+/// Canonicalize a workspace scope, or `None` for "not workspace-scoped".
+///
+/// Strips trailing slashes BEFORE the emptiness check, not after. The previous
+/// order mapped a root workspace `"/"` to `Some("")` — a workspace scope that
+/// no checkout can ever match, so a page scoped to it was invisible to every
+/// scoped query and to every unscoped one. `"/"` now reads as global, which is
+/// the only reachable answer. Matches `procedure::normalize_procedure_scope`,
+/// so the two scope columns cannot drift apart.
 fn normalize_scope_id(scope_id: &str) -> Option<String> {
-    let trimmed = scope_id.trim();
-    (!trimmed.is_empty()).then(|| trimmed.trim_end_matches('/').to_owned())
+    let trimmed = scope_id.trim().trim_end_matches('/');
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 fn tokenize_query(query: &str) -> Vec<String> {
@@ -1017,6 +1025,13 @@ CREATE INDEX IF NOT EXISTS ix_memory_procedure_key ON memory_procedure(signature
 CREATE INDEX IF NOT EXISTS ix_memory_procedure_outcome ON memory_procedure(outcome);",
     )?;
 
+    add_column_if_missing(
+        conn,
+        "memory_revision",
+        "freshness",
+        "TEXT NOT NULL DEFAULT 'durable'",
+    )?;
+
     // `failures` must exist BEFORE the repair below, which folds it. Ordering
     // this after the fold would silently drop duplicates' failure counts.
     add_column_if_missing(
@@ -1035,13 +1050,6 @@ CREATE INDEX IF NOT EXISTS ix_memory_procedure_outcome ON memory_procedure(outco
     // One transaction, because the steps are not independently valid: a crash
     // between the fold and the delete would leave counters folded AND
     // duplicates present, and the next open would fold them a second time.
-    add_column_if_missing(
-        conn,
-        "memory_revision",
-        "freshness",
-        "TEXT NOT NULL DEFAULT 'durable'",
-    )?;
-
     // IMMEDIATE, not the default DEFERRED: the repair reads (SELECT DISTINCT)
     // before it writes, and a deferred read-then-write upgrade that loses the
     // race returns SQLITE_BUSY_SNAPSHOT WITHOUT invoking the busy handler — so
@@ -1138,30 +1146,41 @@ fn repair_memory_procedure(tx: &Connection) -> Result<()> {
     // Fold every duplicate's counters into the lowest-id survivor. BOTH
     // counters, or the survivor's reliability is computed from successes it
     // kept and failures it lost.
-    tx.execute_batch(
+    // The identity of a procedure row, written ONCE and reused by the fold, the
+    // grouping, the delete and the index. Spelling it out per site is how the
+    // generation-3 miss happened: the `failures` term was added to one copy of
+    // the fold and not the other, so half the counters were silently dropped.
+    const IDENTITY: &str = "signature_key, plan, COALESCE(scope_id, '')";
+    // Duplicates OF the row being updated: same identity, higher id. Disjoint
+    // from the updated set, which is why the fold cannot double-count.
+    const DUP_OF_SURVIVOR: &str = "dup.signature_key = memory_procedure.signature_key
+                   AND dup.plan = memory_procedure.plan
+                   AND COALESCE(dup.scope_id, '') = COALESCE(memory_procedure.scope_id, '')
+                   AND dup.id > memory_procedure.id";
+    // Saturating, because SQLite promotes an i64 overflow to REAL instead of
+    // erroring and the typed read then rejects the column outright.
+    let fold = |column: &str| {
+        format!(
+            "{column} = MIN(9223372036854775807, {column} + COALESCE((
+                 SELECT SUM(dup.{column}) FROM memory_procedure dup
+                 WHERE {DUP_OF_SURVIVOR}), 0))"
+        )
+    };
+    tx.execute_batch(&format!(
         "UPDATE memory_procedure SET
-             uses = MIN(9223372036854775807, uses + COALESCE((
-                 SELECT SUM(dup.uses) FROM memory_procedure dup
-                 WHERE dup.signature_key = memory_procedure.signature_key
-                   AND dup.plan = memory_procedure.plan
-                   AND COALESCE(dup.scope_id, '') = COALESCE(memory_procedure.scope_id, '')
-                   AND dup.id > memory_procedure.id), 0)),
-             failures = MIN(9223372036854775807, failures + COALESCE((
-                 SELECT SUM(dup.failures) FROM memory_procedure dup
-                 WHERE dup.signature_key = memory_procedure.signature_key
-                   AND dup.plan = memory_procedure.plan
-                   AND COALESCE(dup.scope_id, '') = COALESCE(memory_procedure.scope_id, '')
-                   AND dup.id > memory_procedure.id), 0))
+             {uses},
+             {failures}
          WHERE id IN (
              SELECT MIN(id) FROM memory_procedure
-             GROUP BY signature_key, plan, COALESCE(scope_id, '')
+             GROUP BY {IDENTITY}
              HAVING COUNT(*) > 1);
          DELETE FROM memory_procedure WHERE id NOT IN (
-             SELECT MIN(id) FROM memory_procedure
-             GROUP BY signature_key, plan, COALESCE(scope_id, ''));
+             SELECT MIN(id) FROM memory_procedure GROUP BY {IDENTITY});
          CREATE UNIQUE INDEX ux_memory_procedure_identity
-             ON memory_procedure(signature_key, plan, COALESCE(scope_id, ''));",
-    )?;
+             ON memory_procedure({IDENTITY});",
+        uses = fold("uses"),
+        failures = fold("failures"),
+    ))?;
     Ok(())
 }
 

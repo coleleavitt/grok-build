@@ -3,6 +3,19 @@ use serde::{Deserialize, Serialize};
 /// Schema version for the event log format. Bumped on breaking changes.
 pub const EVENT_SCHEMA_VERSION: &str = "1.0";
 
+/// Wire tags of events that exist purely to be counted later.
+///
+/// Canonical list, kept beside the enum that owns the tags. Consumers that must
+/// exclude instrumentation from semantic processing mirror this rather than
+/// importing it — notably `xai_grok_brain::backfill::is_measurement_only_event`,
+/// which keeps that crate free of workspace dependencies.
+///
+/// ADDING A MEASUREMENT-ONLY VARIANT? Add its tag here AND to that mirror. The
+/// mirror has a test pinning the same literal set, so a divergence is one grep
+/// away — but nothing enforces it across the crate boundary, so this note is
+/// the tripwire.
+pub const MEASUREMENT_ONLY_EVENT_TYPES: &[&str] = &["goal_role_assignment"];
+
 /// A single event in the per-turn event log.
 ///
 /// Each variant maps to a line in `events.jsonl`. The `type` field is the
@@ -927,6 +940,34 @@ mod tests {
         assert_eq!(v["role"], "skeptic");
         assert_eq!(v["skeptic_idx"], 1);
         assert_eq!(v["reason"], "toolset_unavailable");
+    }
+
+    /// Every tag in the canonical measurement-only list must be a real event
+    /// tag, so the list cannot rot into naming a variant that no longer exists.
+    #[test]
+    fn measurement_only_event_types_name_real_events() {
+        let assignment = Event::GoalRoleAssignment {
+            role: "planner",
+            skeptic_idx: None,
+            explicit: false,
+            model: None,
+            agent_type: None,
+            succeeded: true,
+            fell_back: false,
+        };
+        let tag = serde_json::to_value(&assignment).unwrap()["type"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            MEASUREMENT_ONLY_EVENT_TYPES.contains(&tag.as_str()),
+            "{tag} is measurement-only but is missing from the canonical list",
+        );
+        assert_eq!(
+            MEASUREMENT_ONLY_EVENT_TYPES.len(),
+            1,
+            "a new entry here needs a matching entry in the xai-grok-brain mirror",
+        );
     }
 
     /// The wire shape must be pinned in the crate that OWNS it. Without this

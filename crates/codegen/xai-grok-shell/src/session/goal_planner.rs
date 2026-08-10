@@ -1737,6 +1737,15 @@ mod role_assignment_instrumentation_tests {
             .collect()
     }
 
+    /// The two renders every role spawn carries. Six copies of this literal
+    /// said nothing the name does not.
+    fn prompt() -> RoleRenderedPrompt {
+        RoleRenderedPrompt {
+            primary: "PRIMARY".to_string(),
+            fallback: "FALLBACK".to_string(),
+        }
+    }
+
     fn explicit() -> RoleSpawnOverride {
         RoleSpawnOverride {
             model: Some("cfg-model".into()),
@@ -1756,10 +1765,7 @@ mod role_assignment_instrumentation_tests {
             None,
             &explicit(),
             Some(&writer),
-            RoleRenderedPrompt {
-                primary: "PRIMARY".to_string(),
-                fallback: "FALLBACK".to_string(),
-            },
+            prompt(),
             move |model, harness, _prompt| {
                 let c = c.clone();
                 async move {
@@ -1807,10 +1813,7 @@ mod role_assignment_instrumentation_tests {
             Some(2),
             &explicit(),
             Some(&writer),
-            RoleRenderedPrompt {
-                primary: "PRIMARY".to_string(),
-                fallback: "FALLBACK".to_string(),
-            },
+            prompt(),
             move |model, _harness, prompt| {
                 let c = c.clone();
                 async move {
@@ -1864,10 +1867,7 @@ mod role_assignment_instrumentation_tests {
             None,
             &RoleSpawnOverride::default(),
             Some(&writer),
-            RoleRenderedPrompt {
-                primary: "PRIMARY".to_string(),
-                fallback: "FALLBACK".to_string(),
-            },
+            prompt(),
             move |model, harness, prompt| {
                 let c = c.clone();
                 async move {
@@ -1910,10 +1910,7 @@ mod role_assignment_instrumentation_tests {
             None,
             &explicit(),
             Some(&writer),
-            RoleRenderedPrompt {
-                primary: "PRIMARY".to_string(),
-                fallback: "FALLBACK".to_string(),
-            },
+            prompt(),
             |_model, _harness, _prompt| async move { Err(SpawnError::Transport("boom".into())) },
         )
         .await;
@@ -1939,10 +1936,7 @@ mod role_assignment_instrumentation_tests {
             None,
             &explicit(),
             Some(&writer),
-            RoleRenderedPrompt {
-                primary: "PRIMARY".to_string(),
-                fallback: "FALLBACK".to_string(),
-            },
+            prompt(),
             move |_model, _harness, _prompt| {
                 let c = c.clone();
                 async move {
@@ -1972,6 +1966,11 @@ mod role_assignment_instrumentation_tests {
     /// and behaviour is identical.
     #[tokio::test]
     async fn without_an_event_writer_nothing_is_recorded_and_behaviour_is_identical() {
+        // The "nothing is recorded" half was previously unverified: the test
+        // asserted only the return value and the call count, so the name
+        // claimed more than the body proved. A tempdir that stays empty is the
+        // observable form of "nothing was written".
+        let dir = tempfile::tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
         let out: Result<String, SpawnError> = spawn_with_fail_open_retry(
@@ -1979,10 +1978,7 @@ mod role_assignment_instrumentation_tests {
             None,
             &explicit(),
             None,
-            RoleRenderedPrompt {
-                primary: "PRIMARY".to_string(),
-                fallback: "FALLBACK".to_string(),
-            },
+            prompt(),
             move |_model, _harness, _prompt| {
                 let c = c.clone();
                 async move {
@@ -1994,5 +1990,14 @@ mod role_assignment_instrumentation_tests {
         .await;
         assert_eq!(out.unwrap(), "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !dir.path().join("events.jsonl").exists(),
+            "no writer means no events file is created at all",
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "and nothing else is written either",
+        );
     }
 }

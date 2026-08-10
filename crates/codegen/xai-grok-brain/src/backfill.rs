@@ -378,16 +378,29 @@ fn read_jsonl_artifact_file(
     Ok(())
 }
 
-/// Event types that exist purely to be counted later.
+/// Wire tags of events that exist purely to be counted later.
 ///
-/// They are deliberately excluded from the self-improvement extraction context:
-/// they describe the harness measuring itself, never anything about the user's
-/// project, and they are emitted often enough to crowd out events that do.
+/// MIRRORS `xai_file_utils::events::types::MEASUREMENT_ONLY_EVENT_TYPES`, which
+/// is canonical because it sits beside the enum that owns the tags. Mirrored
+/// rather than imported on purpose: this crate has no workspace dependencies,
+/// and taking one on the whole event/tracker/log machinery to share a single
+/// string would be a worse trade than restating it.
+///
+/// The cost is honest — nothing enforces agreement across the crate boundary.
+/// Both sites carry a note and a test pinning the same literal set, so a
+/// divergence is one grep away rather than invisible.
+const MEASUREMENT_ONLY_EVENT_TYPES: &[&str] = &["goal_role_assignment"];
+
+/// Whether a parsed event line is instrumentation rather than content.
+///
+/// Excluded from the self-improvement extraction context: these describe the
+/// harness measuring itself, never anything about the user's project, and they
+/// are emitted often enough to crowd out the events that do.
 fn is_measurement_only_event(value: &serde_json::Value) -> bool {
-    matches!(
-        value.get("type").and_then(serde_json::Value::as_str),
-        Some("goal_role_assignment"),
-    )
+    value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|tag| MEASUREMENT_ONLY_EVENT_TYPES.contains(&tag))
 }
 
 fn read_text_artifact_dir(
@@ -878,6 +891,20 @@ mod tests {
                 .any(|d| d.id == "/repo/notes.txt")
         );
     }
+    /// The mirror must stay in step with the canonical list in
+    /// `xai_file_utils::events::types::MEASUREMENT_ONLY_EVENT_TYPES`. Nothing
+    /// enforces that across the crate boundary — this crate takes no workspace
+    /// dependencies — so both sides pin the same literal set and a divergence
+    /// is one grep away instead of invisible.
+    #[test]
+    fn the_measurement_only_mirror_is_pinned() {
+        assert_eq!(
+            super::MEASUREMENT_ONLY_EVENT_TYPES,
+            ["goal_role_assignment"],
+            "adding an entry here needs a matching entry in xai-file-utils",
+        );
+    }
+
     /// Generation-1 red-team finding: the events window keeps only the last
     /// few lines, so appending high-frequency instrumentation evicted real
     /// session events AND replaced them with a content-free excerpt.
