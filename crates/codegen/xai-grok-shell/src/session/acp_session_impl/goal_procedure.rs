@@ -52,6 +52,67 @@ pub(crate) fn promote_goal_procedure(
     )
 }
 
+/// Cap on the recalled block injected into the planner prompt. Recall is a
+/// hint, not a second plan; past this it competes with the objective for the
+/// planner's attention.
+const MAX_RECALLED_BLOCK_BYTES: usize = 8 * 1024;
+
+/// How many prior plans to offer. More than a couple stops being a hint and
+/// becomes a menu the planner has to adjudicate.
+const MAX_RECALLED_PROCEDURES: usize = 2;
+
+/// Format plans that previously achieved a similar objective, for injection
+/// into the planner prompt. Empty string when there is nothing relevant —
+/// which is the common case, and the caller renders no section at all then.
+pub(crate) fn recall_prior_procedures(objective: &str) -> String {
+    recall_prior_procedures_from(&xai_grok_brain::default_store_path(), objective)
+}
+
+/// [`recall_prior_procedures`] against an explicit store, so tests never touch
+/// the user's real Brain.
+pub(crate) fn recall_prior_procedures_from(store_path: &Path, objective: &str) -> String {
+    let objective = objective.trim();
+    if objective.is_empty() {
+        return String::new();
+    }
+    let Ok(service) = xai_grok_brain::BrainService::open(store_path) else {
+        // Best-effort, exactly like promotion: no Brain simply means no hint.
+        return String::new();
+    };
+    let options =
+        xai_grok_brain::ProcedureRecallOptions::new(objective).limit(MAX_RECALLED_PROCEDURES);
+    let Ok(recalled) = service.store().recall_procedures(&options) else {
+        return String::new();
+    };
+
+    let mut out = String::new();
+    for entry in recalled {
+        // The counts are shown because they are what makes this evidence
+        // rather than authority: a plan with one success reads very
+        // differently from one with nine, and hiding that would invite the
+        // planner to treat a lucky plan as settled practice.
+        let header = format!(
+            "--- prior plan for: {} ({} success{}, {} failure{}) ---\n",
+            entry.procedure.signature,
+            entry.procedure.uses,
+            if entry.procedure.uses == 1 { "" } else { "es" },
+            entry.procedure.failures,
+            if entry.procedure.failures == 1 {
+                ""
+            } else {
+                "s"
+            },
+        );
+        if out.len() + header.len() + entry.procedure.plan.len() > MAX_RECALLED_BLOCK_BYTES {
+            break;
+        }
+        out.push_str(&header);
+        out.push_str(&entry.procedure.plan);
+        out.push_str("\n\n");
+    }
+    out
+}
+
 /// Promote from a tracker that is about to complete.
 ///
 /// Called at every `tracker.complete()` site. Reads the snapshot BEFORE the
@@ -239,6 +300,89 @@ mod tests {
         assert_eq!(
             recalled[0].procedure.uses, 2,
             "a plan that keeps working accrues evidence",
+        );
+    }
+
+    /// The full loop the writer existed for: a goal completes, its plan is
+    /// promoted, and a later similar goal gets it back as a hint.
+    #[test]
+    fn a_promoted_plan_comes_back_on_a_later_similar_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.sqlite3");
+        let plan_file = plan(
+            dir.path(),
+            "1. reproduce 2. patch the tokenizer 3. add a test",
+        );
+        assert!(promote_into(
+            &db,
+            "fix the failing tokenizer test",
+            Some(&plan_file),
+            None,
+        ));
+
+        let recalled = recall_prior_procedures_from(&db, "fix the failing tokenizer test");
+        assert!(
+            recalled.contains("patch the tokenizer"),
+            "the promoted plan must come back: {recalled:?}",
+        );
+        assert!(
+            recalled.contains("1 success"),
+            "the evidence counts make this a hint rather than authority: {recalled:?}",
+        );
+    }
+
+    /// An unrelated goal must recall nothing. Handing the planner a plan for a
+    /// different problem is worse than handing it none.
+    #[test]
+    fn an_unrelated_goal_recalls_no_prior_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.sqlite3");
+        let plan_file = plan(dir.path(), "the tokenizer plan");
+        assert!(promote_into(
+            &db,
+            "fix the failing tokenizer test",
+            Some(&plan_file),
+            None,
+        ));
+
+        assert!(
+            recall_prior_procedures_from(&db, "renew the TLS certificate chain").is_empty(),
+            "an unrelated objective must get no hint",
+        );
+    }
+
+    /// Recall is best-effort in exactly the way promotion is: no Brain means no
+    /// hint, never a failed plan.
+    #[test]
+    fn recall_without_a_usable_store_is_empty_rather_than_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("not-a-db");
+        std::fs::create_dir(&broken).unwrap();
+        assert!(recall_prior_procedures_from(&broken, "some goal").is_empty());
+        assert!(recall_prior_procedures_from(&dir.path().join("absent.sqlite3"), "").is_empty());
+    }
+
+    /// The block is capped: recall is a hint, and past a point it competes with
+    /// the objective for the planner's attention.
+    #[test]
+    fn the_recalled_block_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.sqlite3");
+        for i in 0..4 {
+            let body = "z".repeat(MAX_RECALLED_BLOCK_BYTES / 2);
+            let plan_file = plan(dir.path(), &format!("{body}{i}"));
+            assert!(promote_into(
+                &db,
+                &format!("shared objective wording {i}"),
+                Some(&plan_file),
+                None,
+            ));
+        }
+        let recalled = recall_prior_procedures_from(&db, "shared objective wording 0");
+        assert!(
+            recalled.len() <= MAX_RECALLED_BLOCK_BYTES,
+            "recalled block was {} bytes",
+            recalled.len(),
         );
     }
 

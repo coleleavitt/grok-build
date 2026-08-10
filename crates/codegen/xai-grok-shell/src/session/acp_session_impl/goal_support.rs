@@ -1128,6 +1128,11 @@ impl SessionActor {
         let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
         self.emit_goal_planning(current_tokens);
 
+        // Procedural memory: plans that achieved a similar objective before.
+        // Empty on a fresh store, and best-effort — a Brain failure costs a
+        // hint, never the plan.
+        let prior_procedures = super::goal_procedure::recall_prior_procedures(objective);
+
         let outcome = crate::session::goal_planner::run_goal_planner(
             spawner,
             crate::session::goal_planner::GoalPlannerInputs {
@@ -1138,6 +1143,7 @@ impl SessionActor {
                 // Planner is forced to the parent model (no role override), so the
                 // effective role model is always the parent.
                 model_id: crate::session::goal_planner::effective_role_model_id(None, &model_id),
+                prior_procedures: &prior_procedures,
                 tool_names: &tool_names,
                 inherit_tool_names: &inherit_tool_names,
             },

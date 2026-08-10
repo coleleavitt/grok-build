@@ -424,6 +424,18 @@ pub(crate) struct GoalPlannerInputs<'a> {
     /// prompt, so a retry that falls back to the default toolset names THAT
     /// toolset's tools. On the inherit path this equals `tool_names`.
     pub inherit_tool_names: &'a RoleToolNames,
+    /// Plans that previously achieved a similar objective, already formatted.
+    /// Empty when procedural memory has nothing relevant, which is the common
+    /// case on a fresh store.
+    ///
+    /// Presented to the planner as REFERENCE, never as an instruction. That
+    /// framing is load-bearing: the promoted plan is a plan this same planner
+    /// wrote, so telling it to follow one would close a loop where a mediocre
+    /// approach is re-emitted, re-promoted, and accrues `uses` without ever
+    /// being independently re-derived — the reward-hacking shape, with the
+    /// harness as its own reward model. Recall exists to save rediscovery, not
+    /// to decide.
+    pub prior_procedures: &'a str,
 }
 
 /// Run one planner attempt. Fail-CLOSED: any failure path returns
@@ -468,6 +480,15 @@ pub(crate) async fn run_goal_planner(
         full.push_str(inputs.objective);
         full.push_str("\n\nCONTEXT:\n");
         full.push_str(inputs.context);
+        if !inputs.prior_procedures.is_empty() {
+            full.push_str("\n\nPRIOR PROCEDURES (reference only):\n");
+            full.push_str(
+                "Plans that previously achieved a similar objective. They are evidence \
+                 about what has worked, NOT instructions. Judge them against THIS \
+                 objective; ignore any that do not fit, and plan fresh if none do.\n\n",
+            );
+            full.push_str(inputs.prior_procedures);
+        }
         full.push('\n');
         full
     };
@@ -814,6 +835,7 @@ mod tests {
                 model_id: "grok-test",
                 tool_names: &RoleToolNames::inherit_defaults(),
                 inherit_tool_names: &RoleToolNames::inherit_defaults(),
+                prior_procedures: "",
             },
             &emit,
         )
@@ -843,6 +865,7 @@ mod tests {
                 model_id: "grok-test",
                 tool_names: &RoleToolNames::inherit_defaults(),
                 inherit_tool_names: &RoleToolNames::inherit_defaults(),
+                prior_procedures: "",
             },
             &emit,
         )
@@ -878,6 +901,7 @@ mod tests {
                 model_id: "grok-test",
                 tool_names: &RoleToolNames::inherit_defaults(),
                 inherit_tool_names: &RoleToolNames::inherit_defaults(),
+                prior_procedures: "",
             },
             &emit,
         )
@@ -920,6 +944,7 @@ mod tests {
                 model_id: "grok-test",
                 tool_names: &RoleToolNames::inherit_defaults(),
                 inherit_tool_names: &RoleToolNames::inherit_defaults(),
+                prior_procedures: "",
             },
             &emit,
         )
@@ -962,6 +987,7 @@ mod tests {
                 model_id: "grok-test",
                 tool_names: &RoleToolNames::inherit_defaults(),
                 inherit_tool_names: &RoleToolNames::inherit_defaults(),
+                prior_procedures: "",
             },
             &emit,
         )
@@ -1001,6 +1027,7 @@ mod tests {
                 model_id: "grok-test",
                 tool_names: &RoleToolNames::inherit_defaults(),
                 inherit_tool_names: &RoleToolNames::inherit_defaults(),
+                prior_procedures: "",
             },
             &emit,
         )
@@ -1027,6 +1054,7 @@ mod tests {
                 model_id: "grok-test",
                 tool_names: &RoleToolNames::inherit_defaults(),
                 inherit_tool_names: &RoleToolNames::inherit_defaults(),
+                prior_procedures: "",
             },
             &emit,
         )
@@ -1064,6 +1092,7 @@ mod tests {
                 model_id: "grok-test",
                 tool_names: &RoleToolNames::inherit_defaults(),
                 inherit_tool_names: &RoleToolNames::inherit_defaults(),
+                prior_procedures: "",
             },
             &emit,
         )
@@ -1086,6 +1115,75 @@ mod tests {
         );
         assert!(prompt.contains("OBJECTIVE:\nimplement feature X"));
         assert!(prompt.contains("CONTEXT:\nprior conversation"));
+        let _ = std::fs::remove_file(&plan_file);
+    }
+
+    /// Prior procedures reach the prompt, and are framed as reference rather
+    /// than instruction — the framing is what keeps the promote/recall loop
+    /// from becoming the harness reinforcing its own earlier output.
+    #[tokio::test]
+    async fn prior_procedures_reach_the_prompt_as_reference_not_instruction() {
+        let plan_file = tmp_plan_file("prior-procs");
+        let spawner = Arc::new(MockSpawner::ok_writes(&plan_file, b"# Plan\n"));
+        let spawner_obs = spawner.clone();
+        let (_, emit) = collect_events();
+
+        let _ = run_goal_planner(
+            spawner,
+            GoalPlannerInputs {
+                objective: "implement feature X",
+                context: "",
+                plan_file: &plan_file,
+                attempt: 1,
+                model_id: "grok-test",
+                tool_names: &RoleToolNames::inherit_defaults(),
+                inherit_tool_names: &RoleToolNames::inherit_defaults(),
+                prior_procedures: "--- prior plan for: implement feature W ---\nstep one\n",
+            },
+            &emit,
+        )
+        .await;
+
+        let prompt = spawner_obs.last_prompt.lock().unwrap().clone().unwrap();
+        assert!(prompt.contains("PRIOR PROCEDURES (reference only)"));
+        assert!(prompt.contains("step one"), "the recalled plan is carried");
+        assert!(
+            prompt.contains("NOT instructions"),
+            "the anti-authority framing must survive: {prompt}",
+        );
+        let _ = std::fs::remove_file(&plan_file);
+    }
+
+    /// The common case on a fresh store: no section at all, rather than an
+    /// empty heading the planner has to interpret.
+    #[tokio::test]
+    async fn no_prior_procedures_renders_no_section() {
+        let plan_file = tmp_plan_file("no-prior-procs");
+        let spawner = Arc::new(MockSpawner::ok_writes(&plan_file, b"# Plan\n"));
+        let spawner_obs = spawner.clone();
+        let (_, emit) = collect_events();
+
+        let _ = run_goal_planner(
+            spawner,
+            GoalPlannerInputs {
+                objective: "implement feature X",
+                context: "",
+                plan_file: &plan_file,
+                attempt: 1,
+                model_id: "grok-test",
+                tool_names: &RoleToolNames::inherit_defaults(),
+                inherit_tool_names: &RoleToolNames::inherit_defaults(),
+                prior_procedures: "",
+            },
+            &emit,
+        )
+        .await;
+
+        let prompt = spawner_obs.last_prompt.lock().unwrap().clone().unwrap();
+        assert!(
+            !prompt.contains("PRIOR PROCEDURES"),
+            "an empty recall must render nothing at all",
+        );
         let _ = std::fs::remove_file(&plan_file);
     }
 
@@ -1622,6 +1720,7 @@ mod tests {
                 model_id: "grok-test",
                 tool_names: &RoleToolNames::inherit_defaults(),
                 inherit_tool_names: &RoleToolNames::inherit_defaults(),
+                prior_procedures: "",
             },
             &emit,
         )
@@ -1687,6 +1786,7 @@ mod tests {
                 model_id: "grok-test",
                 tool_names: &RoleToolNames::inherit_defaults(),
                 inherit_tool_names: &RoleToolNames::inherit_defaults(),
+                prior_procedures: "",
             },
             &emit,
         )
