@@ -17,6 +17,7 @@ mod health;
 mod procedure;
 mod search;
 mod service;
+mod staleness;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -37,6 +38,9 @@ pub use search::{
 pub use service::{
     BrainBackfillOutcome, BrainRequest, BrainRequestOutcome, BrainService, CurrentStateMemory,
     default_store_path,
+};
+pub use staleness::{
+    INHERITED_STALE_AT, MIN_NEIGHBOURS_FOR_INHERITED_VERDICT, PageStaleness, Staleness,
 };
 pub use store::BrainStore;
 pub use types::{

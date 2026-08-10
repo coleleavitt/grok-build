@@ -241,12 +241,28 @@ impl xai_tool_runtime::Tool for BrainGetTool {
             xai_grok_brain::MemoryFreshness::Durable => "durable",
             xai_grok_brain::MemoryFreshness::TimeSensitive => "time_sensitive",
         };
+        // Freshness that crosses relations. A page marked durable whose
+        // neighbours are mostly operational state is only as durable as what it
+        // rests on, and reporting the bare flag would hide that.
+        let inherited = service
+            .store()
+            .page_staleness(page.id)
+            .map_err(|err| tool_error("brain_get", err))?
+            .filter(|staleness| staleness.verdict == xai_grok_brain::Staleness::InheritedSuspect)
+            .map(|staleness| {
+                format!(
+                    " — marked durable, but {} of {} related pages are time-sensitive; verify before relying on it",
+                    staleness.time_sensitive_neighbours, staleness.neighbours,
+                )
+            })
+            .unwrap_or_default();
         let mut out = format!(
-            "#{} [{}] {}\nfreshness: {}\nscope: {}{}\nupdated: {}\nsources: {} | related: {} | revisions: {}\n\n{}",
+            "#{} [{}] {}\nfreshness: {}{}\nscope: {}{}\nupdated: {}\nsources: {} | related: {} | revisions: {}\n\n{}",
             page.id,
             page.category.as_str(),
             page.title,
             freshness,
+            inherited,
             page.scope_kind.as_str(),
             page.scope_id
                 .as_deref()
