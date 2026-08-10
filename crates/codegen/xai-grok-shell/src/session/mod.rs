@@ -318,6 +318,7 @@ pub mod file_system;
 pub mod fork;
 pub(crate) mod fs_watch;
 pub(crate) mod goal_classifier;
+pub(crate) mod goal_deterministic_gate;
 pub(crate) mod goal_evaluator;
 pub(crate) mod goal_next_step;
 pub(crate) mod goal_orchestrator;

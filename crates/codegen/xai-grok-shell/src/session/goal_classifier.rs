@@ -2092,6 +2092,42 @@ pub(crate) async fn run_verification_stage(
     };
     let kind_lens = kind_lens(goal_kind);
 
+    // Deterministic pre-check. The panel is N language models voting on a
+    // diff; for anything the session can look up, the lookup is strictly
+    // better — cheaper, deterministic, and it cannot be argued out of a
+    // correct verdict. Today that is exactly one claim: a code-change goal
+    // whose workspace provably did not change. Everything else defers, so
+    // this can only ever save spawns, never invent a rejection.
+    let changed = super::goal_deterministic_gate::workspace_changed(
+        inputs.workspace_root,
+        inputs.baseline_commit,
+    )
+    .await;
+    if let super::goal_deterministic_gate::DeterministicVerdict::Refuted { reason } =
+        super::goal_deterministic_gate::decide(goal_kind, changed)
+    {
+        let gap = "the workspace is byte-identical to the goal's baseline:                    no files were added, modified, or committed";
+        tracing::info!(
+            reason,
+            attempt = inputs.attempt,
+            "verification stage: deterministically refuted; skipping the panel",
+        );
+        write_details_file(
+            &details_path,
+            &format!(
+                "# Verification: Not Achieved (deterministic)\n\n                 No skeptic panel was run. This goal declares `## Goal kind: code-change`,                  and {gap}.\n\n                 A code change that changed nothing cannot have achieved a code-change goal,                  so the panel was skipped rather than asked to confirm an absence.\n\n                 Reason code: `{reason}`\n"
+            ),
+        )
+        .await;
+        return GoalClassifierOutcome::NotAchieved {
+            details_path: details_raw,
+            gaps_summary: format!("- [deterministic, high] {gap}"),
+            pause_summary: String::new(),
+            gap_fingerprint: reason.to_owned(),
+        }
+        .into();
+    }
+
     let implementer_scratch = inputs.implementer_scratch_dir.to_string_lossy();
 
     let n = inputs
@@ -6575,6 +6611,135 @@ mod tests {
             "precious",
             "the symlink's victim file must be untouched",
         );
+    }
+
+    /// The deterministic gate, exercised through the real stage: a
+    /// code-change goal whose workspace never changed must be refuted WITHOUT
+    /// spawning a single skeptic. Existing stage tests all pass
+    /// `baseline_commit: None`, so without this the wiring was uncovered and
+    /// deleting it left the suite green.
+    #[tokio::test]
+    async fn verification_stage_refuses_a_code_change_goal_with_no_workspace_change() {
+        let wsp = tempfile::tempdir().unwrap();
+        let root = wsp.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join("seed.txt"), "seed").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "seed"]);
+        let baseline = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_owned();
+
+        // The plan lives in the SESSION dir, not the workspace — writing it
+        // into the repo would itself be the change the gate looks for.
+        let session = tempfile::tempdir().unwrap();
+        let plan = session.path().join("plan.md");
+        std::fs::write(&plan, "# Plan\n\n## Goal kind\n\ncode-change\n").unwrap();
+
+        let vid = unique_verifier_id();
+        super::super::goal_tracker::ensure_goal_scratch_root(&vid).unwrap();
+        let spawner = Arc::new(MockSpawner::new([]));
+        let observed = spawner.clone();
+        let spawner: Arc<dyn GoalClassifierSpawner> = spawner;
+        let (_log, emit) = collect_events();
+
+        let mut inputs = stage_inputs("do X", "all done!", root, &vid, 1, 3);
+        inputs.baseline_commit = Some(&baseline);
+        inputs.plan_file = Some(&plan);
+
+        let result = run_verification_stage(spawner, inputs, &emit).await;
+
+        assert!(!result.panel_ran, "the panel must be skipped entirely");
+        assert_eq!(
+            observed
+                .spawn_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a lookup replaced three model spawns",
+        );
+        let GoalClassifierOutcome::NotAchieved {
+            details_path,
+            gaps_summary,
+            gap_fingerprint,
+            ..
+        } = result.outcome
+        else {
+            panic!("an unchanged workspace must refute a code-change goal");
+        };
+        assert!(
+            gaps_summary.contains("byte-identical"),
+            "the gap must name what was checked: {gaps_summary}",
+        );
+        assert_eq!(
+            gap_fingerprint,
+            super::super::goal_deterministic_gate::REASON_NO_WORKSPACE_CHANGE,
+        );
+        let body = tokio::fs::read_to_string(&details_path).await.unwrap();
+        assert!(
+            body.contains("deterministic"),
+            "details explain the skip: {body}"
+        );
+        let _ = std::fs::remove_dir_all(super::super::goal_tracker::goal_scratch_root(&vid));
+    }
+
+    /// The same goal WITH a real change must fall through to the panel —
+    /// otherwise the gate would reject all code-change goals.
+    #[tokio::test]
+    async fn verification_stage_defers_to_the_panel_once_the_workspace_changed() {
+        let wsp = tempfile::tempdir().unwrap();
+        let root = wsp.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join("seed.txt"), "seed").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "seed"]);
+        let baseline = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_owned();
+        // The implementer did something.
+        std::fs::write(root.join("new_file.rs"), "fn added() {}").unwrap();
+
+        let session = tempfile::tempdir().unwrap();
+        let plan = session.path().join("plan.md");
+        std::fs::write(&plan, "# Plan\n\n## Goal kind\n\ncode-change\n").unwrap();
+
+        let vid = unique_verifier_id();
+        super::super::goal_tracker::ensure_goal_scratch_root(&vid).unwrap();
+        let spawner = Arc::new(MockSpawner::new([MockResponse::not_refuted()]));
+        let observed = spawner.clone();
+        let spawner: Arc<dyn GoalClassifierSpawner> = spawner;
+        let (_log, emit) = collect_events();
+
+        let mut inputs = stage_inputs("do X", "all done!", root, &vid, 1, 1);
+        inputs.baseline_commit = Some(&baseline);
+        inputs.plan_file = Some(&plan);
+
+        let _ = run_verification_stage(spawner, inputs, &emit).await;
+        assert!(
+            observed
+                .spawn_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0,
+            "a changed workspace must still reach the panel",
+        );
+        let _ = std::fs::remove_dir_all(super::super::goal_tracker::goal_scratch_root(&vid));
     }
 
     #[tokio::test]
