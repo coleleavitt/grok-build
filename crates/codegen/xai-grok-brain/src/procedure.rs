@@ -103,21 +103,49 @@ pub struct Procedure {
     pub updated_at: DateTime<Utc>,
 }
 
+/// z for a ~95% one-sided Wilson interval. Fixed rather than configurable: it
+/// selects how much evidence a plan must show before it outranks a sparse one,
+/// and that is a property of the ranking, not a per-caller preference.
+const WILSON_Z: f64 = 1.96;
+
 impl Procedure {
-    /// Laplace-smoothed success rate in `(0, 1)`.
+    /// Wilson score LOWER BOUND on the success rate, in `[0, 1]`.
     ///
-    /// Smoothed so a single lucky success does not score a perfect 1.0 and
-    /// outrank a plan with a long, nearly-clean record: one success scores
-    /// 0.75 while nine successes and one failure score 0.86. Unsmoothed rates
-    /// would make the sparsest evidence look strongest, which is the opposite
-    /// of what the ranking is for.
+    /// Ranks on what the evidence establishes rather than on the observed rate,
+    /// which is what makes volume count in the right direction.
+    ///
+    /// The previous Laplace point estimate `(s+0.5)/(n+1)` had a crossover the
+    /// review lanes flagged: a lone success scores exactly 0.75, so ANY plan
+    /// whose observed rate fell below that lost to it no matter how much
+    /// evidence backed it — 30 successes against 12 failures scores 0.7262 and
+    /// ranked below a plan that had worked once. Raising the prior only moves
+    /// the crossover; it does not remove it, because a point estimate cannot
+    /// express confidence.
+    ///
+    /// A lower bound can. One success gives 0.207 — the evidence is consistent
+    /// with a bad plan — while 30/12 gives 0.564 and correctly wins. Two
+    /// successes against fifty failures still gives 0.011, so the generation-2
+    /// inversion stays closed from the other side.
+    ///
+    /// It also makes the volume tiebreak nearly redundant: at an identical
+    /// observed rate, more trials tighten the interval and raise the bound on
+    /// their own. The tiebreak is kept only for exact ties.
     pub fn reliability(&self) -> f64 {
         // Clamped because the columns carry no CHECK constraint: a corrupted
-        // negative pair sums to -1 and divides by zero, and `+inf` sorts ahead
-        // of every honest record under `total_cmp`.
-        let uses = self.uses.max(0) as f64;
-        let failures = self.failures.max(0) as f64;
-        (uses + 0.5) / (uses + failures + 1.0)
+        // negative pair would otherwise produce a negative n and a NaN root.
+        let successes = self.uses.max(0) as f64;
+        let trials = successes + self.failures.max(0) as f64;
+        if trials <= 0.0 {
+            // No evidence establishes nothing. Distinct from a low bound, which
+            // means evidence exists and is bad.
+            return 0.0;
+        }
+        let p = successes / trials;
+        let z2 = WILSON_Z * WILSON_Z;
+        let denominator = 1.0 + z2 / trials;
+        let centre = p + z2 / (2.0 * trials);
+        let margin = WILSON_Z * (p * (1.0 - p) / trials + z2 / (4.0 * trials * trials)).sqrt();
+        ((centre - margin) / denominator).clamp(0.0, 1.0)
     }
 }
 
@@ -125,8 +153,13 @@ impl Procedure {
 #[derive(Debug, Clone)]
 pub struct RecalledProcedure {
     pub procedure: Procedure,
-    /// Jaccard overlap in `[0, 1]`; 1.0 is an exact token-set match.
+    /// How much of the goal this signature covers, in `[0, 1]`. The primary
+    /// ranking key — see [`coverage`].
     pub similarity: f64,
+    /// Jaccard overlap in `[0, 1]`, the tiebreak between two plans that cover
+    /// the goal equally. Exposed so a caller can see tightness as well as
+    /// coverage rather than trusting one scalar.
+    pub overlap: f64,
 }
 
 /// Default for [`ProcedureRecallOptions::max_candidates`]. Large enough that a
@@ -140,11 +173,16 @@ pub struct ProcedureRecallOptions {
     pub goal: String,
     pub scope_id: Option<String>,
     pub limit: usize,
-    /// Minimum similarity to return at all.
+    /// Minimum coverage to return at all.
     ///
     /// Non-zero by default and deliberately so: recall that returns the
     /// best-of-a-bad-set hands the agent a plan for a different problem, which
     /// is worse than returning nothing and letting it plan fresh.
+    ///
+    /// 0.5 under coverage rather than the 0.2 the old Jaccard used: coverage is
+    /// the more permissive measure, so the same permissiveness needs a higher
+    /// floor. "Half the goal's tokens appear in the signature" is the weakest
+    /// claim worth acting on.
     pub min_similarity: f64,
     /// Hard cap on how many rows are pulled out of SQLite before ranking.
     ///
@@ -167,7 +205,7 @@ impl ProcedureRecallOptions {
             goal: goal.into(),
             scope_id: None,
             limit: 3,
-            min_similarity: 0.2,
+            min_similarity: 0.5,
             max_candidates: DEFAULT_MAX_RECALL_CANDIDATES,
         }
     }
@@ -209,8 +247,30 @@ pub(crate) fn signature_tokens(value: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Jaccard overlap of two token sets. Two empty signatures score 0, not 1 —
-/// an empty goal matches nothing rather than matching everything.
+/// How much of the QUERY's tokens the stored signature covers, in `[0, 1]`.
+///
+/// Asymmetric on purpose. Jaccard divides by the union, so a stored signature
+/// that contains the goal verbatim PLUS useful detail scores lower than a
+/// vague one that happens to be short — the red-team lane found a generic
+/// three-stopword signature outranking a verbatim superset. Recall asks "does
+/// this stored plan address my goal", and extra specificity in the signature is
+/// not evidence against that.
+///
+/// Two empty sets score 0, not 1: an empty goal matches nothing rather than
+/// everything.
+pub(crate) fn coverage(query: &HashSet<String>, signature: &HashSet<String>) -> f64 {
+    if query.is_empty() || signature.is_empty() {
+        return 0.0;
+    }
+    query.intersection(signature).count() as f64 / query.len() as f64
+}
+
+/// Jaccard overlap, kept as the TIEBREAK behind coverage.
+///
+/// Coverage alone would rank a signature with a hundred unrelated extra tokens
+/// equal to a tight one, since both cover the goal completely. Jaccard is the
+/// right preference between two plans that both cover the goal: prefer the one
+/// that is about less else.
 pub(crate) fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
@@ -408,17 +468,25 @@ impl crate::BrainStore {
         let mut scored: Vec<RecalledProcedure> = candidates
             .into_iter()
             .filter_map(|procedure| {
-                let similarity = jaccard(&query_tokens, &signature_tokens(&procedure.signature));
+                let tokens = signature_tokens(&procedure.signature);
+                let similarity = coverage(&query_tokens, &tokens);
+                let overlap = jaccard(&query_tokens, &tokens);
                 (similarity >= options.min_similarity).then_some(RecalledProcedure {
                     procedure,
                     similarity,
+                    overlap,
                 })
             })
             .collect();
 
+        // Coverage, then tightness, then what the evidence establishes, then
+        // raw volume for exact ties, then recency. `uses` sits BELOW reliability
+        // because a Wilson lower bound already rewards volume at an equal rate;
+        // it survives only to make exact ties deterministic.
         scored.sort_by(|a, b| {
             b.similarity
                 .total_cmp(&a.similarity)
+                .then(b.overlap.total_cmp(&a.overlap))
                 .then(
                     b.procedure
                         .reliability()
@@ -851,20 +919,17 @@ mod tests {
         assert_eq!(recalled[1].procedure.plan, "risky");
     }
 
-    /// Volume decides between plans whose reliability genuinely ties.
-    ///
-    /// The earlier version of this test used one clean success against four,
-    /// which are NOT equally reliable (0.75 vs 0.90) — the reliability
-    /// comparator decided it and the `uses` tiebreak was never reached, so
-    /// deleting that comparator left the suite green. `(1,1)` and `(3,3)` both
-    /// smooth to exactly 0.5, so only the volume comparator can order them.
+    /// Wilson rewards volume DIRECTLY: at an identical observed rate, more
+    /// trials tighten the interval and raise the lower bound. The old Laplace
+    /// point estimate could not express that, which is why it needed a separate
+    /// volume tiebreak — and why `(1,1)` and `(3,3)` used to score an identical
+    /// 0.5. They no longer tie, and that is the fix rather than a regression.
     #[test]
-    fn volume_breaks_ties_between_equally_reliable_plans() {
+    fn more_evidence_at_the_same_rate_ranks_higher() {
         let store = store();
         // "thick" reaches (3, 3) FIRST, so both SQL recency and the recency
-        // comparator favour "thin". Only the volume comparator can put "thick"
-        // ahead. Without that ordering this test passes with the comparator
-        // deleted — which is exactly how the previous version was vacuous.
+        // comparator favour "thin". Only the evidence comparator can put
+        // "thick" ahead.
         for _ in 0..3 {
             store
                 .record_procedure("shared goal text", "thick", ProcedureOutcome::Failed, None)
@@ -898,11 +963,142 @@ mod tests {
         assert_eq!(thick.plan, "thick", "more evidence at an equal rate wins");
         assert_eq!((thick.uses, thick.failures), (3, 3));
         assert_eq!((thin.uses, thin.failures), (1, 1));
-        assert_eq!(
+
+        // Both observed exactly 50%, and the bound separates them anyway.
+        assert!(
+            thick.reliability() > thin.reliability(),
+            "same observed rate, tighter interval: {} vs {}",
             thick.reliability(),
             thin.reliability(),
-            "the tie must be exact, or the reliability comparator decides it \
-             and the volume comparator is never exercised",
+        );
+    }
+
+    /// The crossover the review lanes flagged: under the old Laplace estimate a
+    /// lone success scored exactly 0.75, so any plan whose observed rate fell
+    /// below that lost regardless of evidence. 30 successes against 12 failures
+    /// scored 0.7262 and ranked BELOW a plan that had worked once.
+    #[test]
+    fn a_well_evidenced_plan_outranks_a_lone_success() {
+        let store = store();
+        for _ in 0..12 {
+            store
+                .record_procedure(
+                    "shared goal text",
+                    "seasoned",
+                    ProcedureOutcome::Failed,
+                    None,
+                )
+                .unwrap();
+        }
+        for _ in 0..30 {
+            store
+                .record_procedure(
+                    "shared goal text",
+                    "seasoned",
+                    ProcedureOutcome::Succeeded,
+                    None,
+                )
+                .unwrap();
+        }
+        store
+            .record_procedure(
+                "shared goal text",
+                "lucky",
+                ProcedureOutcome::Succeeded,
+                None,
+            )
+            .unwrap();
+
+        let recalled = store
+            .recall_procedures(&ProcedureRecallOptions::new("shared goal text").limit(10))
+            .unwrap();
+        assert_eq!(
+            recalled[0].procedure.plan,
+            "seasoned",
+            "30/12 (bound {}) must beat 1/0 (bound {})",
+            recalled[0].procedure.reliability(),
+            recalled[1].procedure.reliability(),
+        );
+        // And the generation-2 inversion stays closed from the other side.
+        assert!(
+            store
+                .get_procedure(recalled[1].procedure.id)
+                .unwrap()
+                .unwrap()
+                .reliability()
+                < 0.5,
+            "a lone success establishes little, so its bound stays low",
+        );
+    }
+
+    /// The red-team's Jaccard finding: a stored signature containing the goal
+    /// verbatim PLUS useful detail scored LOWER than a vague short one, because
+    /// Jaccard divides by the union and punishes specificity.
+    #[test]
+    fn a_detailed_signature_is_not_punished_for_being_specific() {
+        let store = store();
+        // Long enough that Jaccard's union denominator overtakes it: 5 shared
+        // tokens over a 13-token union scores 0.385, below the generic
+        // signature's 0.6. That inversion is the defect.
+        store
+            .record_procedure(
+                "fix the failing parser test in the tokenizer module after the refactor landed on main",
+                "specific",
+                ProcedureOutcome::Succeeded,
+                None,
+            )
+            .unwrap();
+        store
+            .record_procedure("fix the test", "vague", ProcedureOutcome::Succeeded, None)
+            .unwrap();
+
+        let recalled = store
+            .recall_procedures(
+                &ProcedureRecallOptions::new("fix the failing parser test").limit(10),
+            )
+            .unwrap();
+        assert_eq!(
+            recalled[0].procedure.plan,
+            "specific",
+            "the signature that actually covers the goal must rank first; \
+             coverage {} vs {}",
+            recalled[0].similarity,
+            recalled.get(1).map_or(0.0, |r| r.similarity),
+        );
+    }
+
+    /// Coverage alone would rank a signature padded with unrelated tokens equal
+    /// to a tight one, since both cover the goal completely. Jaccard breaks that
+    /// tie toward the plan that is about less else.
+    #[test]
+    fn tightness_breaks_ties_between_equally_covering_signatures() {
+        let store = store();
+        store
+            .record_procedure(
+                "rotate the signing key and also refactor the parser and update the docs",
+                "padded",
+                ProcedureOutcome::Succeeded,
+                None,
+            )
+            .unwrap();
+        store
+            .record_procedure(
+                "rotate the signing key",
+                "tight",
+                ProcedureOutcome::Succeeded,
+                None,
+            )
+            .unwrap();
+
+        let recalled = store
+            .recall_procedures(&ProcedureRecallOptions::new("rotate the signing key").limit(10))
+            .unwrap();
+        assert_eq!(recalled[0].similarity, 1.0, "both cover the goal fully");
+        assert_eq!(recalled[1].similarity, 1.0);
+        assert_eq!(
+            recalled[0].procedure.plan, "tight",
+            "equal coverage, so the tighter signature wins on overlap ({} vs {})",
+            recalled[0].overlap, recalled[1].overlap,
         );
     }
 
