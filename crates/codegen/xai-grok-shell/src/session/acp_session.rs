@@ -97,6 +97,8 @@ mod auth_retry;
 mod brain;
 #[path = "acp_session_impl/goal.rs"]
 mod goal;
+#[path = "acp_session_impl/goal_procedure.rs"]
+mod goal_procedure;
 #[path = "acp_session_impl/turn.rs"]
 mod turn;
 #[path = "acp_session_impl/workflow.rs"]

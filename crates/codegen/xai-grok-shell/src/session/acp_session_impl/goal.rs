@@ -510,6 +510,7 @@ impl SessionActor {
                 // later `completed: true` lands here.
                 self.clear_pending_classifier_completions();
                 let mut tracker = self.goal_tracker.lock();
+                super::goal_procedure::promote_from_tracker(&tracker);
                 tracker.complete();
                 notify.emit_goal_updated(&mut tracker, tokens_used, finished_marginal);
                 drop(tracker);
@@ -876,6 +877,7 @@ impl SessionActor {
                     // Goal solved: the NotAchieved streak is broken and any
                     // stale strategist note must stop replaying.
                     tracker.reset_strategist_state();
+                    super::goal_procedure::promote_from_tracker(&tracker);
                     tracker.complete();
                     // Ack the location `complete()` rescued the details file
                     // to, so the "See <path>" pointer stays readable.
@@ -1022,6 +1024,7 @@ impl SessionActor {
                 // Fail-open is treated as Achieved: break the streak and drop
                 // any stale strategist note, symmetric with the real Achieved.
                 tracker.reset_strategist_state();
+                super::goal_procedure::promote_from_tracker(&tracker);
                 tracker.complete();
                 notify.emit_goal_updated(&mut tracker, tokens_used, finished_marginal);
                 UpdateGoalAck::ClassifierFailOpenAchieved {
@@ -1054,6 +1057,7 @@ impl SessionActor {
                         GapsUpdate::Clear,
                     );
                     tracker.reset_strategist_state();
+                    super::goal_procedure::promote_from_tracker(&tracker);
                     tracker.complete();
                     notify.emit_goal_updated(&mut tracker, tokens_used, finished);
                 }
