@@ -53,6 +53,10 @@ pub fn section_label(section: &McpSectionId, count: usize) -> String {
     }
 }
 
+/// Refresh binding on the MCP tab. The action-key table and the connectors wait overlay both read
+/// it so the list footer, the overlay footer, and telemetry cannot drift apart.
+pub const MCP_SERVERS_REFRESH_KEY: char = 'r';
+
 /// Base grok.com connectors URL (no team). Prefer [`managed_connectors_url`] when opening.
 pub const MANAGED_SECTION_CONNECTORS_URL: &str = "https://grok.com/connectors";
 
@@ -67,10 +71,9 @@ pub fn managed_connectors_url(team_id: Option<&str>) -> String {
     }
 }
 
-/// Display form of [`managed_connectors_url`] with the `https://` scheme dropped.
-///
-/// Used for the Managed section subtitle so the URL is shorter and more likely
-/// to fit on one row; the Ctrl+O action still opens the full-scheme URL.
+/// Display form of [`managed_connectors_url`] with the `https://` scheme dropped. Used for the
+/// Managed section subtitle so the URL is shorter and more likely to fit on one row; the. CtrlCtrl+O
+/// action still opens the full-scheme URL.
 pub fn managed_connectors_url_display(team_id: Option<&str>) -> String {
     let url = managed_connectors_url(team_id);
     url.strip_prefix("https://").unwrap_or(&url).to_string()
@@ -93,11 +96,9 @@ pub fn section_description_lines(section: &McpSectionId, team_id: Option<&str>) 
 
 /// Classify a server into a UI section.
 ///
-/// Priority: `grok_com_` prefix or managed wire source → Managed; else plugin
-/// label → Plugin; else Local. A managed server with a plugin display label
-/// still lands in Managed.
+/// Priority: a gateway / managed wire source maps to Managed; else a plugin label maps to Plugin; else Local.
 pub fn section_for(server: &McpServerInfo) -> McpSectionId {
-    if server.name.starts_with("grok_com_") || server.wire_source == McpWireSource::Managed {
+    if server.is_managed_gateway || server.wire_source == McpWireSource::Managed {
         McpSectionId::Managed
     } else if let Some(ref name) = server.plugin_name {
         McpSectionId::Plugin(name.clone())
@@ -108,7 +109,7 @@ pub fn section_for(server: &McpServerInfo) -> McpSectionId {
 
 /// Whether the user may delete this server from local config.
 pub fn is_removable(server: &McpServerInfo) -> bool {
-    server.wire_source == McpWireSource::Local && !server.name.starts_with("grok_com_")
+    server.wire_source == McpWireSource::Local && !server.is_managed_gateway
 }
 
 fn parse_wire_source(raw: Option<&str>) -> McpWireSource {
@@ -164,6 +165,10 @@ pub struct McpsServerSession {
     pub auth_required: bool,
     #[serde(default)]
     pub setup_required: bool,
+    /// Managed-policy verdict for a server the merge dropped (absent on
+    /// older shells and on live servers).
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -214,6 +219,8 @@ pub struct McpServerInfo {
     pub tools: Vec<McpToolDetail>,
     /// Whether the server is enabled in config.
     pub enabled: bool,
+    /// Policy verdict text for the expanded row; `status` carries the classification.
+    pub blocked_reason: Option<String>,
     /// Display label from `source_label` or wire `source` (e.g. `"plugin: foo"`).
     pub source: String,
     /// Wire `source` enum before display overlay.
@@ -230,6 +237,8 @@ pub enum McpServerDisplayStatus {
     SetupRequired,
     Unavailable,
     Initializing,
+    /// Dropped by managed (organization) policy; the row says why it will not start.
+    BlockedByPolicy,
 }
 
 impl McpServerDisplayStatus {
@@ -241,6 +250,7 @@ impl McpServerDisplayStatus {
             Self::SetupRequired => theme.warning,
             Self::Unavailable => theme.accent_error,
             Self::Initializing => theme.running,
+            Self::BlockedByPolicy => theme.accent_error,
         }
     }
 
@@ -252,6 +262,7 @@ impl McpServerDisplayStatus {
             Self::SetupRequired => "setup required",
             Self::Unavailable => "unavailable",
             Self::Initializing => "initializing",
+            Self::BlockedByPolicy => "blocked by policy",
         }
     }
 }
@@ -264,8 +275,18 @@ pub fn convert_list_response(resp: McpsListResponse) -> Vec<McpServerInfo> {
             let (status, tool_count, tools, auth_required, enabled) =
                 if let Some(session) = &entry.session {
                     let enabled = session.enabled;
-                    // Prefer setupRequired bool; status is a fallback for older shells.
-                    if session.setup_required {
+                    // The shell sets blockedReason only on servers its merge dropped: a terminal
+                    // verdict, so it outranks the live setup/auth statuses.
+                    if session.blocked_reason.is_some() {
+                        (
+                            McpServerDisplayStatus::BlockedByPolicy,
+                            0,
+                            vec![],
+                            false,
+                            false,
+                        )
+                    } else if session.setup_required {
+                        // Prefer setupRequired bool; status is a fallback for older shells.
                         (
                             McpServerDisplayStatus::SetupRequired,
                             0,
@@ -318,11 +339,8 @@ pub fn convert_list_response(resp: McpsListResponse) -> Vec<McpServerInfo> {
                 .source_label
                 .or(entry.source)
                 .unwrap_or_else(|| "local".to_string());
-            let setup_required = entry
-                .session
-                .as_ref()
-                .is_some_and(|session| session.setup_required)
-                || matches!(status, McpServerDisplayStatus::SetupRequired);
+            // Derived from the status so a policy-blocked row cannot also open the setup form.
+            let setup_required = status == McpServerDisplayStatus::SetupRequired;
             McpServerInfo {
                 name: entry.name,
                 display_name: entry.display_name,
@@ -334,6 +352,7 @@ pub fn convert_list_response(resp: McpsListResponse) -> Vec<McpServerInfo> {
                 setup_values: entry.setup_values.unwrap_or_default(),
                 tools,
                 enabled,
+                blocked_reason: entry.session.and_then(|s| s.blocked_reason),
                 source,
                 wire_source,
                 plugin_name,
@@ -363,22 +382,8 @@ pub fn convert_list_response(resp: McpsListResponse) -> Vec<McpServerInfo> {
     servers
 }
 
-/// Patch a single server row in-place from an `x.ai/mcp/server_status`
-/// push.
-///
-/// Finds the row by `name` and updates its `status` (and optionally its
-/// `tools` list + `tool_count`). When the named server is not present
-/// the call is a silent no-op — the pager may receive a status push
-/// for a server it has not yet fetched (e.g. the modal was just opened
-/// and the cached `mcp/list` response has not landed yet). The cheap
-/// no-op keeps the push subscription side-effect-free in that case.
-///
-/// When duplicate names exist, only the first occurrence is mutated.
-/// In practice `build_mcp_catalog` deduplicates by name before the
-/// list reaches the pager, so this is dead-code in production.
-///
-/// Returns `true` when a row was actually mutated; the caller can use
-/// this signal to decide whether a redraw is warranted.
+/// Patch a single server row in-place from an `x.ai/mcp/server_status` push. When duplicate names
+/// exist, only the first occurrence is mutated.
 pub fn patch_server_row(
     servers: &mut [McpServerInfo],
     name: &str,
@@ -412,6 +417,7 @@ mod tests {
             setup_values: std::collections::HashMap::new(),
             tools: Vec::new(),
             enabled: true,
+            blocked_reason: None,
             source: "local".to_string(),
             wire_source: McpWireSource::Local,
             plugin_name: None,
@@ -448,12 +454,56 @@ mod tests {
                     tools: vec![],
                     auth_required: false,
                     setup_required: false,
+                    blocked_reason: None,
                 }),
             }],
         })
         .into_iter()
         .next()
         .unwrap()
+    }
+
+    /// A policy-dropped server (wire `blockedReason`) converts to the "blocked by policy" status
+    /// with its reason kept; an old shell that omits the field keeps the "unavailable" fallback.
+    #[test]
+    fn convert_list_response_labels_policy_blocked_servers() {
+        let convert = |session: serde_json::Value| {
+            let entry: McpsServerEntry =
+                serde_json::from_value(serde_json::json!({ "name": "corp", "session": session }))
+                    .unwrap();
+            convert_list_response(McpsListResponse {
+                servers: vec![entry],
+            })
+            .remove(0)
+        };
+
+        let blocked = convert(serde_json::json!({
+            "enabled": false,
+            "blockedReason": "matches deniedMcpServers (/etc/grok/managed_config.toml)"
+        }));
+        assert_eq!(blocked.status, McpServerDisplayStatus::BlockedByPolicy);
+        assert_eq!(blocked.status.label(), "blocked by policy");
+        assert!(!blocked.enabled);
+        assert_eq!(
+            blocked.blocked_reason.as_deref(),
+            Some("matches deniedMcpServers (/etc/grok/managed_config.toml)")
+        );
+
+        // The verdict outranks a co-emitted setup flag, including the field the setup form keys on.
+        let blocked_setup = convert(serde_json::json!({
+            "enabled": false,
+            "setupRequired": true,
+            "blockedReason": "matches deniedMcpServers (/etc/grok/managed_config.toml)"
+        }));
+        assert_eq!(
+            blocked_setup.status,
+            McpServerDisplayStatus::BlockedByPolicy
+        );
+        assert!(!blocked_setup.setup_required);
+
+        let disabled = convert(serde_json::json!({ "enabled": false }));
+        assert_eq!(disabled.status, McpServerDisplayStatus::Unavailable);
+        assert_eq!(disabled.blocked_reason, None);
     }
 
     #[test]
@@ -512,13 +562,20 @@ mod tests {
     }
 
     #[test]
-    fn section_for_grok_com_with_plugin_label_is_managed() {
-        let server = server_from_wire(
-            "grok_com_linear",
+    fn section_for_gateway_with_plugin_label_is_managed() {
+        let server = server_from_wire_with_type(
+            "managed_gateway:linear",
             Some("managed"),
             Some("plugin: my-plugin"),
+            Some("managedGateway"),
         );
         assert_eq!(section_for(&server), McpSectionId::Managed);
+    }
+
+    #[test]
+    fn section_for_grok_com_local_name_is_local() {
+        let server = server_from_wire("grok_com_linear", Some("local"), None);
+        assert_eq!(section_for(&server), McpSectionId::Local);
     }
 
     #[test]
@@ -543,9 +600,9 @@ mod tests {
     }
 
     #[test]
-    fn is_removable_rejects_grok_com_prefix() {
+    fn is_removable_allows_grok_com_local_name() {
         let server = server_from_wire("grok_com_slack", Some("local"), None);
-        assert!(!is_removable(&server));
+        assert!(is_removable(&server));
     }
 
     #[test]
@@ -599,6 +656,7 @@ mod tests {
                     tools: vec![],
                     auth_required: false,
                     setup_required: false,
+                    blocked_reason: None,
                 }),
             }
         }
@@ -642,6 +700,7 @@ mod tests {
                     tools: vec![],
                     auth_required: true,
                     setup_required: true,
+                    blocked_reason: None,
                 }),
             }],
         });
@@ -721,6 +780,7 @@ mod tests {
             }],
             enabled: true,
             source: "local".into(),
+            blocked_reason: None,
             wire_source: McpWireSource::Local,
             plugin_name: None,
             is_managed_gateway: false,
@@ -733,7 +793,7 @@ mod tests {
         );
         assert!(mutated);
         assert_eq!(servers[0].status, McpServerDisplayStatus::Unavailable);
-        // Tools left untouched when caller passes None.
+        // Tools are left untouched when the caller passes None
         assert_eq!(servers[0].tool_count, 3);
         assert_eq!(servers[0].tools.len(), 1);
         assert_eq!(servers[0].tools[0].name, "existing");

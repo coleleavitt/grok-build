@@ -5,7 +5,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::cpu_profile::{ControlError, ProfileArtifactFormat};
 
-const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024; // 64MB
+const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -19,7 +19,9 @@ pub enum ProtocolError {
     ConnectionClosed,
 }
 
-pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, ProtocolError> {
+pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Vec<u8>, ProtocolError> {
     let mut len_buf = [0u8; 4];
     match reader.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -39,7 +41,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>,
     Ok(buf)
 }
 
-pub async fn write_frame<W: AsyncWrite + Unpin>(
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     data: &[u8],
 ) -> Result<(), ProtocolError> {
@@ -72,19 +74,14 @@ where
     write_frame(writer, &data).await
 }
 
-/// Unique identifier for a connected client.
-///
-/// Each client gets a unique ID when connecting to the leader server.
+/// Unique identifier assigned to each client connecting to the leader server.
 /// IDs are monotonically increasing and wrap around at u64::MAX.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientId(pub u64);
 
 impl ClientId {
-    /// Generate a new unique client ID.
-    ///
-    /// Uses an atomic counter that wraps around at u64::MAX.
-    /// While collisions are theoretically possible after 2^64 IDs,
-    /// this is practically impossible in real-world usage.
+    /// Generate a new unique client ID from an atomic counter that wraps at u64::MAX.
+    /// Collisions would need 2^64 IDs, which never happens in practice.
     pub fn new() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -108,20 +105,16 @@ impl Default for ClientId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientMode {
-    /// Headless mode (grok agent, grok agent headless) - uses websocket relay.
-    /// Leader connects to websocket relay once and forwards messages.
+    /// Headless mode (grok agent, grok agent headless): the leader connects to the websocket relay once and forwards messages.
     Headless,
-    /// Stdio mode (grok agent stdio, grok -p) - uses local IPC.
-    /// Client sends/receives ACP messages directly via IPC.
+    /// Stdio mode (grok agent stdio, grok -p): the client sends and receives ACP messages directly via local IPC.
     Stdio,
 }
 
-/// Client capabilities reported during registration.
-///
-/// These capabilities are used by the leader to customize behavior for each client,
-/// such as injecting settings into session requests.
 pub const LEADER_PROTOCOL_VERSION: u32 = 1;
 
+/// Client capabilities reported during registration.
+/// The leader uses them to customize behavior per client, such as injecting settings into session requests.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClientCapabilities {
     /// Auto-approve all tool executions without confirmation (YOLO mode).
@@ -129,35 +122,29 @@ pub struct ClientCapabilities {
     #[serde(default)]
     pub yolo_mode: bool,
 
-    /// Classifier permission mode (auto). When true and not yolo, the leader
-    /// injects `autoMode: true` into session/new and session/load `_meta`.
+    /// Classifier permission mode (auto).
+    /// When true and not yolo, the leader injects `autoMode: true` into session/new and session/load `_meta`.
     #[serde(default)]
     pub auto_mode: bool,
 
     /// Default model ID to use for new sessions.
-    /// When set, the leader will inject `modelId` into session/new requests
-    /// (only if the request doesn't already specify a modelId).
+    /// When set, the leader injects `modelId` into session/new requests that don't already specify one.
     #[serde(default)]
     pub default_model: Option<String>,
 
     /// Client binary version (e.g., "0.1.150").
-    /// Used by the leader to detect version mismatches after client auto-updates.
-    /// If the client version differs from the leader's version, a warning is logged.
+    /// The leader logs a warning when this differs from its own version, which happens after client auto-updates.
     #[serde(default)]
     pub client_version: Option<String>,
 
     /// Whether this client has advertised `x.ai/codeNavigation.enabled`.
-    /// When true, the leader injects `codeNavEnabled: true` into `session/new`
-    /// and `session/load` requests so the agent can gate code-nav startup on a
-    /// per-client basis rather than reading from shared last-initialized state.
+    /// When true, the leader injects `codeNavEnabled: true` into `session/new` and `session/load` requests.
+    /// The agent can then gate code-nav startup per client rather than reading shared last-initialized state.
     #[serde(default)]
     pub code_nav_enabled: bool,
 
-    /// Whether the client handles terminal ACP messages (create, output, kill, etc.).
-    /// When true, the leader injects `clientTerminal: true` into `session/new` and
-    /// `session/load` so the agent routes terminal commands to the client via ACP
-    /// instead of running them locally. Per-client so a TUI (`terminal: false`) and
-    /// a web client (`terminal: true`) sharing the same leader get independent routing.
+    /// Whether the client handles terminal ACP messages (create, output, kill, etc.). When true, the leader injects `clientTerminal: true` into `session/new` and `session/load`.
+    /// The agent then routes terminal commands to the client via ACP instead of running them locally. Per-client so a TUI (`terminal: false`) and a web client (`terminal: true`) sharing the same leader get independent routing.
     #[serde(default)]
     pub terminal: bool,
 
@@ -167,6 +154,18 @@ pub struct ClientCapabilities {
     pub fs_read: bool,
     #[serde(default)]
     pub fs_write: bool,
+
+    /// Whether this client will draw a status row (`x.ai/statusLine`). When true, the leader injects `clientStatusLine: true`.
+    /// The agent then builds the payload for a client that asked, not for whichever one started the process. The flag it sets is per session, so other subscribers of a shared session receive the payload too.
+    #[serde(default)]
+    pub status_line: bool,
+
+    /// Whether this client wants live `user_message_chunk` during a prompt (`x.ai/userMessageEcho`).
+    /// When true, the leader injects `clientUserMessageEcho: true`. False is omitted so a client
+    /// that advertised at initialize is not overridden (`grok agent` is persist-only).
+    /// The flag it sets is per session, so other subscribers of a shared session receive the echo too.
+    #[serde(default)]
+    pub user_message_echo: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -180,10 +179,8 @@ pub struct LeaderCapabilities {
     pub profile_formats: Vec<ProfileArtifactFormat>,
     #[serde(default)]
     pub workspace_exposure: bool,
-    /// Whether the leader supports [`ControlCommand::RelaunchForUpdate`] — a
-    /// disruptive, bounded-grace relaunch onto a freshly-installed binary
-    /// (driven by `grok update`). Old leaders default to `false`, so a new
-    /// client falls back to advising a manual restart (graceful degradation).
+    /// Whether the leader supports [`ControlCommand::RelaunchForUpdate`], a disruptive relaunch onto a freshly-installed binary driven by `grok update`.
+    /// Old leaders default to `false`, so a new client falls back to advising a manual restart.
     #[serde(default)]
     pub relaunch_v1: bool,
 }
@@ -209,14 +206,9 @@ pub enum ControlCommand {
     WorkspaceResume,
     WorkspaceStop,
     WorkspaceStatus,
-    /// Ask the leader to relaunch onto a freshly-installed binary (driven by
-    /// `grok update`). The leader stops admitting new turns, waits a bounded
-    /// grace period for in-flight turns to finish, flushes session state, then
-    /// exits with [`ShutdownReason::AutoUpdate`] so connected clients reconnect
-    /// onto the new binary and restore their sessions via `session/load`.
-    ///
-    /// `to_version` is the version `grok update` just installed; the leader uses
-    /// it to decline if it is already running that version or newer.
+    /// Ask the leader to relaunch onto a freshly-installed binary (driven by `grok update`). The leader stops admitting new turns, waits a bounded grace period for in-flight turns, and flushes session state.
+    /// It then exits with [`ShutdownReason::AutoUpdate`] so connected clients reconnect onto the new binary and restore sessions via `session/load`.
+    /// `to_version` is the version `grok update` just installed; the leader declines if it already runs that version or newer.
     RelaunchForUpdate {
         to_version: String,
     },
@@ -272,16 +264,14 @@ pub enum ControlPayload {
         sessions: Vec<String>,
         pid: u32,
     },
-    /// Ack for [`ControlCommand::RelaunchForUpdate`]: the leader accepted the
-    /// request and will exit after a bounded grace period of `grace_ms`.
+    /// Ack for [`ControlCommand::RelaunchForUpdate`]: the leader accepted the request and will exit after a bounded grace period of `grace_ms`.
     Relaunching {
         from_version: String,
         to_version: String,
         grace_ms: u64,
     },
-    /// Response to [`ControlCommand::RelaunchForUpdate`] when the leader will not
-    /// relaunch — e.g. it is already running `to_version` or newer, or a relaunch
-    /// is already in progress.
+    /// Response to [`ControlCommand::RelaunchForUpdate`] when the leader will not relaunch.
+    /// E.g. it is already running `to_version` or newer, or a relaunch is already in progress.
     RelaunchDeclined { reason: String },
 }
 
@@ -290,7 +280,6 @@ pub enum ControlPayload {
 pub enum ClientMessage {
     Register {
         client_type: String,
-        /// Client mode determines how leader handles this client's communication
         mode: ClientMode,
         #[serde(default)]
         capabilities: ClientCapabilities,
@@ -307,23 +296,15 @@ pub enum ClientMessage {
 }
 
 /// Reason for a planned leader shutdown, sent with [`ServerMessage::ShuttingDown`].
-///
-/// ## Runtime status
-///
-/// | Variant | Emitted today? | Notes |
-/// |---------|---------------|-------|
-/// | `AutoUpdate` | **Yes** — when `run_auto_update_checker` triggers shutdown | |
-/// | `Manual` | **Yes** — default for SIGTERM, test cancellation, all other paths | |
-/// | `IdleTimeout` | **No** — reserved for a future idle-timeout feature | |
+/// ## Runtime status | Variant | Emitted today? | Notes | |---------|---------------|-------| | `AutoUpdate` | **Yes** — when `run_auto_update_checker` triggers shutdown | | | `Manual` | **Yes** — default for SIGTERM, test cancellation, all other paths | | | `IdleTimeout` | **No** — reserved for a future idle-timeout feature | |
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShutdownReason {
     /// Leader is shutting down to install a downloaded binary auto-update.
-    /// Clients should reconnect immediately via `connect_or_spawn`; the new binary
-    /// will be picked up automatically.
+    /// Clients should reconnect immediately via `connect_or_spawn`; the new binary is picked up automatically.
     AutoUpdate,
-    /// Reserved for a future idle-timeout feature (no active clients for a configurable
-    /// duration). **Not emitted in the current implementation.**
+    /// Reserved for a future idle-timeout feature (no active clients for a configurable duration).
+    /// **Not emitted in the current implementation.**
     IdleTimeout,
     /// Unspecified or externally-triggered shutdown (SIGTERM, programmatic cancel, etc.).
     Manual,
@@ -334,16 +315,12 @@ fn default_ready() -> bool {
     true
 }
 
-/// New fields must use `#[serde(default)]` — the leader and client can run different binary versions.
+/// New fields must use `#[serde(default)]`; the leader and client can run different binary versions.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    /// Registration confirmation.
-    ///
-    /// `ready` indicates whether the leader has already completed its startup
-    /// (auth + model prefetch). When `ready = false` the client **must** wait for a
-    /// subsequent [`LeaderReady`](Self::LeaderReady) message before sending any ACP
-    /// traffic — the server will hold the connection open until the leader is ready.
+    /// Registration confirmation. `ready` indicates whether the leader has already completed its startup (auth and model prefetch).
+    /// When `ready = false` the client **must** wait for a subsequent [`LeaderReady`](Self::LeaderReady) message before sending any ACP traffic. The server holds the connection open until the leader is ready.
     Registered {
         client_id: u64,
         /// Whether the leader is fully initialised and ready to forward ACP traffic.
@@ -368,27 +345,83 @@ pub enum ServerMessage {
         code: i32,
         message: String,
     },
-    /// Advance notice of a planned shutdown. Sent before [`Shutdown`](Self::Shutdown)
-    /// to give clients time to prepare for reconnection.
-    ///
-    /// Clients should treat this as a signal that [`Shutdown`](Self::Shutdown) is
-    /// imminent and pre-arm their reconnection handlers (e.g. show a banner).
+    /// Advance notice of a planned shutdown.
+    /// Sent before [`Shutdown`](Self::Shutdown) to give clients time to prepare for reconnection.
+    /// Clients should treat this as a signal that [`Shutdown`](Self::Shutdown) is imminent and prepare their reconnection handlers (e.g. show a banner).
     ShuttingDown {
         reason: ShutdownReason,
-        /// Milliseconds until the actual [`Shutdown`](Self::Shutdown) message.
-        ///
-        /// **Currently always `0`** — the server sends `Shutdown` immediately after
-        /// `ShuttingDown` with no intervening sleep. Clients must not rely on this
-        /// field providing a real grace window in the current implementation; treat
-        /// `ShuttingDown` as equivalent to an imminent `Shutdown` regardless of this
-        /// value.
+        /// Milliseconds until the actual [`Shutdown`](Self::Shutdown) message. **Currently always `0`**: the server sends `Shutdown` immediately after `ShuttingDown` with no intervening sleep.
+        /// Clients must not rely on this field providing a real grace window. Treat `ShuttingDown` as an imminent `Shutdown` regardless of this value.
         delay_ms: u64,
     },
     Shutdown,
-    /// Sent by the server after a `Registered { ready: false }` once the leader
-    /// finishes initialising. The client should treat this as the signal that
-    /// ACP traffic will now be forwarded correctly.
+    /// Sent by the server after a `Registered { ready: false }` once the leader finishes initialising.
+    /// The client should treat this as the signal that ACP traffic will now be forwarded correctly.
     LeaderReady,
+}
+
+/// Extension methods injected into the agent, named as the agent matches them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumIter)]
+pub(crate) enum InternalMethod {
+    AuthCleared,
+    EvictSessions,
+    ReloadAllMcpServers,
+    ReloadModels,
+    ReloadModelsCache,
+    ReloadProjectMcpServers,
+    ReloadSkills,
+    ReloadWorkflows,
+}
+
+impl InternalMethod {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::AuthCleared => "x.ai/internal/auth_cleared",
+            Self::EvictSessions => "x.ai/internal/evict_sessions",
+            Self::ReloadAllMcpServers => "x.ai/internal/reload_all_mcp_servers",
+            Self::ReloadModels => "x.ai/internal/reload_models",
+            Self::ReloadModelsCache => "x.ai/internal/reload_models_cache",
+            Self::ReloadProjectMcpServers => "x.ai/internal/reload_project_mcp_servers",
+            Self::ReloadSkills => "x.ai/internal/reload_skills",
+            Self::ReloadWorkflows => "x.ai/internal/reload_workflows",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        use strum::IntoEnumIterator;
+
+        Self::iter().find(|method| method.name() == name)
+    }
+
+    /// The decoder routes a custom method to `ext_method` or `ext_notification` only when it carries the `_` prefix, and rejects the bare name.
+    fn wire_name(self) -> String {
+        format!("_{}", self.name())
+    }
+}
+
+/// Not newline-terminated: the `acp_tx` forwarding loop appends the terminator.
+pub(crate) fn internal_notification(method: InternalMethod, params: serde_json::Value) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method.wire_name(),
+        "params": params,
+    })
+    .to_string()
+}
+
+/// Newline-terminated for direct injection.
+pub(crate) fn internal_request_line(
+    id: &str,
+    method: InternalMethod,
+    params: serde_json::Value,
+) -> String {
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method.wire_name(),
+        "params": params,
+    });
+    format!("{msg}\n")
 }
 
 #[cfg(test)]
@@ -510,8 +543,7 @@ mod tests {
             msg,
             ServerMessage::Registered {
                 client_id: 7,
-                // `ready` defaults to `true` via `default_ready()` — old leaders
-                // that predate the field are already initialised.
+                // `ready` defaults to `true` via `default_ready()`: old leaders that predate the field are already initialised
                 ready: true,
                 leader_protocol_version: None,
                 leader_binary_version: None,
@@ -558,10 +590,9 @@ mod tests {
 
     #[test]
     fn profile_artifact_format_serde_names_are_stable() {
-        // Wire compat contract: `svg` must stay decodable (old leaders
-        // advertise it), and `folded` is the name new binaries will start
-        // advertising once the fleet can decode it. Renaming either variant
-        // breaks the Registered handshake across version skew.
+        // Wire compat contract: `svg` must stay decodable (old leaders advertise it)
+        // `folded` is the name new binaries will start advertising once the fleet can decode it
+        // Renaming either variant breaks the Registered handshake across version skew
         assert_eq!(
             serde_json::to_string(&ProfileArtifactFormat::Svg).unwrap(),
             "\"svg\""
@@ -713,6 +744,25 @@ mod tests {
                 assert_eq!(delay_ms, 2000);
             }
             _ => panic!("Expected ShuttingDown, got {:?}", received),
+        }
+    }
+
+    #[test]
+    fn every_internal_method_carries_the_routable_prefix() {
+        use strum::IntoEnumIterator;
+
+        for method in InternalMethod::iter() {
+            for line in [
+                internal_notification(method, serde_json::json!({})),
+                internal_request_line("id", method, serde_json::json!({})),
+            ] {
+                let json: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+                assert_eq!(
+                    json["method"].as_str().and_then(|m| m.strip_prefix('_')),
+                    Some(method.name()),
+                    "unroutable wire method: {line}"
+                );
+            }
         }
     }
 

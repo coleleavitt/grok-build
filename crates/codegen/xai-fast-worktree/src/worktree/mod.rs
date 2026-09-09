@@ -11,6 +11,173 @@ use crate::copy::{CopyStats, DirtyFilesReport};
 
 pub(crate) use plan::WorktreePlan;
 
+/// Strategy strings written to `worktrees.db` `creation_mode` and metrics.
+pub const STRATEGY_GROVE_FUSE: &str = "grove-fuse";
+pub const STRATEGY_GROVE_NFS: &str = "grove-nfs";
+/// Deprecated alias for [`STRATEGY_GROVE_NFS`]. Still accepted on read/GC.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const STRATEGY_NFS: &str = "nfs";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const STRATEGY_OVERLAY: &str = "overlay";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const STRATEGY_BTRFS: &str = "btrfs";
+pub const STRATEGY_COPY: &str = "copy";
+pub const STRATEGY_GIT: &str = "git";
+pub const STRATEGY_STANDALONE: &str = "standalone";
+
+/// Projected grove worktree: Linux FUSE, macOS NFS, or the legacy `nfs` spelling.
+#[must_use]
+pub fn is_grove_strategy(s: &str) -> bool {
+    matches!(s, STRATEGY_GROVE_FUSE | STRATEGY_GROVE_NFS | STRATEGY_NFS)
+}
+
+/// The one decline both the Grove arm and the workspace's pre-dispatch rewrite
+/// can reach, so they account for the same source the same way.
+pub const SKIP_SOURCE_IS_GROVE_MOUNT: &str = "source is itself a Grove mount";
+
+/// Outcome of the Grove arm when it was requested.
+pub(crate) enum GroveTry {
+    Adopted(Box<CreateWorktreeResult>),
+    Skipped(GroveSkip),
+}
+
+impl std::fmt::Debug for GroveTry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Adopted(_) => f.write_str("Adopted(..)"),
+            Self::Skipped(skip) => f.debug_tuple("Skipped").field(skip).finish(),
+        }
+    }
+}
+
+/// Why the Grove arm declined. Every variant is a fallthrough: the next arm runs.
+/// `Display` is the wording that reaches the user through the strategy report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroveSkip {
+    /// Linux-only: macOS reaches Grove over NFS and never reads `/dev/fuse`.
+    #[cfg(target_os = "linux")]
+    FuseUnavailable,
+    #[cfg(target_os = "linux")]
+    PrivateMountNamespace,
+    SourceIsGroveMount,
+    PreserveOnLinkedView,
+    MountTableInconclusive,
+    PreserveOnInconclusiveLinkedView,
+    JjSourceRepo,
+    PreserveNonHeadRef,
+    HeadUnreadableAfterAdopt,
+    DaemonDeclined,
+}
+
+impl GroveSkip {
+    /// The daemon is the only decline its capability class explains; every other
+    /// variant is a local decision the daemon never saw, so grading it there
+    /// would spend a Status RPC to answer a question nobody asked.
+    pub(crate) fn is_daemon_refusal(self) -> bool {
+        matches!(self, Self::DaemonDeclined)
+    }
+}
+
+impl std::fmt::Display for GroveSkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // This text is printed to users, not just logged: say what happened in
+        // the user's terms, not in the implementation's.
+        f.write_str(match self {
+            #[cfg(target_os = "linux")]
+            Self::FuseUnavailable => "/dev/fuse or fusermount is missing",
+            #[cfg(target_os = "linux")]
+            Self::PrivateMountNamespace => "this process is in a private mount namespace",
+            Self::SourceIsGroveMount => crate::worktree::SKIP_SOURCE_IS_GROVE_MOUNT,
+            Self::PreserveOnLinkedView => {
+                "uncommitted changes cannot be carried onto a linked Grove view"
+            }
+            Self::MountTableInconclusive => "the source's mount table could not be read",
+            Self::PreserveOnInconclusiveLinkedView => {
+                "uncommitted changes cannot be carried onto a possibly linked Grove view"
+            }
+            Self::JjSourceRepo => "the source is a jj repo",
+            Self::PreserveNonHeadRef => {
+                "uncommitted changes cannot be carried onto a different ref"
+            }
+            Self::HeadUnreadableAfterAdopt => "the new worktree's HEAD could not be read",
+            Self::DaemonDeclined => "the Grove daemon declined or was unreachable",
+        })
+    }
+}
+
+/// A dispatch arm that can decline before a later arm serves the worktree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreeArm {
+    GroveFuse,
+    GroveNfs,
+    Overlay,
+    Btrfs,
+}
+
+impl WorktreeArm {
+    /// Only a Grove skip explains why Grove did not serve the worktree; a
+    /// snapshot arm's skip means an earlier arm lost and Grove never ran.
+    #[must_use]
+    pub fn is_grove(self) -> bool {
+        matches!(self, Self::GroveFuse | Self::GroveNfs)
+    }
+
+    #[must_use]
+    fn label(self) -> &'static str {
+        match self {
+            Self::GroveFuse => STRATEGY_GROVE_FUSE,
+            Self::GroveNfs => STRATEGY_GROVE_NFS,
+            Self::Overlay => STRATEGY_OVERLAY,
+            Self::Btrfs => STRATEGY_BTRFS,
+        }
+    }
+}
+
+/// One arm that did not serve the worktree, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArmSkip {
+    pub arm: WorktreeArm,
+    /// One line: a typed Grove decline, or a flattened error chain.
+    pub detail: String,
+    /// Set when the Grove arm declined with a [`GroveSkip`]. Absent on snapshot-arm
+    /// failures and flattened error chains, which have no typed Grove decline.
+    pub grove_skip: Option<GroveSkip>,
+}
+
+impl ArmSkip {
+    pub fn new(arm: WorktreeArm, detail: impl Into<String>) -> Self {
+        Self {
+            arm,
+            detail: detail.into(),
+            grove_skip: None,
+        }
+    }
+
+    pub fn from_grove(arm: WorktreeArm, skip: GroveSkip) -> Self {
+        Self {
+            arm,
+            detail: skip.to_string(),
+            grove_skip: Some(skip),
+        }
+    }
+}
+
+impl std::fmt::Display for ArmSkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.arm.label(), self.detail)
+    }
+}
+
+/// Skip lines joined for a log field or a fallback message.
+#[must_use]
+pub fn render_arm_skips(skips: &[ArmSkip]) -> String {
+    skips
+        .iter()
+        .map(ArmSkip::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Result of worktree creation.
 #[derive(Debug)]
 pub struct CreateWorktreeResult {
@@ -28,6 +195,18 @@ pub struct CreateWorktreeResult {
 
     /// Report about dirty files (modified/untracked/deleted) in the source worktree
     pub dirty_files_report: Option<DirtyFilesReport>,
+
+    /// Which dispatch arm actually ran (`grove-fuse` / `grove-nfs` / `overlay` / `btrfs` / `copy` / `git` / `standalone`).
+    pub resolved_strategy: &'static str,
+
+    /// Arm-specific metadata (NFS mount/backing/pin; overlay/btrfs snapshot paths).
+    pub strategy_metadata: Option<serde_json::Value>,
+
+    /// Arms that declined before the one that ran.
+    pub skipped: Vec<ArmSkip>,
+
+    /// Grove daemon capability class: `current`, `old`, or `unknown`.
+    pub daemon_capability_class: Option<&'static str>,
 }
 
 /// Execute worktree creation plan. This is a blocking operation.
@@ -39,6 +218,15 @@ pub(crate) fn execute_plan(plan: WorktreePlan) -> Result<CreateWorktreeResult> {
 mod tests {
     use super::*;
     use crate::{IgnoredFilesMode, WorkingTreeMode, WorktreeBuilder};
+
+    #[test]
+    fn grove_strategy_names() {
+        assert!(is_grove_strategy(STRATEGY_GROVE_FUSE));
+        assert!(is_grove_strategy(STRATEGY_GROVE_NFS));
+        assert!(is_grove_strategy(STRATEGY_NFS));
+        assert!(!is_grove_strategy(STRATEGY_COPY));
+        assert!(!is_grove_strategy("linked"));
+    }
     use tempfile::TempDir;
     use xai_test_utils::git::{git_commit_all, init_git_repo};
 
@@ -64,6 +252,11 @@ mod tests {
         assert!(result.worktree_path.exists());
         assert!(result.worktree_path.join("file.txt").exists());
         assert!(!result.commit.is_empty());
+        assert_eq!(result.resolved_strategy, "copy");
+        assert!(
+            crate::grove_wt_create_count("copy") >= 1,
+            "grove_wt_create must record the copy arm"
+        );
     }
 
     #[test]
@@ -1218,14 +1411,331 @@ mod tests {
         assert!(result.ignored_copy.is_some());
     }
 
+    #[test]
+    fn test_standalone_worktree_narrows_origin_fetch() {
+        xai_test_utils::require_git!();
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+        init_git_repo(&repo_path);
+        std::fs::write(repo_path.join("file.txt"), "content").unwrap();
+        git_commit_all(&repo_path, "initial");
+        let branch =
+            xai_test_utils::git::run_git(&repo_path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        xai_test_utils::git::run_git(
+            &repo_path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/xai-org/xai.git",
+            ],
+        );
+        xai_test_utils::git::run_git(
+            &repo_path,
+            &[
+                "config",
+                "--replace-all",
+                "remote.origin.fetch",
+                "+refs/heads/*",
+            ],
+        );
+        assert_eq!(
+            xai_test_utils::git::run_git(&repo_path, &["config", "--get", "remote.origin.fetch"]),
+            "+refs/heads/*"
+        );
+
+        let worktree_path = temp.path().join("standalone");
+        WorktreeBuilder::new(repo_path.clone(), worktree_path.clone())
+            .standalone(true)
+            .create()
+            .unwrap();
+
+        assert_eq!(
+            xai_test_utils::git::run_git(
+                &worktree_path,
+                &["config", "--get-all", "remote.origin.fetch"]
+            ),
+            format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")
+        );
+        assert_eq!(
+            xai_test_utils::git::run_git(&worktree_path, &["config", "--get", "remote.origin.url"]),
+            "https://github.com/xai-org/xai.git"
+        );
+    }
+
+    #[test]
+    fn test_standalone_worktree_drops_inconsistent_shallow() {
+        xai_test_utils::require_git!();
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+        init_git_repo(&repo_path);
+        std::fs::write(repo_path.join("a.txt"), "a").unwrap();
+        git_commit_all(&repo_path, "A");
+        let a = xai_test_utils::git::run_git(&repo_path, &["rev-parse", "HEAD"]);
+        std::fs::write(repo_path.join("b.txt"), "b").unwrap();
+        git_commit_all(&repo_path, "B");
+        let b = xai_test_utils::git::run_git(&repo_path, &["rev-parse", "HEAD"]);
+        xai_test_utils::git::run_git(&repo_path, &["checkout", "-b", "feature", &a]);
+        std::fs::write(repo_path.join("d.txt"), "d").unwrap();
+        git_commit_all(&repo_path, "D");
+        xai_test_utils::git::run_git(&repo_path, &["update-ref", "refs/heads/main", &b]);
+        xai_test_utils::git::run_git(&repo_path, &["update-ref", "refs/remotes/origin/main", &b]);
+        std::fs::write(repo_path.join(".git/shallow"), format!("{b}\n")).unwrap();
+
+        let worktree_path = temp.path().join("standalone");
+        WorktreeBuilder::new(repo_path, worktree_path.clone())
+            .standalone(true)
+            .create()
+            .unwrap();
+
+        assert!(!worktree_path.join(".git/shallow").exists());
+        assert_eq!(
+            xai_test_utils::git::run_git(&worktree_path, &["rev-parse", "--is-shallow-repository"]),
+            "false"
+        );
+        assert_eq!(
+            xai_test_utils::git::run_git(&worktree_path, &["rev-parse", "HEAD^"]),
+            a
+        );
+    }
+
+    #[test]
+    fn test_standalone_worktree_sanitizes_after_checkout_ref() {
+        xai_test_utils::require_git!();
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+        init_git_repo(&repo_path);
+        std::fs::write(repo_path.join("a.txt"), "a").unwrap();
+        git_commit_all(&repo_path, "A");
+        let a = xai_test_utils::git::run_git(&repo_path, &["rev-parse", "HEAD"]);
+        std::fs::write(repo_path.join("b.txt"), "b").unwrap();
+        git_commit_all(&repo_path, "B");
+        let b = xai_test_utils::git::run_git(&repo_path, &["rev-parse", "HEAD"]);
+        std::fs::write(repo_path.join("c.txt"), "c").unwrap();
+        git_commit_all(&repo_path, "C");
+        let source_branch =
+            xai_test_utils::git::run_git(&repo_path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        xai_test_utils::git::run_git(&repo_path, &["checkout", "-b", "feature", &a]);
+        std::fs::write(repo_path.join("d.txt"), "d").unwrap();
+        git_commit_all(&repo_path, "D");
+        xai_test_utils::git::run_git(&repo_path, &["checkout", &source_branch]);
+        assert_ne!(source_branch, "feature");
+        xai_test_utils::git::run_git(
+            &repo_path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/xai-org/xai.git",
+            ],
+        );
+        xai_test_utils::git::run_git(
+            &repo_path,
+            &[
+                "config",
+                "--replace-all",
+                "remote.origin.fetch",
+                "+refs/heads/*",
+            ],
+        );
+        xai_test_utils::git::run_git(&repo_path, &["update-ref", "refs/remotes/origin/main", &b]);
+        xai_test_utils::git::run_git(
+            &repo_path,
+            &["update-ref", "refs/remotes/origin/feature", &a],
+        );
+        xai_test_utils::git::run_git(&repo_path, &["update-ref", "refs/remotes/origin/noise", &b]);
+        std::fs::write(repo_path.join(".git/shallow"), format!("{b}\n")).unwrap();
+
+        let worktree_path = temp.path().join("standalone");
+        WorktreeBuilder::new(repo_path, worktree_path.clone())
+            .standalone(true)
+            .git_ref("feature")
+            .create()
+            .unwrap();
+
+        assert_eq!(
+            xai_test_utils::git::run_git(&worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "feature"
+        );
+        assert_eq!(
+            xai_test_utils::git::run_git(
+                &worktree_path,
+                &["rev-parse", "refs/remotes/origin/feature"]
+            ),
+            a,
+            "checkout dest-branch origin ref must survive source-HEAD CoW prune"
+        );
+        let noise = std::process::Command::new("git")
+            .current_dir(&worktree_path)
+            .args(["show-ref", "--verify", "refs/remotes/origin/noise"])
+            .output()
+            .unwrap();
+        assert!(
+            !noise.status.success(),
+            "unrelated origin/noise must still be pruned after checkout sanitize"
+        );
+        assert_eq!(
+            xai_test_utils::git::run_git(
+                &worktree_path,
+                &["config", "--get-all", "remote.origin.fetch"]
+            ),
+            "+refs/heads/feature:refs/remotes/origin/feature"
+        );
+        assert!(
+            !worktree_path.join(".git/shallow").exists(),
+            "after checkout, graft B is unused and its parent is in the ODB"
+        );
+        assert_eq!(
+            xai_test_utils::git::run_git(&worktree_path, &["rev-parse", "--is-shallow-repository"]),
+            "false"
+        );
+        assert_eq!(
+            xai_test_utils::git::run_git(&worktree_path, &["rev-parse", "HEAD^"]),
+            a
+        );
+    }
+
+    #[test]
+    fn test_standalone_worktree_keeps_origin_ref_after_detached_checkout() {
+        xai_test_utils::require_git!();
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+        init_git_repo(&repo_path);
+        std::fs::write(repo_path.join("a.txt"), "a").unwrap();
+        git_commit_all(&repo_path, "A");
+        let a = xai_test_utils::git::run_git(&repo_path, &["rev-parse", "HEAD"]);
+        std::fs::write(repo_path.join("b.txt"), "b").unwrap();
+        git_commit_all(&repo_path, "B");
+        let b = xai_test_utils::git::run_git(&repo_path, &["rev-parse", "HEAD"]);
+        xai_test_utils::git::run_git(&repo_path, &["branch", "feature", &a]);
+        xai_test_utils::git::run_git(
+            &repo_path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/xai-org/xai.git",
+            ],
+        );
+        xai_test_utils::git::run_git(
+            &repo_path,
+            &["update-ref", "refs/remotes/origin/feature", &a],
+        );
+        xai_test_utils::git::run_git(&repo_path, &["update-ref", "refs/remotes/origin/noise", &b]);
+
+        let worktree_path = temp.path().join("standalone");
+        WorktreeBuilder::new(repo_path, worktree_path.clone())
+            .standalone(true)
+            .git_ref("origin/feature")
+            .create()
+            .unwrap();
+
+        assert_eq!(
+            xai_test_utils::git::run_git(&worktree_path, &["rev-parse", "HEAD"]),
+            a
+        );
+        assert_eq!(
+            xai_test_utils::git::run_git(
+                &worktree_path,
+                &["rev-parse", "refs/remotes/origin/feature"]
+            ),
+            a,
+            "detached origin/feature checkout must keep that remote-tracking ref"
+        );
+        let noise = std::process::Command::new("git")
+            .current_dir(&worktree_path)
+            .args(["show-ref", "--verify", "refs/remotes/origin/noise"])
+            .output()
+            .unwrap();
+        assert!(
+            !noise.status.success(),
+            "unrelated origin/noise must still be pruned"
+        );
+    }
+
+    #[test]
+    fn test_standalone_worktree_skips_extra_origin_remotes() {
+        xai_test_utils::require_git!();
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+        init_git_repo(&repo_path);
+        std::fs::write(repo_path.join("file.txt"), "content").unwrap();
+        git_commit_all(&repo_path, "initial");
+        let head = xai_test_utils::git::run_git(&repo_path, &["rev-parse", "HEAD"]);
+        let branch =
+            xai_test_utils::git::run_git(&repo_path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        xai_test_utils::git::run_git(
+            &repo_path,
+            &["update-ref", "refs/remotes/origin/main", &head],
+        );
+        xai_test_utils::git::run_git(
+            &repo_path,
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/{branch}"),
+                &head,
+            ],
+        );
+        for i in 0..40 {
+            xai_test_utils::git::run_git(
+                &repo_path,
+                &[
+                    "update-ref",
+                    &format!("refs/remotes/origin/branch-{i}"),
+                    &head,
+                ],
+            );
+        }
+
+        let worktree_path = temp.path().join("standalone");
+        WorktreeBuilder::new(repo_path, worktree_path.clone())
+            .standalone(true)
+            .create()
+            .unwrap();
+
+        assert_eq!(
+            xai_test_utils::git::run_git(
+                &worktree_path,
+                &["rev-parse", "refs/remotes/origin/main"]
+            ),
+            head
+        );
+        assert_eq!(
+            xai_test_utils::git::run_git(
+                &worktree_path,
+                &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+            ),
+            head
+        );
+        for i in 0..40 {
+            let show = std::process::Command::new("git")
+                .current_dir(&worktree_path)
+                .args([
+                    "show-ref",
+                    "--verify",
+                    &format!("refs/remotes/origin/branch-{i}"),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                !show.status.success(),
+                "standalone dest must not have origin/branch-{i}"
+            );
+        }
+    }
+
     // ─── Cancellation / partial-creation cleanup tests ───────────────────
 
     #[test]
     fn test_linked_cancel_after_worktree_add_deregisters() {
         // A pre-cancelled Linked creation bails right after `git worktree add`.
-        // The partial worktree dir AND its `.git/worktrees/<name>` registration
-        // must both be cleaned up, so a later create at the same dest isn't
-        // blocked by a stale registration.
+        // Both the partial dir and its `.git/worktrees/<name>` registration must
+        // be cleaned up, or a later create at the same dest is blocked.
         xai_test_utils::require_git!();
         use crate::CreationMode;
         use tokio_util::sync::CancellationToken;
@@ -1260,11 +1770,8 @@ mod tests {
     #[test]
     fn test_standalone_cancel_removes_partial_dest() {
         // A pre-cancelled standalone creation must join the background `.git/`
-        // copy thread and then remove the partial dest — no leftover dir.
-        // NOTE: with a tiny repo the `.git/` copy finishes ~instantly, so this
-        // covers the join-before-teardown ORDERING structurally (no timing
-        // fault-injection); the unconditional join in execute.rs makes it safe
-        // regardless of thread timing.
+        // copy and then remove the partial dest. A tiny repo finishes instantly,
+        // so this pins join-before-teardown ordering, not timing.
         xai_test_utils::require_git!();
         use tokio_util::sync::CancellationToken;
 
@@ -1289,10 +1796,9 @@ mod tests {
 
     #[test]
     fn test_linked_hard_error_reclaims_and_deregisters() {
-        // A hard (non-cancel) error AFTER `git worktree add` arms the guard must
-        // reclaim the dir AND deregister `.git/worktrees/<name>` — proves the
-        // guard fires on the error path, not only on cancel. An invalid
-        // ignored-files glob makes the ignored-copy phase fail deterministically.
+        // A hard error after `git worktree add` must reclaim the dir and
+        // deregister `.git/worktrees/<name>` — the guard fires on error, not
+        // only on cancel. An invalid ignored-files glob fails that phase.
         xai_test_utils::require_git!();
         use crate::{CreationMode, IgnoredFilesMode};
 

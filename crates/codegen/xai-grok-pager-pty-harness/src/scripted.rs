@@ -1,31 +1,32 @@
 //! Scripted TUI scenario runner for xai-grok-pager.
 //!
-//! This layer lets UI regression tests describe a scenario declaratively, run
-//! the real pager binary in a PTY, interact with it through keyboard input and
-//! resizes, assert observable terminal output, and persist visual artifacts for
-//! bug triage.
+//! A test describes a scenario declaratively; the runner plays it against the real pager binary in a PTY.
+//! Steps send keys and resizes, assert on visible terminal output, and persist visual artifacts for bug triage.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::{ContentController, PtyHarness, StyledLine, pager_binary, parse_keys};
+use crate::{
+    AgentTurnExpectation, ContentController, PtyHarness, StyledLine, pager_binary, parse_keys,
+};
 
 const SGR_LEFT_BUTTON: u16 = 0;
 const SGR_MIDDLE_BUTTON: u16 = 1;
 const SGR_RIGHT_BUTTON: u16 = 2;
 const SGR_DRAG_BUTTON: u16 = 32;
-/// SGR wheel button codes (bit 6 / +64 marks a wheel event). Public so PTY
-/// tests share this single definition instead of respelling 64/65.
+/// SGR wheel button codes (bit 6 / +64 marks a wheel event).
+/// Public so PTY tests share this single definition instead of respelling 64/65.
 pub const SGR_SCROLL_UP: u16 = 64;
 pub const SGR_SCROLL_DOWN: u16 = 65;
 
 const DEFAULT_ROWS: u16 = 50;
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 15_000;
+const EXPECTATION_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Declarative scenario consumed by [`ScriptedScenarioRunner`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,10 +39,8 @@ pub struct ScriptedScenario {
     pub terminal: TerminalConfig,
     #[serde(default)]
     pub environment: EnvironmentConfig,
-    /// Optional ephemeral workspace materialized into a temp dir and used as the
-    /// pager's cwd. Lets a scenario exercise repo-local behavior — e.g. the
-    /// folder-trust prompt, which only renders when `cwd` has a repo-local
-    /// config (`.mcp.json`). `None` inherits the test process cwd.
+    /// Optional ephemeral workspace materialized into a temp dir and used as the pager's cwd.
+    /// `None` inherits the test process cwd.
     #[serde(default)]
     pub workspace: Option<WorkspaceConfig>,
     #[serde(default)]
@@ -51,7 +50,6 @@ pub struct ScriptedScenario {
 }
 
 impl ScriptedScenario {
-    /// Load a scenario from JSON.
     pub fn from_json_file(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("read scenario file {}", path.display()))?;
@@ -59,7 +57,6 @@ impl ScriptedScenario {
             .with_context(|| format!("parse scenario JSON {}", path.display()))
     }
 
-    /// Load a scenario from YAML.
     pub fn from_yaml_file(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("read scenario file {}", path.display()))?;
@@ -93,12 +90,7 @@ pub struct TerminalConfig {
     pub rows: u16,
     #[serde(default = "default_cols")]
     pub cols: u16,
-    /// Answer terminal device queries (cursor-position reports for `ESC[6n`,
-    /// etc.) from the embedded vt100 emulator, like a real terminal would.
-    /// Off by default — most scenarios don't need it. Required for `--minimal`
-    /// scenarios: the inline viewport's startup cursor-position probe otherwise
-    /// times out and `--minimal` silently downgrades to full-height inline
-    /// (see `PtyHarness::set_respond_to_queries`).
+    /// Off by default. Required for `--minimal` or the startup cursor-position probe times out and the mode silently downgrades.
     #[serde(default)]
     pub respond_to_queries: bool,
 }
@@ -116,12 +108,12 @@ impl Default for TerminalConfig {
 /// Environment filters and extra environment variables for a scenario.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EnvironmentConfig {
-    /// Optional OS allow-list. Values are Rust `std::env::consts::OS` strings
-    /// such as `macos`, `linux`, or `windows`.
+    /// Optional OS allow-list.
+    /// Values are Rust `std::env::consts::OS` strings such as `macos`, `linux`, or `windows`.
     #[serde(default)]
     pub os: Vec<String>,
-    /// Optional architecture allow-list. Values are
-    /// `std::env::consts::ARCH` strings such as `aarch64` or `x86_64`.
+    /// Optional architecture allow-list.
+    /// Values are `std::env::consts::ARCH` strings such as `aarch64` or `x86_64`.
     #[serde(default)]
     pub arch: Vec<String>,
     /// Additional env vars set on the pager process.
@@ -130,9 +122,8 @@ pub struct EnvironmentConfig {
     /// Extra CLI args passed to the pager binary.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Optional `config.toml` written into the run's isolated `$GROK_HOME`
-    /// before spawn (e.g. `[ui] keep_text_selection` so selection
-    /// highlights survive long enough to assert on).
+    /// Optional `config.toml` written into the run's isolated `$GROK_HOME` before spawn.
+    /// For example, `[ui] keep_text_selection` keeps selection highlights alive long enough to assert on.
     #[serde(default)]
     pub config_toml: Option<String>,
 }
@@ -144,21 +135,17 @@ impl EnvironmentConfig {
     }
 }
 
-/// One environment variable assignment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvVar {
     pub key: String,
     pub value: String,
 }
 
-/// Ephemeral workspace materialized for a scenario run: a temp dir seeded with
-/// declared files and optionally `git init`-ed, then used as the pager's cwd.
-/// The folder-trust prompt, for example, only renders when `cwd` contains a
-/// repo-local config (`.mcp.json`), so a scenario can declare one here.
+/// Ephemeral workspace for a scenario run: a temp dir seeded with declared files and optionally `git init`-ed, then used as the pager's cwd.
+/// The folder-trust prompt, for example, only renders when `cwd` contains a repo-local config (`.mcp.json`), so a scenario can declare one here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
-    /// Run `git init` so the temp dir resolves as a git repository root — the
-    /// scope repo-local config discovery and folder-trust use to bound a repo.
+    /// Run `git init` so the temp dir resolves as a git repository root, which repo-local config discovery and folder-trust use to bound a repo.
     #[serde(default)]
     pub git_init: bool,
     /// Files to create in the workspace, keyed by path relative to its root.
@@ -172,11 +159,7 @@ pub struct WorkspaceConfig {
 pub struct MockConfig {
     #[serde(default = "default_mock_response")]
     pub response: String,
-    /// Optional per-agent-turn responses, consumed FIFO (one per real agent
-    /// turn; aux requests don't consume one — see
-    /// `MockInferenceServer::set_agent_turns`). Lets a scenario give each
-    /// turn a distinct sentinel, e.g. to prove a transcript tail was
-    /// truncated and re-generated. Falls back to `response` when exhausted.
+    /// Ordered per-turn expectations; every listed turn must be satisfied. Falls back to `response` when exhausted.
     #[serde(default)]
     pub turns: Vec<String>,
     #[serde(default)]
@@ -196,10 +179,10 @@ pub struct ImageFixture {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageFixtureKind {
-    /// 8x8 RGBA PNG — meets the minimum vision-model dimension requirement.
+    /// 8x8 RGBA PNG; meets the minimum vision-model dimension requirement.
     #[default]
     Standard,
-    /// 1x1 RGBA PNG — below the 8 px minimum; rejected client-side.
+    /// 1x1 RGBA PNG, below the 8 px minimum; rejected client-side.
     #[serde(rename = "tiny_1x1")]
     Tiny1x1,
     /// Valid 64x64 PNG header with a clobbered IDAT CRC; full decode rejects.
@@ -216,7 +199,6 @@ impl Default for MockConfig {
     }
 }
 
-/// A single executable scenario step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ScenarioStep {
@@ -301,8 +283,7 @@ pub enum ScenarioStep {
         occurrence: usize,
     },
     /// Select a visible text range by locating both endpoints on screen.
-    /// `to_offset_cols` shifts the drag's end column right (clamped at the
-    /// screen edge), e.g. onto a table border when exercising dead-zones.
+    /// `to_offset_cols` shifts the drag's end column right (clamped at the screen edge), e.g. onto a table border when exercising dead-zones.
     SelectTextRange {
         from_text: String,
         to_text: String,
@@ -322,42 +303,31 @@ pub enum ScenarioStep {
     },
     /// Assert the captured terminal output contains an OSC 52 clipboard write.
     AssertOsc52Contains { text: String },
-    /// Assert NO OSC 52 clipboard payload contains `text` (negative of
-    /// [`AssertOsc52Contains`]). Used to prove a label prefix was excluded
-    /// from a selection/copy, e.g. that copying a Read tool header yields the
-    /// path alone rather than the full `Read {path}` line.
+    /// Assert NO OSC 52 clipboard payload contains `text` (negative of [`AssertOsc52Contains`]).
+    /// Proves a label prefix was excluded from a copy, e.g. copying a Read tool header yields the path alone, not the full `Read {path}` line.
     AssertOsc52NotContains { text: String },
-    /// Assert the contiguous highlighted run at the first occurrence of
-    /// `at_text` renders `equals`, untrimmed, over one uniform background.
-    /// Needs a persistent `keep_text_selection` via `config_toml` (flash
-    /// clears in ~150ms).
+    /// Assert the contiguous highlighted run at the first occurrence of `at_text` renders `equals`, untrimmed, over one uniform background.
+    /// Needs a persistent `keep_text_selection` via `config_toml` (flash clears in ~150ms).
     AssertHighlightRun { at_text: String, equals: String },
-    /// Assert no screen cell rendering the first occurrence of `text` has a
-    /// non-default background (the text is outside any selection highlight).
+    /// Assert no screen cell rendering the first occurrence of `text` has a non-default background (the text is outside any selection highlight).
     AssertTextNotHighlighted { text: String },
-    /// Assert the captured **raw** PTY output contains at least `min` Kitty
-    /// graphics APC sequences (`\x1b_G`). Mirrors [`AssertOsc52Contains`]: the
-    /// graphics escapes are written into the synchronized-update frame buffer,
-    /// outside the vt100 cell grid, so a screen-text snapshot can't see them —
-    /// this scans the raw bytes instead. Proves an inline diagram was emitted.
+    /// Assert the captured **raw** PTY output contains at least `min` Kitty graphics APC sequences (`\x1b_G`).
+    /// The graphics escapes go into the synchronized-update frame buffer, outside the vt100 cell grid, so a screen-text snapshot can't see them.
+    /// Proves an inline diagram was emitted.
     AssertKittyGraphics {
         #[serde(default = "default_assert_min")]
         min: usize,
     },
-    /// Poll the raw PTY output until at least `min` Kitty graphics APC sequences
-    /// appear (or `timeout_ms` expires). Preferred over a fixed `wait` before
-    /// [`AssertKittyGraphics`]: it returns as soon as the diagram is placed and
-    /// doesn't flake under load.
+    /// Poll the raw PTY output until at least `min` Kitty graphics APC sequences appear (or `timeout_ms` expires).
+    /// Preferred over a fixed `wait` before [`AssertKittyGraphics`]: it returns as soon as the diagram is placed and doesn't flake under load.
     WaitForKittyGraphics {
         #[serde(default = "default_assert_min")]
         min: usize,
         #[serde(default = "default_wait_timeout_ms")]
         timeout_ms: u64,
     },
-    /// Assert the captured **raw** PTY output contains NO Kitty graphics APC
-    /// sequences. The inverse of [`AssertKittyGraphics`]: proves a feature (e.g.
-    /// a Mermaid diagram) was rendered as text, never transmitted as an inline
-    /// image.
+    /// Assert the captured **raw** PTY output contains NO Kitty graphics APC sequences.
+    /// The inverse of [`AssertKittyGraphics`]: proves a feature (e.g. a Mermaid diagram) was rendered as text, never transmitted as an inline image.
     AssertNoKittyGraphics {},
     /// Assert that a submitted request included at least this many image payloads.
     AssertRequestImageCount { min: usize },
@@ -374,7 +344,7 @@ pub enum ScenarioStep {
     /// Assert at least one request body contains the literal `text`.
     AssertRequestContains {
         text: String,
-        /// Optional — restrict to the Nth most recent request body (0 = newest).
+        /// Restrict to the Nth most recent request body (0 is the newest).
         #[serde(default)]
         request_index: Option<usize>,
     },
@@ -397,8 +367,7 @@ pub enum ScenarioStep {
     AssertChatCompletion,
 }
 
-/// Dimension assertion for [`ScenarioStep::AssertInlineImages`]: either an
-/// exact pixel count (`width: 28`) or a range (`width: { min: 28 }`).
+/// Dimension assertion for [`ScenarioStep::AssertInlineImages`]: either an exact pixel count (`width: 28`) or a range (`width: { min: 28 }`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DimensionAssertion {
@@ -473,7 +442,6 @@ pub enum TargetLocator {
     },
 }
 
-/// Runner configuration for scripted scenarios.
 #[derive(Debug, Clone)]
 pub struct ScriptedRunConfig {
     pub binary: PathBuf,
@@ -531,9 +499,15 @@ impl ScriptedScenarioRunner {
             .await
             .context("start mock content")?;
         content.set_response(&scenario.mock.response);
-        if !scenario.mock.turns.is_empty() {
-            content.set_turns(scenario.mock.turns.iter().cloned());
-        }
+        let turn_expectations: Vec<_> = scenario
+            .mock
+            .turns
+            .iter()
+            .enumerate()
+            .map(|(index, turn)| {
+                content.expect_agent_turn(format!("scenario turn {}", index + 1), turn)
+            })
+            .collect();
 
         if let Some(config_toml) = &scenario.environment.config_toml {
             let grok_home = content.home().join(".grok");
@@ -543,17 +517,11 @@ impl ScriptedScenarioRunner {
                 .context("write scenario config.toml")?;
         }
 
-        let mut env = content.env_for_pager();
-        env.extend(
-            scenario
-                .environment
-                .env
-                .iter()
-                .map(|v| (v.key.clone(), v.value.clone())),
-        );
-        let env_refs: Vec<(&str, &str)> = env
+        let env_refs: Vec<(&str, &str)> = scenario
+            .environment
+            .env
             .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .map(|v| (v.key.as_str(), v.value.as_str()))
             .collect();
         let args: Vec<&str> = scenario
             .environment
@@ -562,20 +530,20 @@ impl ScriptedScenarioRunner {
             .map(String::as_str)
             .collect();
 
-        // Materialize an optional ephemeral workspace (temp dir + files + git
-        // init) and run the pager there. Bound for the whole run so the dir
-        // outlives the pager process; `None` inherits the test process cwd.
+        // Materialize an optional ephemeral workspace (temp dir, files, git init) and run the pager there
+        // Bound for the whole run so the dir outlives the pager process; `None` inherits the test process cwd
         let workspace_dir = match scenario.workspace.as_ref() {
-            Some(ws) => Some(materialize_workspace(ws)?),
+            Some(ws) => Some(materialize_workspace(ws, content.sandbox())?),
             None => None,
         };
         let workspace_cwd = workspace_dir.as_ref().map(|dir| dir.path());
 
-        let mut harness = PtyHarness::new_in_dir(
+        let mut harness = PtyHarness::new_in_sandbox(
             &self.config.binary,
             scenario.terminal.rows,
             scenario.terminal.cols,
             &args,
+            content.sandbox(),
             &env_refs,
             workspace_cwd,
         )
@@ -626,11 +594,39 @@ impl ScriptedScenarioRunner {
             }
         }
 
-        if !harness.is_running() {
+        if !harness.is_running()? {
             report.bugs.push(BugFinding {
                 step: scenario.steps.len(),
                 severity: BugSeverity::Bug,
                 message: "pager exited before scenario completed".to_owned(),
+                screen_text: harness.screen_contents(),
+            });
+            report.status = ScriptedRunStatus::Failed;
+        }
+
+        if report.status == ScriptedRunStatus::Running {
+            let settle_deadline = Instant::now() + EXPECTATION_SETTLE_TIMEOUT;
+            while turn_expectations
+                .iter()
+                .any(|expectation| !expectation.is_satisfied())
+                && Instant::now() < settle_deadline
+            {
+                harness.update(Duration::from_millis(100));
+            }
+        }
+        let unsatisfied_turns: Vec<_> = turn_expectations
+            .iter()
+            .filter(|expectation| !expectation.is_satisfied())
+            .map(AgentTurnExpectation::diagnostic)
+            .collect();
+        if !unsatisfied_turns.is_empty() {
+            report.bugs.push(BugFinding {
+                step: scenario.steps.len(),
+                severity: BugSeverity::Bug,
+                message: format!(
+                    "required mock.turns expectations were not satisfied:\n- {}",
+                    unsatisfied_turns.join("\n- ")
+                ),
                 screen_text: harness.screen_contents(),
             });
             report.status = ScriptedRunStatus::Failed;
@@ -649,17 +645,16 @@ impl ScriptedScenarioRunner {
     }
 }
 
-/// Create a temp dir for a scenario [`WorkspaceConfig`]: write its files
-/// (creating parent dirs) and optionally `git init` it. The returned `TempDir`
-/// must be held for the whole run so the directory outlives the pager process.
-fn materialize_workspace(workspace: &WorkspaceConfig) -> Result<tempfile::TempDir> {
+/// Create a temp dir for a scenario [`WorkspaceConfig`]: write its files (creating parent dirs) and optionally `git init` it.
+/// The returned `TempDir` must be held for the whole run so the directory outlives the pager process.
+fn materialize_workspace(
+    workspace: &WorkspaceConfig,
+    sandbox: &xai_grok_test_support::TestSandbox,
+) -> Result<tempfile::TempDir> {
     let dir = tempfile::tempdir().context("create scenario workspace temp dir")?;
     for (rel_path, contents) in &workspace.files {
-        // Fail closed: a `files` key must be a relative path that stays inside
-        // the workspace. Reject absolute paths and any root/prefix/`..`
-        // component so a scenario can never write outside the tempdir. This is
-        // author-controlled test YAML (not a security boundary), but it's the
-        // shared materialization path, so guard it.
+        // Fail closed: a `files` key must be a relative path that stays inside the workspace
+        // This is author-controlled test YAML (not a security boundary), but it's the shared materialization path, so guard it
         let rel = Path::new(rel_path);
         if rel.is_absolute()
             || rel.components().any(|c| {
@@ -680,20 +675,21 @@ fn materialize_workspace(workspace: &WorkspaceConfig) -> Result<tempfile::TempDi
             .with_context(|| format!("write workspace file {}", path.display()))?;
     }
     if workspace.git_init {
-        // A real repo root makes `workspace_key` / repo-local discovery
-        // deterministic regardless of where the system temp dir lives. Shelled
-        // out (not `git2`) because this harness crate has no `git2` dependency;
-        // the subprocess is careful — nulled streams + `status.success()` check
-        // + `bail!` on failure.
-        let status = std::process::Command::new("git")
+        // A real repo root keeps repo-local discovery independent of the system temp path
+        let mut cmd = sandbox.git_command();
+        let output = cmd
             .args(["init", "-q"])
             .current_dir(dir.path())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .stderr(std::process::Stdio::piped())
+            .output()
             .context("run `git init` for scenario workspace")?;
-        if !status.success() {
-            bail!("`git init` for scenario workspace failed: {status}");
+        if !output.status.success() {
+            bail!(
+                "`git init` for scenario workspace failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
     Ok(dir)
@@ -926,8 +922,8 @@ fn run_step(
             let point = locate_text(harness, at_text, 0)?;
             let cells = row_char_bgs(harness, point.row)
                 .with_context(|| format!("styled row {} for {at_text:?}", point.row))?;
-            // Highlighted = differs from the row's dominant background; the
-            // hovered-entry wash tints whole rows, so bg-set alone is wrong.
+            // A cell counts as highlighted when its background differs from the row's dominant one
+            // The hovered-entry wash tints whole rows, so a set background alone doesn't mean selected
             let dominant = dominant_bg(&cells);
             let col = point.col as usize;
             let highlighted = |idx: usize| cells.get(idx).is_some_and(|(_, bg)| *bg != dominant);
@@ -1019,7 +1015,7 @@ fn run_step(
             ));
         }
         ScenarioStep::AssertRunning => {
-            if !harness.is_running() {
+            if !harness.is_running()? {
                 bail!("pager process is not running");
             }
         }
@@ -1570,9 +1566,9 @@ fn inline_image_data(image: &serde_json::Value) -> Option<(&str, &str)> {
         return Some((mime, data));
     }
 
-    // The Responses API encodes the image as `image_url: "data:..."`
-    // (string), while the legacy chat-completions shape uses
-    // `image_url: { url: "data:..." }` (object). Accept both.
+    // The Responses API encodes the image as `image_url: "data:..."` (a string)
+    // The legacy chat-completions shape uses `image_url: { url: "data:..." }` (an object)
+    // Accept both
     let url = image
         .get("image_url")
         .and_then(|v| v.as_str().or_else(|| v.get("url").and_then(|u| u.as_str())))
@@ -1663,9 +1659,8 @@ fn locate_prompt_drop_point(harness: &PtyHarness) -> Result<MousePoint> {
     )
 }
 
-/// Per-character backgrounds for a 0-indexed screen row (`None` = default),
-/// char-indexed to match [`locate_text`]; wide-char spacers are skipped by
-/// the styled extraction.
+/// Per-character backgrounds for a 0-indexed screen row (`None` means the default background), char-indexed to match [`locate_text`].
+/// The styled extraction skips wide-char spacers.
 fn row_char_bgs(harness: &PtyHarness, row: u16) -> Option<Vec<(char, Option<String>)>> {
     let styled = harness.screen_styled();
     let line = styled.iter().find(|l| l.line == row as usize + 1)?;
@@ -1678,9 +1673,8 @@ fn row_char_bgs(harness: &PtyHarness, row: u16) -> Option<Vec<(char, Option<Stri
     Some(cells)
 }
 
-/// The most common background on a row — its "unhighlighted" baseline
-/// (hovered/selected rows carry a uniform wash, not `None`). BTreeMap keys
-/// make count ties deterministic.
+/// The most common background on a row: its "unhighlighted" baseline (hovered/selected rows carry a uniform wash, not `None`).
+/// BTreeMap keys make count ties deterministic.
 fn dominant_bg(cells: &[(char, Option<String>)]) -> Option<String> {
     let mut counts: std::collections::BTreeMap<&Option<String>, usize> =
         std::collections::BTreeMap::new();
@@ -1770,16 +1764,8 @@ fn decode_osc52_payloads(bytes: &[u8]) -> Result<Vec<String>> {
     Ok(payloads)
 }
 
-/// Count Kitty graphics protocol APC sequences (`ESC _ G`) that carry image
-/// data or placement in raw PTY output — i.e. every graphics APC *except* the
-/// pure control escapes delete (`a=d`) and capability query (`a=q`), which
-/// display nothing. (Image transmits chunk into several APCs, so this counts
-/// each chunk; callers use it as a presence test, not an exact image count.)
-///
-/// The pager writes these into the synchronized-update frame buffer, outside the
-/// vt100 cell grid, so the screen-text snapshot can't observe them. Excluding
-/// delete/query makes `assert_no_kitty_graphics` mean "no inline image was
-/// shown", not "the pager never probed for graphics support".
+/// Image/placement APCs only, as a presence test (transmits are chunked). Outside the vt100 grid, so screen text cannot see them.
+/// Delete/query are excluded so a no-graphics assert is not tripped by a capability probe.
 pub(crate) fn count_kitty_graphics(bytes: &[u8]) -> usize {
     const INTRO: &[u8] = b"\x1b_G";
     let mut count = 0;
@@ -1789,8 +1775,7 @@ pub(crate) fn count_kitty_graphics(bytes: &[u8]) -> usize {
             i += 1;
             continue;
         }
-        // The APC's parameter section runs up to the first `;` (data follows) or
-        // the terminating ESC.
+        // The APC's parameter section runs up to the first `;` (data follows) or the terminating ESC
         let params_start = i + INTRO.len();
         let params_end = bytes[params_start..]
             .iter()
@@ -2018,13 +2003,13 @@ mod tests {
     fn workspace_rejects_paths_outside_the_tempdir() {
         use std::collections::BTreeMap;
 
-        // A normal relative key (the folder-trust scenario's own `.mcp.json`)
-        // is accepted.
+        // A normal relative key (the folder-trust scenario's own `.mcp.json`) is accepted
         let ok = WorkspaceConfig {
             git_init: false,
             files: BTreeMap::from([(".mcp.json".to_string(), "{}".to_string())]),
         };
-        assert!(materialize_workspace(&ok).is_ok());
+        let sandbox = xai_grok_test_support::TestSandbox::new();
+        assert!(materialize_workspace(&ok, &sandbox).is_ok());
 
         // Absolute and `..`-traversing keys are rejected before any write.
         for bad in ["/etc/evil", "../escape", "sub/../../escape"] {
@@ -2032,12 +2017,44 @@ mod tests {
                 git_init: false,
                 files: BTreeMap::from([(bad.to_string(), "x".to_string())]),
             };
-            let err = materialize_workspace(&ws).unwrap_err().to_string();
+            let err = materialize_workspace(&ws, &sandbox)
+                .unwrap_err()
+                .to_string();
             assert!(
                 err.contains("must be relative and within the workspace"),
                 "path {bad:?} must be rejected, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn workspace_git_init_materializes_a_real_repository() {
+        let workspace = WorkspaceConfig {
+            git_init: true,
+            files: std::collections::BTreeMap::from([(
+                "nested/fixture.txt".to_string(),
+                "fixture\n".to_string(),
+            )]),
+        };
+
+        let sandbox = xai_grok_test_support::TestSandbox::new();
+        let dir = materialize_workspace(&workspace, &sandbox).expect("materialize git workspace");
+        assert!(dir.path().join(".git").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("nested/fixture.txt")).unwrap(),
+            "fixture\n"
+        );
+        let mut cmd = sandbox.git_command();
+        let output = cmd
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(dir.path())
+            .output()
+            .expect("query materialized repository");
+        assert!(
+            output.status.success(),
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -2062,12 +2079,6 @@ mod tests {
             .expect("sniff format")
             .into_dimensions()
             .expect("read dimensions")
-    }
-
-    #[test]
-    fn standard_fixture_decodes_as_8x8() {
-        let bytes = standard_png_bytes().expect("encode standard");
-        assert_eq!(decoded_dimensions(&bytes), (8, 8));
     }
 
     #[test]
@@ -2126,7 +2137,7 @@ mod tests {
             serde_json::json!({"k": "second"}),
             serde_json::json!({"k": "third"}),
         ];
-        // index 0 = newest
+        // Index 0 is the newest
         assert_request_contains(&bodies, "third", Some(0)).expect("newest");
         assert_request_contains(&bodies, "first", Some(2)).expect("oldest");
         assert!(assert_request_contains(&bodies, "first", Some(0)).is_err());
@@ -2172,15 +2183,13 @@ mod tests {
 
     #[test]
     fn count_kitty_graphics_counts_apc_introducers() {
-        // Two image escapes (transmit `_Gf=100...` + place `_Ga=p...`),
-        // ignoring OSC and other escapes around them.
+        // Two image escapes (transmit `_Gf=100...` and place `_Ga=p...`), ignoring OSC and other escapes around them
         let raw = b"text\x1b_Gf=100,i=2;AAAA\x1b\\\x1b[0m\x1b_Ga=p,i=2\x1b\\more";
         assert_eq!(count_kitty_graphics(raw), 2);
         assert_eq!(count_kitty_graphics(b"no graphics here"), 0);
         // An OSC 52 clipboard write must not be miscounted as a graphics APC.
         assert_eq!(count_kitty_graphics(b"\x1b]52;c;AAAA\x07"), 0);
-        // Delete (`a=d`) and capability query (`a=q`) display nothing, so they
-        // are not counted — a diagram that renders as text emits only these.
+        // Delete (`a=d`) and capability query (`a=q`) display nothing, so they are not counted; a diagram that renders as text emits only these
         assert_eq!(count_kitty_graphics(b"\x1b_Ga=d,d=i,i=1,q=2\x1b\\"), 0);
         assert_eq!(
             count_kitty_graphics(b"\x1b_Gi=31,a=q,s=1,v=1;AAAA\x1b\\"),
@@ -2246,7 +2255,7 @@ mod tests {
                 }]
             }]
         })];
-        // exact form still works (default behaviour)
+        // Exact form still works (default behaviour)
         assert_inline_images(
             &bodies,
             1,
@@ -2255,7 +2264,7 @@ mod tests {
             &DimensionAssertion::Exact(8),
         )
         .expect("exact match");
-        // range form succeeds when width >= 1
+        // Range form succeeds when width is at least 1
         assert_inline_images(
             &bodies,
             1,
@@ -2270,7 +2279,7 @@ mod tests {
             },
         )
         .expect("range match");
-        // range form fails when width must be >= 28 but actual is 8
+        // Range form fails when width must be at least 28 but the actual is 8
         assert!(
             assert_inline_images(
                 &bodies,

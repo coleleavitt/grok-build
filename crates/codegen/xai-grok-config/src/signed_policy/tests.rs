@@ -33,6 +33,7 @@ fn payload() -> SignedPayload {
         requirements: Some("[features]\nweb_fetch = false\n".into()),
         fail_closed: false,
         expires_at: 4_000_000_000,
+        nonce: String::new(),
         key_id: "v1".into(),
     }
 }
@@ -79,7 +80,7 @@ fn server_wire_format_is_client_verifiable() {
     assert!(payload.fail_closed);
 }
 
-/// A payload missing `fail_closed` (an older server) parses lenient — the field is additive.
+/// A payload missing `fail_closed` (an older server) parses lenient; the field is additive.
 #[test]
 fn missing_fail_closed_defaults_false() {
     let (kp, pubkey) = test_keypair();
@@ -146,9 +147,9 @@ fn wrong_key_fails() {
     );
 }
 
-/// Pins where the fetch binding ([`check_fetch_identity`], expiry enforced, deployment
-/// trusted on signature alone) diverges from the at-rest rule
-/// ([`signed_principal_matches`], strict effective-principal equality, expiry-free).
+/// Pins where the fetch binding diverges from the at-rest rule.
+/// [`check_fetch_identity`] enforces expiry and trusts a deployment on signature alone.
+/// [`signed_principal_matches`] requires strict effective-principal equality and ignores expiry.
 #[test]
 fn binding_rejects_other_team_and_expiry() {
     let p = payload();
@@ -170,10 +171,10 @@ fn binding_rejects_other_team_and_expiry() {
         ..payload()
     };
     assert!(check_fetch_identity(&dep, Some("team-007"), 1_000).is_ok());
-    // The at-rest rule instead requires the effective principal (its deployment_id)...
+    // The at-rest rule instead requires the effective principal (its deployment_id)
     assert!(signed_principal_matches(&dep, Some("dep-1")));
     assert!(!signed_principal_matches(&dep, Some("team-007")));
-    // ...and is expiry-free: an expired payload still matches, while the fetch binding rejects it.
+    // It is also expiry-free: an expired payload still matches, while the fetch binding rejects it
     let expired = SignedPayload {
         expires_at: 10,
         ..payload()
@@ -205,8 +206,7 @@ fn on_disk_content_must_match_signed() {
     );
 }
 
-/// A locally planted file in a signed-ABSENT slot is tamper on both the refetch and
-/// gate paths; an absent or empty on-disk file is clean.
+/// A locally planted file in a signed-ABSENT slot is tamper on both the refetch and gate paths; an absent or empty on-disk file is clean.
 #[test]
 fn planted_artifact_in_signed_absent_slot_is_tamper() {
     let dir = tempfile::tempdir().unwrap();
@@ -224,12 +224,12 @@ fn planted_artifact_in_signed_absent_slot_is_tamper() {
     .unwrap();
     write_sidecar(home, &sign(&kp, &p)).unwrap();
 
-    // Absent → clean; empty file → clean (some tooling touches empty files).
+    // An absent slot is clean; so is an empty file (some tooling touches empty files)
     assert!(check_on_disk_matches(home, &p).is_ok());
     std::fs::write(home.join("requirements.toml"), "").unwrap();
     assert!(check_on_disk_matches(home, &p).is_ok());
 
-    // Planted non-empty requirements → tamper on both paths.
+    // A planted non-empty requirements file is tamper on both paths
     std::fs::write(home.join("requirements.toml"), "[endpoints]\n").unwrap();
     assert_eq!(
         check_on_disk_matches(home, &p),
@@ -257,8 +257,7 @@ fn planted_artifact_in_signed_absent_slot_is_tamper() {
     );
 }
 
-/// An unreadable regular file (EACCES) is a read blip, not tamper: the refetch trigger
-/// fires but the gate does not refuse. Unix-only; self-skips when running as root.
+/// An unreadable regular file (EACCES) is a read blip, not tamper: the refetch trigger fires but the gate does not refuse.
 #[cfg(unix)]
 #[test]
 fn unreadable_artifact_refetches_but_does_not_refuse() {
@@ -300,8 +299,7 @@ fn unreadable_artifact_refetches_but_does_not_refuse() {
     );
 }
 
-/// A directory squatting in an artifact slot is tamper, not a read blip: the gate
-/// refuses and the refetch fires.
+/// A directory squatting in an artifact slot is tamper, not a read blip: the gate refuses and the refetch fires.
 #[test]
 fn directory_squat_is_tamper_not_unreadable() {
     let dir = tempfile::tempdir().unwrap();
@@ -334,8 +332,7 @@ fn directory_squat_is_tamper_not_unreadable() {
     ));
 }
 
-/// A read blip on the SIDECAR mirrors the artifact-slot semantics: SidecarUnreadable
-/// at the gate (no refusal) while the refetch trigger fires. Unix-only; self-skips as root.
+/// A read blip on the SIDECAR behaves like one on an artifact slot: SidecarUnreadable at the gate (no refusal) while the refetch trigger fires.
 #[cfg(unix)]
 #[test]
 fn sidecar_read_blip_is_lenient_at_gate_but_refetches() {
@@ -373,9 +370,8 @@ fn sidecar_read_blip_is_lenient_at_gate_but_refetches() {
     );
 }
 
-/// A symlink at an artifact slot is tamper (no-follow classification): even one
-/// pointing at a byte-identical file (reads could be redirected later), and one
-/// pointing at a directory — never the lenient Unreadable.
+/// A symlink at an artifact slot is tamper, never the lenient Unreadable: the check does not follow links.
+/// Even a link to a byte-identical file is tamper (reads could be redirected later), and so is a link to a directory.
 #[cfg(unix)]
 #[test]
 fn symlink_at_artifact_slot_is_tamper() {
@@ -389,7 +385,7 @@ fn symlink_at_artifact_slot_is_tamper() {
     write_policy(home, &p);
     write_sidecar(home, &sign(&kp, &p)).unwrap();
 
-    // Symlink → file carrying the exact signed bytes.
+    // Symlink to a file carrying the exact signed bytes
     let slot = home.join("requirements.toml");
     let target = home.join("elsewhere.toml");
     std::fs::rename(&slot, &target).unwrap();
@@ -404,7 +400,7 @@ fn symlink_at_artifact_slot_is_tamper() {
         SignedVerdict::Compromised
     );
 
-    // Symlink → directory.
+    // Symlink to a directory
     std::fs::remove_file(&slot).unwrap();
     let squat_dir = home.join("squat_dir");
     std::fs::create_dir(&squat_dir).unwrap();
@@ -415,9 +411,8 @@ fn symlink_at_artifact_slot_is_tamper() {
     );
 }
 
-/// A symlink at the SIDECAR slot reads NoAuthenticSidecar (absence-with-teeth under a
-/// fail-closed marker), never the lenient SidecarUnreadable — even one pointing at a
-/// perfectly valid sidecar file, and one pointing at a directory.
+/// A symlink at the SIDECAR slot reads NoAuthenticSidecar, which refuses under a fail-closed marker, never the lenient SidecarUnreadable.
+/// Even a link to a perfectly valid sidecar file, or to a directory, reads that way.
 #[cfg(unix)]
 #[test]
 fn symlink_at_sidecar_slot_is_absence_not_a_blip() {
@@ -431,7 +426,7 @@ fn symlink_at_sidecar_slot_is_absence_not_a_blip() {
     write_policy(home, &p);
     write_sidecar(home, &sign(&kp, &p)).unwrap();
 
-    // Symlink → a byte-identical valid sidecar elsewhere.
+    // Symlink to a byte-identical valid sidecar elsewhere
     let path = home.join(SIGNATURE_SIDECAR_FILE);
     let target = home.join("sidecar_copy.json");
     std::fs::rename(&path, &target).unwrap();
@@ -442,7 +437,7 @@ fn symlink_at_sidecar_slot_is_absence_not_a_blip() {
         "a symlinked sidecar is not an authentic sidecar"
     );
 
-    // Symlink → directory.
+    // Symlink to a directory
     std::fs::remove_file(&path).unwrap();
     let squat_dir = home.join("squat_dir");
     std::fs::create_dir(&squat_dir).unwrap();
@@ -489,26 +484,79 @@ fn sidecar_round_trips_on_disk() {
 }
 
 #[test]
-fn verification_inert_without_embedded_key() {
-    // The feature ships dark: no compiled-in key, no verification.
-    assert!(EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS.is_empty());
-    assert!(!verification_active());
+fn verification_armed_with_embedded_key() {
+    // Armed: prod v1 key compiled in.
+    assert!(verification_active());
+    assert_eq!(EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS.len(), 1);
+    assert_eq!(EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS[0].0, "v1");
+    assert!(embedded_key_id_trusted("v1"));
+    assert!(!embedded_key_id_trusted("v0"));
+    // Fingerprint pin against silent typos.
+    let digest = ring::digest::digest(
+        &ring::digest::SHA256,
+        EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS[0].1,
+    );
+    let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        hex, EMBEDDED_V1_PUBKEY_SHA256_HEX,
+        "embedded v1 pubkey bytes must match the documented SHA-256 fingerprint"
+    );
 }
 
-/// Dark build: the public gate is false even with a policy on disk and no sidecar.
+/// An empty key set turns verification off; an incident disarm looks the same.
 #[test]
-fn cloud_cache_signature_invalid_is_false_when_dark() {
+fn with_dark_forces_keyless_verification_inactive() {
+    test_seam::with_dark(|| {
+        assert!(
+            !verification_active(),
+            "Some(&[]) must force the keyless build for rollback tests"
+        );
+        assert!(!embedded_key_id_trusted("v1"));
+    });
+    // with_dark restores the embedded keys on exit
+    assert!(verification_active());
+}
+
+/// Armed: a policy with a missing or untrusted sidecar is flagged; an empty dir is not.
+#[test]
+fn cloud_cache_signature_invalid_when_armed() {
     let dir = tempfile::tempdir().unwrap();
-    write_policy(dir.path(), &payload());
-    assert!(!verification_active());
+    assert!(verification_active());
     assert!(!cloud_cache_signature_invalid(
+        dir.path(),
+        Some("team-007"),
+        1_000
+    ));
+    write_policy(dir.path(), &payload());
+    assert!(cloud_cache_signature_invalid(
+        dir.path(),
+        Some("team-007"),
+        1_000
+    ));
+    let (kp, _) = test_keypair();
+    write_sidecar(dir.path(), &sign(&kp, &payload())).unwrap();
+    assert!(cloud_cache_signature_invalid(
         dir.path(),
         Some("team-007"),
         1_000
     ));
 }
 
-/// No policy on disk → nothing to verify → not invalid.
+/// Keyless: the public gate stays inert with an unsigned policy on disk.
+#[test]
+fn cloud_cache_signature_invalid_inert_when_dark() {
+    test_seam::with_dark(|| {
+        let dir = tempfile::tempdir().unwrap();
+        write_policy(dir.path(), &payload());
+        assert!(!verification_active());
+        assert!(
+            !cloud_cache_signature_invalid(dir.path(), Some("team-007"), 1_000),
+            "dark build must not flag unsigned on-disk policy"
+        );
+    });
+}
+
+/// With no policy on disk there is nothing to verify, so the cache is not invalid.
 #[test]
 fn cloud_cache_signature_invalid_is_false_when_no_policy() {
     let dir = tempfile::tempdir().unwrap();
@@ -521,7 +569,38 @@ fn cloud_cache_signature_invalid_is_false_when_no_policy() {
     ));
 }
 
-/// Keyed: a policy with no/edited signature is invalid; a fully covered one is not.
+/// Empty or whitespace-only placeholders (the write-deny slots the first run creates) are not policy.
+#[test]
+fn cloud_cache_signature_invalid_is_false_when_policy_files_are_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (_, pubkey) = test_keypair();
+    let keys = keyset("v1", &pubkey);
+    for (name, body) in [
+        ("requirements.toml", ""),
+        ("requirements.toml", "  \n\t"),
+        ("managed_config.toml", ""),
+        ("managed_config.toml", " \n "),
+    ] {
+        std::fs::write(home.join(name), body).unwrap();
+        assert!(
+            !cloud_cache_signature_invalid_with_keys(home, &keys, Some("team-007"), 1_000),
+            "{name:?} {body:?} must not count as policy"
+        );
+        std::fs::remove_file(home.join(name)).unwrap();
+    }
+    // First-run ensure creates both slots empty.
+    std::fs::write(home.join("requirements.toml"), "").unwrap();
+    std::fs::write(home.join("managed_config.toml"), "").unwrap();
+    assert!(!cloud_cache_signature_invalid_with_keys(
+        home,
+        &keys,
+        Some("team-007"),
+        1_000
+    ));
+}
+
+/// Keyed: a policy with a missing or edited signature is invalid; a fully covered one is not.
 #[test]
 fn cloud_cache_signature_invalid_detects_missing_and_edited() {
     let dir = tempfile::tempdir().unwrap();
@@ -530,7 +609,7 @@ fn cloud_cache_signature_invalid_detects_missing_and_edited() {
     let p = payload();
     write_policy(home, &p);
 
-    // Policy present, no sidecar → invalid.
+    // A policy present with no sidecar is invalid
     assert!(cloud_cache_signature_invalid_with_keys(
         home,
         &keyset("v1", &pubkey),
@@ -538,7 +617,7 @@ fn cloud_cache_signature_invalid_detects_missing_and_edited() {
         1_000
     ));
 
-    // Valid sidecar + matching files → valid.
+    // A valid sidecar with matching files reads valid
     write_sidecar(home, &sign(&kp, &p)).unwrap();
     assert!(!cloud_cache_signature_invalid_with_keys(
         home,
@@ -547,7 +626,7 @@ fn cloud_cache_signature_invalid_detects_missing_and_edited() {
         1_000
     ));
 
-    // Wrong active team → invalid (substituted cache / cross-team replay).
+    // A wrong active team reads invalid (a substituted cache or a cross-team replay)
     assert!(cloud_cache_signature_invalid_with_keys(
         home,
         &keyset("v1", &pubkey),
@@ -555,7 +634,7 @@ fn cloud_cache_signature_invalid_detects_missing_and_edited() {
         1_000
     ));
 
-    // Editing a present, signed file → invalid (in-place tamper).
+    // Editing a present, signed file reads invalid (in-place tamper)
     std::fs::write(
         home.join("requirements.toml"),
         "[features]\nweb_fetch = true\n",
@@ -569,8 +648,8 @@ fn cloud_cache_signature_invalid_detects_missing_and_edited() {
     ));
 }
 
-/// The refetch trigger flags a signature-authentic but FOREIGN-bound cache as stale
-/// (the cross-tenant replay the gate blocks must also rebind online).
+/// The refetch trigger flags a signature-authentic but FOREIGN-bound cache as stale.
+/// The cross-tenant replay the gate blocks must also rebind online.
 #[test]
 fn cloud_cache_signature_invalid_flags_foreign_authentic_cache() {
     let dir = tempfile::tempdir().unwrap();
@@ -614,8 +693,7 @@ fn cloud_cache_signature_invalid_flags_foreign_authentic_cache() {
     ));
 }
 
-/// A signed opt-in over an in-place-edited policy reads compromised — regardless of
-/// the (forgeable) marker, which this verdict never consults.
+/// A signed opt-in over an in-place-edited policy reads compromised, regardless of the (forgeable) marker, which this verdict never consults.
 #[test]
 fn signed_cache_compromised_honors_signed_opt_in() {
     let dir = tempfile::tempdir().unwrap();
@@ -628,13 +706,13 @@ fn signed_cache_compromised_honors_signed_opt_in() {
     write_policy(home, &p);
     write_sidecar(home, &sign(&kp, &p)).unwrap();
 
-    // Opted in + bound + intact → not compromised.
+    // Opted in, bound, and intact reads Trusted
     assert_eq!(
         signed_cache_compromised_with_keys(home, &keyset("v1", &pubkey), Some("team-007"), 1_000),
         SignedVerdict::Trusted
     );
 
-    // In-place edit of the signed file → compromised.
+    // An in-place edit of the signed file reads compromised
     std::fs::write(
         home.join("requirements.toml"),
         "[features]\nweb_fetch = true\n",
@@ -646,8 +724,7 @@ fn signed_cache_compromised_honors_signed_opt_in() {
     );
 }
 
-/// A signed OPT-OUT is never enforced: even an edited policy reads `Trusted` at the
-/// gate (the refetch trigger still catches the edit).
+/// A signed OPT-OUT is never enforced: even an edited policy reads `Trusted` at the gate (the refetch trigger still catches the edit).
 #[test]
 fn signed_cache_compromised_respects_signed_opt_out() {
     let dir = tempfile::tempdir().unwrap();
@@ -668,8 +745,7 @@ fn signed_cache_compromised_respects_signed_opt_out() {
     );
 }
 
-/// No sidecar or a forged signature reads `NoAuthenticSidecar` — never `Compromised`
-/// from unverified bytes.
+/// No sidecar or a forged signature reads `NoAuthenticSidecar`, never `Compromised` from unverified bytes.
 #[test]
 fn signed_cache_compromised_none_without_authentic_sidecar() {
     let dir = tempfile::tempdir().unwrap();
@@ -681,13 +757,13 @@ fn signed_cache_compromised_none_without_authentic_sidecar() {
     };
     write_policy(home, &p);
 
-    // No sidecar → not an authentic verdict.
+    // No sidecar: not an authentic verdict
     assert_eq!(
         signed_cache_compromised_with_keys(home, &keyset("v1", &pubkey), Some("team-007"), 1_000),
         SignedVerdict::NoAuthenticSidecar
     );
 
-    // Forged signature → not an authentic verdict either (never Compromised).
+    // A forged signature is not an authentic verdict either (never Compromised)
     let mut bad = sign(&kp, &p);
     bad.signature = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
     write_sidecar(home, &bad).unwrap();
@@ -697,8 +773,8 @@ fn signed_cache_compromised_none_without_authentic_sidecar() {
     );
 }
 
-/// A deployment-signed policy bound to a different deployment id is a cross-tenant
-/// replay and reads compromised; a matching id (or no recorded id yet) does not.
+/// A deployment-signed policy bound to a different deployment id is a cross-tenant replay and reads compromised.
+/// A matching id (or no recorded id yet) does not.
 #[test]
 fn signed_cache_compromised_rejects_foreign_deployment() {
     let dir = tempfile::tempdir().unwrap();
@@ -713,12 +789,12 @@ fn signed_cache_compromised_rejects_foreign_deployment() {
     write_policy(home, &p);
     write_sidecar(home, &sign(&kp, &p)).unwrap();
 
-    // Locally-recorded deployment is "dep-local" → foreign signed id → compromised.
+    // The locally recorded deployment is "dep-local", so the foreign signed id reads compromised
     assert_eq!(
         signed_cache_compromised_with_keys(home, &keyset("v1", &pubkey), Some("dep-local"), 1_000),
         SignedVerdict::Compromised
     );
-    // Matching deployment id → not compromised.
+    // A matching deployment id is not compromised
     assert_eq!(
         signed_cache_compromised_with_keys(
             home,
@@ -728,15 +804,14 @@ fn signed_cache_compromised_rejects_foreign_deployment() {
         ),
         SignedVerdict::Trusted
     );
-    // No locally-recorded id yet (first trusted fetch) → lenient.
+    // No locally-recorded id yet (first trusted fetch) is lenient
     assert_eq!(
         signed_cache_compromised_with_keys(home, &keyset("v1", &pubkey), None, 1_000),
         SignedVerdict::Trusted
     );
 }
 
-/// A replayed TEAM-signed cache on a deployment-key machine reads foreign rather than
-/// slipping past a deployment-only check.
+/// A replayed TEAM-signed cache on a deployment-key machine reads foreign rather than slipping past a deployment-only check.
 #[test]
 fn signed_cache_compromised_rejects_team_cache_on_deployment_machine() {
     let dir = tempfile::tempdir().unwrap();
@@ -750,7 +825,7 @@ fn signed_cache_compromised_rejects_team_cache_on_deployment_machine() {
     };
     write_policy(home, &team);
     write_sidecar(home, &sign(&kp, &team)).unwrap();
-    // Expected principal = the machine's recorded deployment id.
+    // The expected principal is the machine's recorded deployment id
     assert_eq!(
         signed_cache_compromised_with_keys(home, &keyset("v1", &pubkey), Some("dep-local"), 1_000),
         SignedVerdict::Compromised,
@@ -758,8 +833,8 @@ fn signed_cache_compromised_rejects_team_cache_on_deployment_machine() {
     );
 }
 
-/// A foreign-bound but PERMISSIVE policy still reads compromised: identity runs BEFORE
-/// the opt-in short-circuit, so another tenant's lenient policy can't escape a strict one.
+/// A foreign-bound but PERMISSIVE policy still reads compromised: identity runs BEFORE the opt-in short-circuit.
+/// Another tenant's lenient policy can't escape a strict one.
 #[test]
 fn signed_cache_compromised_rejects_foreign_permissive_policy() {
     let dir = tempfile::tempdir().unwrap();
@@ -812,10 +887,24 @@ fn signed_cache_compromised_rejects_foreign_permissive_policy() {
     );
 }
 
-/// Dark build: the public entry reads Inactive even with an authentic, opted-in,
-/// tampered cache on disk — the marker path then decides.
+/// Keyless: the public entry reads Inactive.
 #[test]
-fn signed_cache_compromised_is_inactive_when_dark() {
+fn signed_cache_compromised_inactive_when_dark() {
+    test_seam::with_dark(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write_policy(home, &payload());
+        assert!(!verification_active());
+        assert_eq!(
+            signed_cache_compromised(home, Some("team-007"), 1_000),
+            SignedVerdict::Inactive
+        );
+    });
+}
+
+/// Armed: a foreign key reads NoAuthenticSidecar (never Inactive).
+#[test]
+fn signed_cache_compromised_is_no_authentic_sidecar_when_armed() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     let (kp, _) = test_keypair();
@@ -825,20 +914,15 @@ fn signed_cache_compromised_is_inactive_when_dark() {
     };
     write_policy(home, &p);
     write_sidecar(home, &sign(&kp, &p)).unwrap();
-    std::fs::write(
-        home.join("requirements.toml"),
-        "[features]\nweb_fetch = true\n",
-    )
-    .unwrap();
-    assert!(!verification_active());
+    assert!(verification_active());
     assert_eq!(
         signed_cache_compromised(home, Some("team-007"), 1_000),
-        SignedVerdict::Inactive
+        SignedVerdict::NoAuthenticSidecar
     );
 }
 
-/// Anti-rollback TTL: an authentic opted-in sidecar reads compromised past its signed
-/// `expires_at` even with intact content and a matching principal; inside the window it holds.
+/// Anti-rollback TTL: an expired authentic opted-in sidecar reads compromised even with intact content and a matching principal.
+/// Inside the `expires_at` window it holds.
 #[test]
 fn signed_cache_compromised_expired_reads_compromised() {
     let dir = tempfile::tempdir().unwrap();
@@ -851,21 +935,19 @@ fn signed_cache_compromised_expired_reads_compromised() {
     };
     write_policy(home, &p);
     write_sidecar(home, &sign(&kp, &p)).unwrap();
-    // Past expiry → compromised, despite intact content + matching principal.
     assert_eq!(
         signed_cache_compromised_with_keys(home, &keyset("v1", &pubkey), Some("team-007"), 1_001),
         SignedVerdict::Compromised,
         "an expired authentic sidecar must read compromised (anti-rollback TTL)"
     );
-    // Just inside the window → honored.
+    // Just inside the window it holds
     assert_eq!(
         signed_cache_compromised_with_keys(home, &keyset("v1", &pubkey), Some("team-007"), 999),
         SignedVerdict::Trusted
     );
 }
 
-/// Rewriting the untrusted outer `sidecar.key_id` can't redirect verification —
-/// only the SIGNED payload's `key_id` selects the verifying key.
+/// Rewriting the untrusted outer `sidecar.key_id` can't redirect verification; only the SIGNED payload's `key_id` selects the verifying key.
 #[test]
 fn untrusted_sidecar_key_id_does_not_affect_verification() {
     let (kp, pubkey) = test_keypair();
@@ -880,14 +962,14 @@ fn untrusted_sidecar_key_id_does_not_affect_verification() {
     assert_eq!(out.key_id, "v1", "only the signed key_id is authoritative");
 }
 
-/// A SIGNED `key_id` outside the trusted set is rejected, and the sidecar reads
-/// inauthentic on both the gate and refetch paths.
+/// A SIGNED `key_id` outside the trusted set is rejected, and the sidecar reads inauthentic on both the gate and refetch paths.
 #[test]
 fn unknown_signed_key_id_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     let (kp, pubkey) = test_keypair();
     let p = SignedPayload {
+        nonce: String::new(),
         key_id: "v9".into(),
         fail_closed: true,
         ..payload()
@@ -920,8 +1002,8 @@ fn unknown_signed_key_id_is_rejected() {
     );
 }
 
-/// Rotation: a {v1, v2} client verifies a payload signed with either key; a payload
-/// CLAIMING a trusted id but signed with a different key still fails.
+/// Rotation: a {v1, v2} client verifies a payload signed with either key.
+/// A payload CLAIMING a trusted id but signed with a different key still fails.
 #[test]
 fn rotation_selects_the_trusted_key_by_signed_key_id() {
     let (kp1, pubkey1) = test_keypair();
@@ -930,6 +1012,7 @@ fn rotation_selects_the_trusted_key_by_signed_key_id() {
 
     let v1 = sign(&kp1, &payload());
     let v2_payload = SignedPayload {
+        nonce: String::new(),
         key_id: "v2".into(),
         ..payload()
     };
@@ -939,8 +1022,7 @@ fn rotation_selects_the_trusted_key_by_signed_key_id() {
         .expect("the v2-signed payload must verify against the rotated set");
     assert_eq!(out.key_id, "v2");
 
-    // A client that has dropped v1 (only-v2 set) still verifies the v2 envelope
-    // and rejects the v1 one.
+    // A client that has dropped v1 (only-v2 set) still verifies the v2 envelope and rejects the v1 one
     let only_v2: Vec<(&str, &[u8])> = vec![("v2", &pubkey2)];
     assert!(verify_signed_payload(&v2.signed_payload, &v2.signature, &only_v2).is_ok());
     assert_eq!(
@@ -948,7 +1030,7 @@ fn rotation_selects_the_trusted_key_by_signed_key_id() {
         Err(SigError::UnknownKeyId)
     );
 
-    // Claiming v1 while signed with kp2 picks the v1 key — and fails to verify.
+    // Claiming v1 while signed with kp2 picks the v1 key and fails to verify
     let imposter = SignatureEnvelope {
         signed_payload: v1.signed_payload.clone(),
         signature: v2.signature.clone(),
@@ -960,7 +1042,65 @@ fn rotation_selects_the_trusted_key_by_signed_key_id() {
     );
 }
 
-// The is-managed claim tests live in a sibling child module (this file is at the
-// 1k-line mark); same private access via the #[path] include below.
+// The is-managed claim tests live in a sibling child module because this file is at the 1k-line mark
+// The #[path] include below keeps the same private access
 #[path = "claim_tests.rs"]
 mod claim_tests;
+
+/// Serialize tests that mutate the process-global kill-switch and key seam.
+fn with_remote_disarm_lock<R>(f: impl FnOnce() -> R) -> R {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
+#[test]
+fn remote_kill_switch_dark_embed_stays_inactive() {
+    with_remote_disarm_lock(|| {
+        // Forced dark: inactive regardless of kill-switch (prod embed is keyed).
+        test_seam::with_dark(|| {
+            apply_remote_managed_config_signature_verification(Some(true), true);
+            assert!(!verification_active());
+
+            apply_remote_managed_config_signature_verification(Some(false), true);
+            assert!(!verification_active());
+
+            apply_remote_managed_config_signature_verification(None, true);
+            assert!(!verification_active());
+        });
+    });
+}
+
+/// With keys embedded (prod pin), disarm flips verification off and re-arm restores it.
+/// Untrusted origin cannot disarm.
+#[test]
+fn remote_kill_switch_with_keys_disarms_and_rearms() {
+    with_remote_disarm_lock(|| {
+        apply_remote_managed_config_signature_verification(Some(true), true);
+        assert!(
+            verification_active(),
+            "keys embedded + armed must be verification_active"
+        );
+
+        apply_remote_managed_config_signature_verification(Some(false), true);
+        assert!(
+            !verification_active(),
+            "trusted Some(false) must disarm keyed verification"
+        );
+
+        apply_remote_managed_config_signature_verification(Some(true), true);
+        assert!(
+            verification_active(),
+            "Some(true) must re-arm keyed verification"
+        );
+
+        apply_remote_managed_config_signature_verification(Some(false), false);
+        assert!(
+            verification_active(),
+            "untrusted Some(false) must not disarm when keys are embedded"
+        );
+
+        apply_remote_managed_config_signature_verification(None, true);
+        assert!(verification_active());
+    });
+}

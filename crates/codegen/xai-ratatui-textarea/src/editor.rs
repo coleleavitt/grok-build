@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::sync::Arc;
 
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation as _};
@@ -8,6 +8,7 @@ use unicode_width::UnicodeWidthStr as _;
 mod keys;
 
 pub use keys::classify_key_event;
+pub(crate) use keys::resolve_movement;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WordStyle {
@@ -30,6 +31,96 @@ pub enum EditCommand {
     DeleteWordForward(WordStyle),
     DeleteToLineStart,
     DeleteToLineEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditCommandCategory {
+    Insert,
+    Navigation,
+    Delete,
+    Kill,
+}
+
+/// Which selection edge a movement collapses to before moving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HorizontalEdge {
+    Start,
+    End,
+}
+
+/// A cursor movement: one vocabulary behind plain move, Shift-extend, and collapse.
+/// `Command` carries its collapse edge from construction, so every movement is
+/// directional by type (no fallible extraction later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Movement {
+    Command(EditCommand, HorizontalEdge),
+    VisualRowUp,
+    VisualRowDown,
+    VisualRowStart,
+    VisualRowEnd,
+    /// Home: logical line start, no already-at-BOL chain (unlike Ctrl+A).
+    LogicalLineStart,
+    /// End: logical line end, no already-at-EOL chain (unlike Ctrl+E).
+    LogicalLineEnd,
+}
+
+impl Movement {
+    /// The selection edge this movement collapses an active selection to.
+    pub(crate) fn collapse_edge(self) -> HorizontalEdge {
+        match self {
+            Self::Command(_, edge) => edge,
+            Self::VisualRowUp | Self::VisualRowStart | Self::LogicalLineStart => {
+                HorizontalEdge::Start
+            }
+            Self::VisualRowDown | Self::VisualRowEnd | Self::LogicalLineEnd => HorizontalEdge::End,
+        }
+    }
+
+    /// Grapheme moves stop at the collapse edge; every other movement continues from it.
+    pub(crate) fn stops_at_collapse_edge(self) -> bool {
+        matches!(
+            self,
+            Self::Command(
+                EditCommand::MoveGraphemeLeft | EditCommand::MoveGraphemeRight,
+                _
+            )
+        )
+    }
+}
+
+impl EditCommand {
+    /// The selection edge this command collapses an active selection to;
+    /// `None` for non-directional commands (inserts, deletes, kills).
+    pub(crate) fn selection_collapse_edge(self) -> Option<HorizontalEdge> {
+        match self {
+            Self::MoveGraphemeLeft | Self::MoveWordLeft(_) | Self::MoveLogicalLineStart => {
+                Some(HorizontalEdge::Start)
+            }
+            Self::MoveGraphemeRight | Self::MoveWordRight(_) | Self::MoveLogicalLineEnd => {
+                Some(HorizontalEdge::End)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn category(self) -> EditCommandCategory {
+        match self {
+            Self::Insert(_) => EditCommandCategory::Insert,
+            Self::MoveGraphemeLeft
+            | Self::MoveGraphemeRight
+            | Self::MoveWordLeft(_)
+            | Self::MoveWordRight(_)
+            | Self::MoveLogicalLineStart
+            | Self::MoveLogicalLineEnd => EditCommandCategory::Navigation,
+            Self::DeleteGraphemeBackward | Self::DeleteGraphemeForward => {
+                EditCommandCategory::Delete
+            }
+            Self::DeleteWordBackward(_)
+            | Self::DeleteWordForward(_)
+            | Self::DeleteToLineStart
+            | Self::DeleteToLineEnd => EditCommandCategory::Kill,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +246,14 @@ impl PartialEq for EditBuffer {
 
 impl Eq for EditBuffer {}
 
+impl Deref for EditBuffer {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.text()
+    }
+}
+
 impl EditBuffer {
     pub fn new() -> Self {
         Self::default()
@@ -210,14 +309,14 @@ impl EditBuffer {
     #[must_use]
     pub fn insert_str(&mut self, text: &str) -> EditOutcome {
         let plan = self.plan_replace_byte_range(self.cursor_byte..self.cursor_byte, text, &[]);
-        self.apply_valid_plan(&plan)
+        self.apply_validated_plan(&plan)
     }
 
     /// Edit-result cursors keep right affinity when adjacent text merges into one grapheme.
     #[must_use]
     pub fn replace_byte_range(&mut self, range: Range<usize>, replacement: &str) -> EditOutcome {
         let plan = self.plan_replace_byte_range(range, replacement, &[]);
-        self.apply_valid_plan(&plan)
+        self.apply_validated_plan(&plan)
     }
 
     pub fn plan_replace_byte_range(
@@ -380,13 +479,13 @@ impl EditBuffer {
 
     pub fn apply_plan(&mut self, plan: &EditPlan) -> Result<EditOutcome, ApplyEditPlanError> {
         self.validate_plan(plan)?;
-        Ok(self.apply_valid_plan(plan))
+        Ok(self.apply_validated_plan(plan))
     }
 
     #[must_use]
     pub fn apply(&mut self, command: EditCommand) -> EditOutcome {
         let plan = self.plan_command(command, &[]);
-        self.apply_valid_plan(&plan)
+        self.apply_validated_plan(&plan)
     }
 
     fn make_plan(
@@ -408,7 +507,7 @@ impl EditBuffer {
         }
     }
 
-    fn validate_plan(&self, plan: &EditPlan) -> Result<(), ApplyEditPlanError> {
+    pub(crate) fn validate_plan(&self, plan: &EditPlan) -> Result<(), ApplyEditPlanError> {
         if !Arc::ptr_eq(&plan.source_identity, &self.identity)
             || plan.source_generation != self.generation
         {
@@ -447,7 +546,7 @@ impl EditBuffer {
         Ok(())
     }
 
-    fn apply_valid_plan(&mut self, plan: &EditPlan) -> EditOutcome {
+    pub(crate) fn apply_validated_plan(&mut self, plan: &EditPlan) -> EditOutcome {
         let old_cursor = self.cursor_byte;
         let text_changed = plan.removed_text != plan.replacement;
         let inserted_len = plan.replacement.len();

@@ -1,3 +1,4 @@
+use crate::implementations::grok_build::send_subagent_message::SendSubagentMessageOutput;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use strip_ansi_escapes::strip_str;
@@ -55,10 +56,9 @@ impl From<serde_json::Value> for DynamicOutput {
         Self { value }
     }
 }
-/// Typed saved path for the media tools (`image_gen` / `video_gen` /
-/// `image_edit`), so consumers read it directly instead of scraping the prose.
-/// A struct (not a bare `PathBuf`) is required: `ToolOutput` is internally
-/// tagged and only accepts map payloads.
+/// Typed saved path for the media tools (`image_gen` / `video_gen` / `image_edit`), so consumers
+/// read it directly instead of scraping the prose. A struct (not a bare `PathBuf`) is required:
+/// `ToolOutput` is internally tagged and only accepts map payloads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaGenOutput {
     /// Absolute path to the saved media file. Empty for [`Self::uploaded`].
@@ -115,21 +115,21 @@ impl MediaGenOutput {
         let message = format!(
             "{action} and saved to {path}. Do not read or re-display it, and do not describe how it appears to the user."
         );
-        serde_json::json!(
-            { "path" : path, "filename" : & self.filename, "session_folder" : & self
-            .session_folder, "message" : message, }
-        )
+        serde_json::json!({
+            "path": path,
+            "filename": &self.filename,
+            "session_folder": &self.session_folder,
+            "message": message,
+        })
         .to_string()
     }
 }
 use crate::implementations::grok_build::todo::{TodoItem, TodoState};
 use crate::implementations::skills::skill::SkillOutput;
 use crate::util::truncate::{DEFAULT_SOFT_WRAP_WIDTH, soft_wrap_lines};
-/// Result of running a tool through the ToolRunner pipeline.
-///
-/// This is the **single return type** from `ToolRunner::run()`. It carries:
-/// 1. Clean `output` — never mutated by layers; for JSON serialization, protocol translation.
-/// 2. `prompt_text` — rendered with system reminders appended; for model prompt.
+/// Result of running a tool through the ToolRunner pipeline. This is the **single return type**
+/// from `ToolRunner::run()`. Clean `output` — never mutated by layers; for JSON serialization,
+/// protocol translation. `prompt_text` — rendered with system reminders appended; for model prompt.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ToolRunResult {
     /// Clean tool output — never mutated by layers.
@@ -222,21 +222,16 @@ pub struct FileContent {
     /// offset-past-end vs genuinely-empty files.
     #[serde(default)]
     pub total_lines: usize,
-    /// Base64 images captured before per-line truncation. The session
-    /// layer turns these into multimodal `ContentPart::Image` follow-ups
-    /// (same pipeline as MCP image extraction); pre-truncation capture
-    /// prevents `truncate_line` from cutting a long single-line URI
-    /// mid-payload. Hidden from the model's JSON schema.
+    /// Pre-truncation image captures for session harvest. Must survive
+    /// ToolDyn hub `to_value`/`from_value`; session drains before PostToolUse
+    /// and ACP wire serialize.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(skip)]
     pub extracted_images: Vec<crate::util::base64_images::ExtractedImage>,
 }
-/// Image content returned when reading an image file.
-///
-/// This is a local type so it can derive `schemars::JsonSchema` v0.8,
-/// which the `Tool` trait requires for its `Output` associated type.
-/// Conversion to the protocol-level image type happens at the
-/// protocol boundary in `xai-grok-shell`.
+/// Image content returned when reading an image file. This is a local type so it can derive `schemars::JsonSchema`
+/// v0.8, which the `Tool` trait requires for its `Output` associated type. Conversion to the protocol-level image type
+/// happens at the protocol boundary in `xai-grok-shell`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ImageContent {
     /// Base64-encoded image data
@@ -325,11 +320,9 @@ pub struct SearchReplaceEditDetail {
     pub context_before: String,
     /// The context after the match
     pub context_after: String,
-    /// Leading text on the first line before the matched `old_string` begins.
-    ///
-    /// When the match starts mid-line (e.g., after indentation), this captures
-    /// the prefix so the diff renderer can display proper alignment. Empty when
-    /// the match starts at the beginning of a line or when unknown.
+    /// Leading text on the first line before the matched `old_string` begins. When the match starts mid-line (e.g., after
+    /// indentation), this captures the prefix so the diff renderer can display proper alignment. Empty when the match
+    /// starts at the beginning of a line or when unknown.
     #[serde(default)]
     pub line_prefix: String,
 }
@@ -374,21 +367,17 @@ pub enum ApplyPatchOutput {
     /// No hunks in the patch.
     EmptyPatch(String),
 }
-/// Payload for `SearchReplaceOutput::NoMatchesFound`.
-///
-/// Separate struct so consumers (reminders, outcome trackers) can extract
-/// the file path without needing to know the call-site context.
+/// Payload for `SearchReplaceOutput::NoMatchesFound`. Separate struct so consumers (reminders,
+/// outcome trackers) can extract the file path without needing to know the call-site context.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NoMatchesFoundError {
     /// Human-readable error message shown to the model.
     pub message: String,
     /// Canonical absolute path of the file that was searched.
     pub file_path: std::path::PathBuf,
-    /// Full file text from the same read the edit used when reporting no match.
-    ///
-    /// In-process only: never serialized on the wire (avoids leaking fresher or
-    /// broader file content than the read/edit path already loaded). Used for
-    /// `StrReplace` fuzzy hints without a second `read_file`.
+    /// Full file text from the same read the edit used when reporting no match. In-process only: never serialized on the
+    /// wire (avoids leaking fresher or broader file content than the read/edit path already loaded). Used for `StrReplace`
+    /// fuzzy hints without a second `read_file`.
     #[serde(default, skip_serializing)]
     #[schemars(skip)]
     pub file_snapshot_at_edit: Option<String>,
@@ -430,22 +419,14 @@ pub struct BashOutput {
     pub output_file: String,
     /// Total bytes of output (before truncation).
     pub total_bytes: usize,
-    /// Incremental output delta (new bytes since last notification).
-    /// When present, consumers should append to their accumulated buffer
-    /// instead of replacing with `output`. When `Some(vec![])`, consumers
-    /// should clear their accumulated buffer (reset signal).
-    /// When `None`, the consumer should use `output` as the full buffer.
+    /// Incremental output delta (new bytes since last notification). When present, consumers should append to their
+    /// accumulated buffer instead of replacing with `output`. When `Some(vec![])`, consumers should clear their accumulated
+    /// buffer (reset signal). When `None`, the consumer should use `output` as the full buffer.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub output_delta: Option<Vec<u8>>,
-    /// Set by the grok_build `run_terminal_cmd` implementation when the
-    /// command was detected as a bare `echo "<msg>"` (or close variant:
-    /// echo -n, echo -e, simple printf for literal output, etc.).
-    ///
-    /// Used for:
-    /// - Telemetry / statistics on this pattern for the grok_build backend.
-    /// - Potential doom-loop / stagnation signals (repeated trivial echoes
-    ///   are a common "no progress" signal).
-    /// - Model hints (see BareEchoHintState in the bash tool).
+    /// Set by the grok_build `run_terminal_cmd` implementation when the command was detected as a bare `echo "<msg>"` (or close variant: echo -n,
+    /// echo -e, simple printf for literal output, etc.). Telemetry / statistics on this pattern for the grok_build backend. Potential doom-loop /
+    /// stagnation signals (repeated trivial echoes are a common "no progress" signal). Model hints (see BareEchoHintState in the bash tool).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub was_bare_echo: bool,
 }
@@ -476,12 +457,9 @@ pub struct BackgroundTaskStarted {
     /// Built by the tool's run() using resolved tool/param names.
     #[serde(default)]
     pub retrieval_hint: String,
-    /// Optional pre-formatted prompt body. When set, `to_prompt_format`
-    /// uses this string verbatim instead of the default
-    /// `<task-id>...</task-id>` XML envelope. Used by namespace-specific
-    /// adapters that need to emit a different model-visible shape
-    /// without disturbing the structured fields above (which other
-    /// consumers still parse).
+    /// Optional pre-formatted prompt body. When set, `to_prompt_format` uses this string verbatim instead of the default
+    /// `<task-id>...</task-id>` XML envelope. Used by namespace-specific adapters that need to emit a different
+    /// model-visible shape without disturbing the structured fields above (which other consumers still parse).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_formatted: Option<String>,
     /// PID of the spawned shell process, when available. Surfaced by
@@ -595,11 +573,9 @@ impl WebFetchOutput {
 }
 use xai_tool_types::KillTaskOutput;
 use xai_tool_types::TaskOutputOutput;
-/// Output schema for the bash tool.
-///
-/// The bash tool can either complete synchronously (`Bash`) or be started
-/// in the background (`BackgroundTaskStarted`). This enum exists to
-/// provide a precise JSON Schema via the `Tool::Output` associated type.
+/// Output schema for the bash tool. The bash tool can either complete synchronously (`Bash`) or be
+/// started in the background (`BackgroundTaskStarted`). This enum exists to provide a precise JSON
+/// Schema via the `Tool::Output` associated type.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum BashToolOutput {
@@ -642,11 +618,14 @@ pub enum ToolOutput {
     EnterPlanMode(EnterPlanModeOutput),
     ExitPlanMode(ExitPlanModeOutput),
     AskUserQuestion(AskUserQuestionOutput),
+    #[serde(alias = "SendAgentMessage")]
+    SendSubagentMessage(SendSubagentMessageOutput),
     Monitor(crate::implementations::grok_build::monitor::types::MonitorOutput),
     SchedulerCreate(crate::implementations::grok_build::scheduler::create::SchedulerCreateOutput),
     SchedulerDelete(crate::implementations::grok_build::scheduler::delete::SchedulerDeleteOutput),
     SchedulerList(crate::implementations::grok_build::scheduler::list::SchedulerListOutput),
     UpdateGoal(crate::implementations::grok_build::update_goal::UpdateGoalOutput),
+    Workflow(crate::implementations::grok_build::workflow::WorkflowToolOutput),
     /// Dynamic output for runtime-registered tools (MCP, test tools, etc.)
     Dynamic(DynamicOutput),
     /// Generic text output for tools that produce simple formatted text
@@ -688,6 +667,12 @@ impl ToolOutput {
             ToolOutput::ApplyPatch(ApplyPatchOutput::Success { .. }) => false,
             ToolOutput::ApplyPatch(_) => true,
             ToolOutput::CodexGrepFiles(CodexGrepFilesOutput::Error(_)) => true,
+            ToolOutput::SendSubagentMessage(output) => {
+                matches!(
+                output.disposition(),
+                crate::implementations::grok_build::send_subagent_message::SendSubagentMessageDisposition::Rejected
+            )
+            }
             ToolOutput::Todo(
                 TodoWriteOutput::DuplicateId(_) | TodoWriteOutput::InvalidArgument(_),
             ) => true,
@@ -699,6 +684,22 @@ impl ToolOutput {
     pub fn to_prompt_format(&self) -> String {
         match self {
             ToolOutput::ReadFile(read_file_output) => match read_file_output {
+                ReadFileOutput::FileContent(file_content) if file_content.content.is_empty() => {
+                    if file_content.total_lines == 0 {
+                        "File is empty.".to_string()
+                    } else if file_content
+                        .offset
+                        .is_some_and(|offset| offset > file_content.total_lines)
+                    {
+                        format!(
+                            "(no lines returned: the requested window is past the end of the \
+                             file; the file has {} lines)",
+                            file_content.total_lines
+                        )
+                    } else {
+                        "(no lines returned)".to_string()
+                    }
+                }
                 ReadFileOutput::FileContent(file_content) => file_content.content.clone(),
                 ReadFileOutput::ImageContent(image_content) => {
                     format!(
@@ -798,20 +799,22 @@ impl ToolOutput {
                         format!("=== Task {} ===", r.task_id),
                         format!("Command: {}", r.command),
                         format!("Status: {}", r.status),
-                        format!("Started: {}", r.started),
+                        format!("Duration: {:.2}s", r.duration_secs),
                     ];
-                    if let Some(ref ended) = r.ended {
-                        lines.push(format!("Ended: {}", ended));
-                    }
-                    lines.push(format!("Duration: {:.2}s", r.duration_secs));
                     if let Some(code) = r.exit_code {
                         lines.push(format!("Exit Code: {}", code));
                     }
-                    lines.push(format!("Output File: {}", r.output_file));
+                    if !r.output_file.is_empty() {
+                        lines.push(format!("Output File: {}", r.output_file));
+                    }
                     lines.push(String::new());
                     lines.push("=== Output ===".to_string());
                     if r.output.is_empty() {
-                        lines.push("(no output yet)".to_string());
+                        if r.status == "running" {
+                            lines.push("(no output yet)".to_string());
+                        } else {
+                            lines.push("(no output)".to_string());
+                        }
                     } else {
                         lines.push(r.output.clone());
                     }
@@ -943,6 +946,7 @@ impl ToolOutput {
                 AskUserQuestionOutput::QuestionsSent { message, .. }
                 | AskUserQuestionOutput::UserAnswered { message },
             ) => message.clone(),
+            ToolOutput::SendSubagentMessage(output) => output.to_string(),
             ToolOutput::Monitor(o) => {
                 if o.persistent {
                     format!(
@@ -961,9 +965,10 @@ impl ToolOutput {
                 }
             }
             ToolOutput::SchedulerCreate(o) => {
+                let verb = if o.updated { "updated" } else { "created" };
                 format!(
-                    "Scheduled task created (ID: {}, {}, recurring: {}).",
-                    o.id, o.human_schedule, o.recurring
+                    "Scheduled task {} (ID: {}, {}).",
+                    verb, o.id, o.human_schedule
                 )
             }
             ToolOutput::SchedulerDelete(o) => o.message.clone(),
@@ -975,6 +980,7 @@ impl ToolOutput {
                 }
             }
             ToolOutput::UpdateGoal(o) => o.summary.clone(),
+            ToolOutput::Workflow(o) => o.message.clone(),
             ToolOutput::Dynamic(v) => serde_json::to_string_pretty(&v.value).unwrap_or_default(),
             ToolOutput::Text(text) => text.text.clone(),
             ToolOutput::ImageGen(m) => m.prompt_text("Image generated"),
@@ -992,11 +998,9 @@ pub struct TodoWriteSuccess {
     #[schemars(skip)]
     pub state: TodoState,
 }
-/// Output from the TodoWrite tool.
-///
-/// Follows the error-as-output-variant pattern (like `ReadFileOutput`,
-/// `SearchReplaceOutput`) so consumers (Python side, ACP layer) can
-/// distinguish tool-logic errors from infrastructure errors.
+/// Output from the TodoWrite tool. Follows the error-as-output-variant pattern (like
+/// `ReadFileOutput`, `SearchReplaceOutput`) so consumers (Python side, ACP layer) can distinguish
+/// tool-logic errors from infrastructure errors.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum TodoWriteOutput {
     /// Successfully updated todo state.
@@ -1024,10 +1028,9 @@ pub enum PlanFileSeedFailure {
     /// No `FileSystem` resource or no absolute path was available to seed.
     Unavailable,
 }
-/// Result of probing / seeding the session plan file on `enter_plan_mode`.
-///
-/// Defaults to `Missing(NotCreated)` when the field is absent on older payloads
-/// (fail-closed in `to_prompt_format`).
+/// Result of probing / seeding the session plan file on `enter_plan_mode`. Defaults to
+/// `Missing(NotCreated)` when the field is absent on older payloads (fail-closed in
+/// `to_prompt_format`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanFileSeedStatus {
@@ -1043,10 +1046,8 @@ impl Default for PlanFileSeedStatus {
         Self::Missing(PlanFileSeedFailure::NotCreated)
     }
 }
-/// Output from the `EnterPlanMode` tool.
-///
-/// Confirms plan mode entry and reports session plan-file seed status.
-/// The tool may create an empty session plan file (never truncating non-empty
+/// Output from the `EnterPlanMode` tool. Confirms plan mode entry and reports session plan-file
+/// seed status. The tool may create an empty session plan file (never truncating non-empty
 /// content); broader read-only enforcement is handled by orchestration.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum EnterPlanModeOutput {
@@ -1058,10 +1059,9 @@ pub enum EnterPlanModeOutput {
         /// Absolute or display path to the plan file so the model knows
         /// where to write its plan immediately.
         plan_file_path: String,
-        /// Pre-resolved tool name hints for `to_prompt_format()`.
-        /// Resolved at runtime via `TemplateRenderer` so no tool names
-        /// are hardcoded. Falls back to canonical names when the
-        /// renderer is unavailable.
+        /// Pre-resolved tool name hints for `to_prompt_format()`. Resolved at runtime via
+        /// `TemplateRenderer` so no tool names are hardcoded. Falls back to canonical names when
+        /// the renderer is unavailable.
         #[serde(default)]
         tool_hints: EnterPlanModeToolHints,
         /// Probe / seed outcome; defaults to `Missing` when absent.
@@ -1102,16 +1102,9 @@ impl EnterPlanModeToolHints {
         "exit_plan_mode".to_owned()
     }
 }
-/// Output from the `AskUserQuestion` tool.
-///
-/// This is a thin signal — the tool sends the questions to the client via
-/// a notification and returns a confirmation. The actual answers come back
-/// from the client as the tool result (handled by the orchestration layer).
-///
-/// Because the answers are provided by the client asynchronously (the user
-/// interacts with a UI), the tool output here just confirms the questions
-/// were dispatched. The orchestration layer is responsible for blocking
-/// until the user responds and injecting the answers into the conversation.
+/// Output from the `AskUserQuestion` tool. This is a thin signal — the tool sends the questions to the client via a notification and returns a
+/// confirmation. The actual answers come back from the client as the tool result (handled by the orchestration layer). Because the answers are
+/// provided by the client asynchronously (the user interacts with a UI), the tool output here just confirms the questions were dispatched.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum AskUserQuestionOutput {
     /// Questions were successfully dispatched to the client for user input.
@@ -1123,21 +1116,17 @@ pub enum AskUserQuestionOutput {
         /// Number of questions sent.
         question_count: usize,
     },
-    /// The user has responded (or cancelled). The `message` is the
-    /// fully-formatted tool result string produced by the format module.
-    ///
-    /// All four user paths (accepted, chat about this, skip interview,
-    /// cancel) return this variant with `ToolCall` status `Completed`.
+    /// The user has responded (or cancelled). The `message` is the fully-formatted tool result
+    /// string produced by the format module. All four user paths (accepted, chat about this, skip
+    /// interview, cancel) return this variant with `ToolCall` status `Completed`.
     UserAnswered {
         /// Pre-formatted tool result string for the model.
         message: String,
     },
 }
-/// Output from the `ExitPlanMode` tool.
-///
-/// The tool reads the plan file from disk and surfaces its content. The
-/// orchestration layer / client is responsible for presenting the plan to
-/// the user for approval and determining the exit outcome.
+/// Output from the `ExitPlanMode` tool. The tool reads the plan file from disk and surfaces its
+/// content. The orchestration layer / client is responsible for presenting the plan to the user for
+/// approval and determining the exit outcome.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum ExitPlanModeOutput {
     /// Plan file had content — surfaced for approval.
@@ -1175,6 +1164,11 @@ pub struct MCPOutput {
     pub is_timeout: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+    /// Pre-truncation image captures for session harvest (same contract as
+    /// [`FileContent::extracted_images`]). Must survive ToolDyn hub
+    /// `to_value`/`from_value`; session drains before PostToolUse and ACP.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extracted_images: Vec<crate::util::base64_images::ExtractedImage>,
 }
 impl MCPOutput {
     pub fn okay_output(tool_name: String, server_name: String, output: String) -> Self {
@@ -1186,6 +1180,7 @@ impl MCPOutput {
             auth_retry_attempted: false,
             is_timeout: false,
             is_error: false,
+            extracted_images: Vec::new(),
         }
     }
     pub fn errored(tool_name: String, server_name: String, error: String) -> Self {
@@ -1197,6 +1192,7 @@ impl MCPOutput {
             auth_retry_attempted: false,
             is_timeout: false,
             is_error: true,
+            extracted_images: Vec::new(),
         }
     }
     pub fn output(&self) -> &MCPOutputDetails {
@@ -1210,8 +1206,42 @@ impl xai_tool_runtime::ToolOutput for ToolOutput {
     fn chat_completion_output(&self) -> Option<xai_tool_runtime::ToolChatCompletionResponse> {
         match self {
             Self::Bash(bash) => xai_tool_runtime::ToolOutput::chat_completion_output(bash),
+            Self::SearchReplace(edit) => xai_tool_runtime::ToolOutput::chat_completion_output(edit),
             _ => None,
         }
+    }
+}
+impl SearchReplaceEditsApplied {
+    /// Where the client's diff lands in the file. `None` for creations (no
+    /// line to point at) and when `replace_all` touched several matches,
+    /// since the card renders one snippet.
+    fn edit_file_anchor(&self) -> Option<xai_tool_runtime::EditFileAnchor> {
+        if self.old_string.is_empty() {
+            return None;
+        }
+        let [edit] = self.edits.details.as_slice() else {
+            return None;
+        };
+        let start_line = u32::try_from(edit.old_line).ok()?;
+        Some(xai_tool_runtime::EditFileAnchor { start_line })
+    }
+}
+impl xai_tool_runtime::ToolOutput for SearchReplaceEditsApplied {
+    /// Same frame grok-computer's `FileEditTool` sends: an empty, successful
+    /// `code_execution_result` shell is what settles the edit card on every
+    /// client, and the anchor rides along when there is one. The reducer
+    /// projects the anchor ahead of the shell only where clients accept it.
+    fn chat_completion_output(&self) -> Option<xai_tool_runtime::ToolChatCompletionResponse> {
+        Some(xai_tool_runtime::ToolChatCompletionResponse {
+            result: Some(xai_tool_runtime::ToolChatCompletion {
+                sender: "assistant".into(),
+                message_tag: Some("raw_function_result".into()),
+                code_execution_result: Some(xai_tool_runtime::ToolCodeExecutionResult::default()),
+                edit_file_result: self.edit_file_anchor(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
     }
 }
 impl xai_tool_runtime::ToolOutput for BashOutput {
@@ -1219,8 +1249,8 @@ impl xai_tool_runtime::ToolOutput for BashOutput {
         let mut stdout = String::from_utf8_lossy(&self.output).into_owned();
         let mut extra = serde_json::Map::new();
         if self.truncated {
-            let shown = crate::util::truncate::format_bytes(self.output.len());
-            let total = crate::util::truncate::format_bytes(self.total_bytes);
+            let shown = crate::util::truncate::format_bytes(self.output.len() as u64);
+            let total = crate::util::truncate::format_bytes(self.total_bytes as u64);
             stdout.push_str(&format!(
                 "\n[truncated: showing first/last {shown} of {total} - full output at: {}]",
                 self.output_file
@@ -1257,7 +1287,16 @@ impl xai_tool_runtime::ToolOutput for BashOutput {
 impl xai_tool_runtime::ToolOutput for GrepSearchOutput {}
 impl xai_tool_runtime::ToolOutput for ReadFileOutput {}
 impl xai_tool_runtime::ToolOutput for ListDirOutput {}
-impl xai_tool_runtime::ToolOutput for SearchReplaceOutput {}
+impl xai_tool_runtime::ToolOutput for SearchReplaceOutput {
+    fn chat_completion_output(&self) -> Option<xai_tool_runtime::ToolChatCompletionResponse> {
+        match self {
+            Self::EditsApplied(applied) => {
+                xai_tool_runtime::ToolOutput::chat_completion_output(applied)
+            }
+            _ => None,
+        }
+    }
+}
 impl xai_tool_runtime::ToolOutput for TodoWriteOutput {}
 impl xai_tool_runtime::ToolOutput for WebSearchOutput {}
 impl xai_tool_runtime::ToolOutput for WebFetchOutput {}
@@ -1276,9 +1315,205 @@ mod tests {
     use serde_json::json;
     use xai_tool_types::KillTaskResult;
     use xai_tool_types::TaskOutputResult;
+    #[test]
+    fn send_subagent_message_error_classification_is_closed() {
+        use crate::implementations::grok_build::send_subagent_message::SendSubagentMessageOutput::*;
+        for (output, is_error) in [
+            (
+                Accepted {
+                    message_id: "m-1".into(),
+                },
+                false,
+            ),
+            (NotFoundOrNotOwned, true),
+            (NotActiveOrFinalizing, true),
+            (Saturated { max_in_flight: 8 }, true),
+            (AdmissionUncertain, false),
+            (NotAcceptedBeforeDeadline, true),
+            (Unsupported, true),
+            (
+                Limit {
+                    max_bytes: 8,
+                    observed_bytes: 9,
+                },
+                true,
+            ),
+            (ChannelClosed, true),
+        ] {
+            assert_eq!(ToolOutput::SendSubagentMessage(output).is_error(), is_error);
+        }
+    }
+    #[test]
+    fn legacy_send_agent_message_output_envelope_deserializes() {
+        let output: ToolOutput = serde_json::from_value(serde_json::json!({
+            "type": "SendAgentMessage",
+            "outcome": "channel_closed",
+        }))
+        .expect("legacy output envelope must remain replayable");
+        assert!(matches!(
+            output,
+            ToolOutput::SendSubagentMessage(SendSubagentMessageOutput::ChannelClosed)
+        ));
+    }
     /// Serialize a ToolOutput to JSON value
     fn to_json(output: ToolOutput) -> serde_json::Value {
         serde_json::to_value(&output).unwrap()
+    }
+    #[test]
+    fn mcp_extracted_images_survive_hub_json_roundtrip() {
+        let mut mcp = MCPOutput::okay_output(
+            "browser_screenshot".into(),
+            "browser-use".into(),
+            crate::util::base64_images::IMAGE_CONTENT_PLACEHOLDER.into(),
+        );
+        let payload = "A".repeat(50_000);
+        mcp.extracted_images = vec![crate::util::base64_images::ExtractedImage {
+            data: payload.clone(),
+            mime_type: "image/png".into(),
+        }];
+        let v = serde_json::to_value(&mcp).unwrap();
+        assert!(
+            v.get("extracted_images").is_some(),
+            "hub ToolDyn to_value must keep non-empty extracted_images"
+        );
+        let back: MCPOutput = serde_json::from_value(v).unwrap();
+        assert_eq!(back.extracted_images.len(), 1);
+        assert_eq!(back.extracted_images[0].data, payload);
+        assert_eq!(back.extracted_images[0].mime_type, "image/png");
+    }
+    #[test]
+    fn tool_output_mcp_extracted_images_survive_hub_roundtrip() {
+        let mut mcp = MCPOutput::okay_output(
+            "t".into(),
+            "s".into(),
+            crate::util::base64_images::IMAGE_CONTENT_PLACEHOLDER.into(),
+        );
+        let payload = "C".repeat(12_000);
+        mcp.extracted_images = vec![crate::util::base64_images::ExtractedImage {
+            data: payload.clone(),
+            mime_type: "image/webp".into(),
+        }];
+        let output = ToolOutput::MCP(mcp);
+        let v = serde_json::to_value(&output).unwrap();
+        let back: ToolOutput = serde_json::from_value(v).unwrap();
+        let ToolOutput::MCP(mcp) = back else {
+            panic!("expected MCP");
+        };
+        assert_eq!(mcp.extracted_images.len(), 1);
+        assert_eq!(mcp.extracted_images[0].data, payload);
+    }
+    #[test]
+    fn file_content_extracted_images_survive_hub_json_roundtrip() {
+        let payload = "B".repeat(40_000);
+        let fc = FileContent {
+            content: crate::util::base64_images::IMAGE_CONTENT_PLACEHOLDER.into(),
+            content_concise: None,
+            absolute_path: PathBuf::from("/tmp/x.png"),
+            offset: None,
+            limit: None,
+            raw_output: String::new(),
+            total_lines: 1,
+            extracted_images: vec![crate::util::base64_images::ExtractedImage {
+                data: payload.clone(),
+                mime_type: "image/jpeg".into(),
+            }],
+        };
+        let v = serde_json::to_value(&fc).unwrap();
+        assert!(v.get("extracted_images").is_some());
+        let back: FileContent = serde_json::from_value(v).unwrap();
+        assert_eq!(back.extracted_images.len(), 1);
+        assert_eq!(back.extracted_images[0].data, payload);
+    }
+    #[test]
+    fn empty_extracted_images_omitted_from_json() {
+        let mcp = MCPOutput::okay_output("t".into(), "s".into(), "plain".into());
+        let v = serde_json::to_value(&mcp).unwrap();
+        assert!(v.get("extracted_images").is_none());
+    }
+    #[test]
+    fn tool_output_read_file_extracted_images_survive_hub_roundtrip() {
+        let payload = "D".repeat(18_000);
+        let fc = FileContent {
+            content: crate::util::base64_images::IMAGE_CONTENT_PLACEHOLDER.into(),
+            content_concise: None,
+            absolute_path: PathBuf::from("/tmp/y.png"),
+            offset: None,
+            limit: None,
+            raw_output: String::new(),
+            total_lines: 1,
+            extracted_images: vec![crate::util::base64_images::ExtractedImage {
+                data: payload.clone(),
+                mime_type: "image/png".into(),
+            }],
+        };
+        let output = ToolOutput::ReadFile(ReadFileOutput::FileContent(fc));
+        let v = serde_json::to_value(&output).unwrap();
+        let back: ToolOutput = serde_json::from_value(v).unwrap();
+        let ToolOutput::ReadFile(ReadFileOutput::FileContent(fc)) = back else {
+            panic!("expected FileContent");
+        };
+        assert_eq!(fc.extracted_images.len(), 1);
+        assert_eq!(fc.extracted_images[0].data, payload);
+        assert_eq!(fc.extracted_images[0].mime_type, "image/png");
+    }
+    fn empty_file_content(offset: Option<usize>, total_lines: usize) -> FileContent {
+        FileContent {
+            content: String::new(),
+            content_concise: None,
+            absolute_path: PathBuf::from("/tmp/f.txt"),
+            offset,
+            limit: None,
+            raw_output: String::new(),
+            total_lines,
+            extracted_images: vec![],
+        }
+    }
+    /// An empty file must render an explicit notice, not a blank result.
+    #[test]
+    fn read_empty_file_prompt_says_file_is_empty() {
+        let output = ToolOutput::ReadFile(ReadFileOutput::FileContent(empty_file_content(None, 0)));
+        assert_eq!(output.to_prompt_format(), "File is empty.");
+    }
+    /// An offset beyond the last line must say past-EOF and report the real
+    /// line count.
+    #[test]
+    fn read_past_eof_prompt_reports_line_count() {
+        let output = ToolOutput::ReadFile(ReadFileOutput::FileContent(empty_file_content(
+            Some(101),
+            100,
+        )));
+        let prompt = output.to_prompt_format();
+        assert!(
+            prompt.contains("past the end of the file"),
+            "expected past-EOF notice, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("100 lines"),
+            "expected real line count, got: {prompt}"
+        );
+    }
+    /// An empty window with an in-range offset (e.g. `limit: 0`) must render
+    /// the generic notice, not a bogus past-EOF claim.
+    #[test]
+    fn read_empty_window_in_range_offset_is_not_past_eof() {
+        let output = ToolOutput::ReadFile(ReadFileOutput::FileContent(empty_file_content(
+            Some(5),
+            100,
+        )));
+        let prompt = output.to_prompt_format();
+        assert_eq!(prompt, "(no lines returned)");
+        assert!(
+            !prompt.contains("past the end of the file"),
+            "in-range empty window must not claim past-EOF: {prompt}"
+        );
+    }
+    /// Non-empty content renders unchanged.
+    #[test]
+    fn read_non_empty_content_renders_verbatim() {
+        let mut fc = empty_file_content(None, 3);
+        fc.content = "1→a\nb\nc".to_string();
+        let output = ToolOutput::ReadFile(ReadFileOutput::FileContent(fc));
+        assert_eq!(output.to_prompt_format(), "1→a\nb\nc");
     }
     #[test]
     fn text_output_to_prompt_format_omits_consumed_completion_task_id() {
@@ -1385,14 +1620,6 @@ mod tests {
         let output = ToolOutput::ImageToVideo(MediaGenOutput::uploaded(url.to_string()));
         let prompt = output.to_prompt_format();
         assert!(prompt.contains(url), "prompt must include the upload URL");
-        assert!(
-            prompt.contains("not available locally"),
-            "prompt must tell the model the file is remote-only"
-        );
-        assert!(
-            prompt.contains("Do not read or re-display"),
-            "prompt must include re-display guard"
-        );
         let json = to_json(output);
         assert_eq!(json["uploaded_url"], url);
         assert!(
@@ -1410,8 +1637,7 @@ mod tests {
             to_json(ReadFileOutput::FileNotFound("Error: /tmp/x does not exist.".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "ReadFile", "FileNotFound" :
-            "Error: /tmp/x does not exist." })
+            json!({"type": "ReadFile", "FileNotFound": "Error: /tmp/x does not exist."})
         );
     }
     #[test]
@@ -1420,8 +1646,7 @@ mod tests {
             to_json(ReadFileOutput::IsADirectory("Error: /tmp is a directory.".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "ReadFile", "IsADirectory" :
-            "Error: /tmp is a directory." })
+            json!({"type": "ReadFile", "IsADirectory": "Error: /tmp is a directory."})
         );
     }
     #[test]
@@ -1431,8 +1656,7 @@ mod tests {
         );
         assert_eq!(
             json,
-            json!({ "type" : "ReadFile", "PermissionDenied" :
-            "Permission denied: /etc/shadow" })
+            json!({"type": "ReadFile", "PermissionDenied": "Permission denied: /etc/shadow"})
         );
     }
     #[test]
@@ -1445,9 +1669,7 @@ mod tests {
         );
         assert_eq!(
             json,
-            json!({ "type" : "ReadFile", "FileTooLarge" :
-            "File content (37044 tokens) exceeds maximum allowed tokens (25000 tokens)."
-            })
+            json!({"type": "ReadFile", "FileTooLarge": "File content (37044 tokens) exceeds maximum allowed tokens (25000 tokens)."})
         );
     }
     #[test]
@@ -1455,7 +1677,7 @@ mod tests {
         let json = to_json(ReadFileOutput::FileReadError("Failed to read file".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "ReadFile", "FileReadError" : "Failed to read file" })
+            json!({"type": "ReadFile", "FileReadError": "Failed to read file"})
         );
     }
     #[test]
@@ -1463,7 +1685,7 @@ mod tests {
         let json = to_json(ReadFileOutput::ImageSizeError("Image too large".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "ReadFile", "ImageSizeError" : "Image too large" })
+            json!({"type": "ReadFile", "ImageSizeError": "Image too large"})
         );
     }
     #[test]
@@ -1471,20 +1693,20 @@ mod tests {
         let json = to_json(ListDirOutput::NotFound("does not exist".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "ListDir", "NotFound" : "does not exist" })
+            json!({"type": "ListDir", "NotFound": "does not exist"})
         );
     }
     #[test]
     fn list_dir_is_a_file_json() {
         let json = to_json(ListDirOutput::IsAFile("is a file".into()).into());
-        assert_eq!(json, json!({ "type" : "ListDir", "IsAFile" : "is a file" }));
+        assert_eq!(json, json!({"type": "ListDir", "IsAFile": "is a file"}));
     }
     #[test]
     fn list_dir_not_a_directory_json() {
         let json = to_json(ListDirOutput::NotADirectory("is not a directory".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "ListDir", "NotADirectory" : "is not a directory" })
+            json!({"type": "ListDir", "NotADirectory": "is not a directory"})
         );
     }
     #[test]
@@ -1492,20 +1714,20 @@ mod tests {
         let json = to_json(ListDirOutput::PermissionDenied("Permission denied".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "ListDir", "PermissionDenied" : "Permission denied" })
+            json!({"type": "ListDir", "PermissionDenied": "Permission denied"})
         );
     }
     #[test]
     fn list_dir_generic_error_json() {
         let json = to_json(ListDirOutput::Error("Some error".into()).into());
-        assert_eq!(json, json!({ "type" : "ListDir", "Error" : "Some error" }));
+        assert_eq!(json, json!({"type": "ListDir", "Error": "Some error"}));
     }
     #[test]
     fn search_replace_file_not_found_json() {
         let json = to_json(SearchReplaceOutput::FileNotFound("not found".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "SearchReplace", "FileNotFound" : "not found" })
+            json!({"type": "SearchReplace", "FileNotFound": "not found"})
         );
     }
     #[test]
@@ -1520,8 +1742,13 @@ mod tests {
         );
         assert_eq!(
             json,
-            json!({ "type" : "SearchReplace", "NoMatchesFound" : { "message" :
-            "no matches", "file_path" : "/project/src/main.c" } })
+            json!({
+                "type": "SearchReplace",
+                "NoMatchesFound": {
+                    "message": "no matches",
+                    "file_path": "/project/src/main.c"
+                }
+            })
         );
     }
     #[test]
@@ -1545,8 +1772,7 @@ mod tests {
         let json = to_json(SearchReplaceOutput::MultipleMatchesFound("3 matches".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "SearchReplace", "MultipleMatchesFound" : "3 matches"
-            })
+            json!({"type": "SearchReplace", "MultipleMatchesFound": "3 matches"})
         );
     }
     #[test]
@@ -1554,7 +1780,7 @@ mod tests {
         let json = to_json(SearchReplaceOutput::FileAlreadyExists("exists".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "SearchReplace", "FileAlreadyExists" : "exists" })
+            json!({"type": "SearchReplace", "FileAlreadyExists": "exists"})
         );
     }
     #[test]
@@ -1562,7 +1788,7 @@ mod tests {
         let json = to_json(SearchReplaceOutput::InvalidInput("same strings".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "SearchReplace", "InvalidInput" : "same strings" })
+            json!({"type": "SearchReplace", "InvalidInput": "same strings"})
         );
     }
     #[test]
@@ -1570,9 +1796,60 @@ mod tests {
         let json = to_json(SearchReplaceOutput::FilenameTooLong("name too long".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "SearchReplace", "FilenameTooLong" : "name too long"
-            })
+            json!({"type": "SearchReplace", "FilenameTooLong": "name too long"})
         );
+    }
+    #[test]
+    fn apply_patch_parse_error_json() {
+        let json = to_json(ApplyPatchOutput::ParseError("Invalid patch: boom".into()).into());
+        assert_eq!(
+            json,
+            json!({"type": "ApplyPatch", "ParseError": "Invalid patch: boom"})
+        );
+    }
+    #[test]
+    fn apply_patch_application_error_json() {
+        let json = to_json(
+            ApplyPatchOutput::ApplicationError("File /tmp/x.rs does not exist".into()).into(),
+        );
+        assert_eq!(
+            json,
+            json!({"type": "ApplyPatch", "ApplicationError": "File /tmp/x.rs does not exist"})
+        );
+    }
+    #[test]
+    fn apply_patch_empty_patch_json() {
+        let json = to_json(ApplyPatchOutput::EmptyPatch("No files were modified.".into()).into());
+        assert_eq!(
+            json,
+            json!({"type": "ApplyPatch", "EmptyPatch": "No files were modified."})
+        );
+    }
+    /// `Success` must not serialize under any of the keys Python treats as a
+    /// failure, otherwise a successful patch would be taxed as a tool error.
+    #[test]
+    fn apply_patch_success_json_is_not_an_error_shape() {
+        let json = to_json(
+            ApplyPatchOutput::Success {
+                files: vec![ApplyPatchFileResult {
+                    path: PathBuf::from("/repo/src/main.rs"),
+                    action: "modified".into(),
+                    old_text: Some("old".into()),
+                    new_text: "new".into(),
+                    move_to: None,
+                }],
+                tool_output_for_prompt: "Updated /repo/src/main.rs".into(),
+            }
+            .into(),
+        );
+        assert_eq!(json["type"], "ApplyPatch");
+        assert!(json.get("Success").is_some(), "missing Success key: {json}");
+        for key in ["ParseError", "ApplicationError", "EmptyPatch"] {
+            assert!(
+                json.get(key).is_none(),
+                "success must not serialize under the error key {key}: {json}"
+            );
+        }
     }
     #[test]
     fn kill_task_result_json() {
@@ -1599,8 +1876,10 @@ mod tests {
         );
         assert_eq!(
             json,
-            json!({ "type" : "KillTask", "TaskNotFound" :
-            "Task abc not found. No background tasks exist in this session." })
+            json!({
+                "type": "KillTask",
+                "TaskNotFound": "Task abc not found. No background tasks exist in this session."
+            })
         );
     }
     #[test]
@@ -1609,8 +1888,7 @@ mod tests {
         let serialized = serde_json::to_value(&original).unwrap();
         let deserialized: KillTaskOutput = serde_json::from_value(serialized).unwrap();
         assert!(
-            matches!(deserialized, KillTaskOutput::TaskNotFound(ref msg) if msg ==
-            "not found")
+            matches!(deserialized, KillTaskOutput::TaskNotFound(ref msg) if msg == "not found")
         );
     }
     #[test]
@@ -1636,6 +1914,55 @@ mod tests {
         assert!(json.get("Result").is_some(), "missing Result key: {json}");
         assert_eq!(json["Result"]["task_id"], "task-1");
         assert_eq!(json["Result"]["status"], "running");
+    }
+    /// The single-task detail view is duration-only: absolute `started` /
+    /// `ended` instants stay on the wire struct but must not reach the prompt.
+    #[test]
+    fn task_output_prompt_is_duration_only() {
+        let out = ToolOutput::TaskOutput(TaskOutputOutput::Result(TaskOutputResult {
+            task_id: "task-1".into(),
+            command: "sleep 10".into(),
+            status: "completed".into(),
+            exit_code: Some(0),
+            started: "2026-03-09T00:00:00Z".into(),
+            ended: Some("2026-03-09T00:00:05Z".into()),
+            duration_secs: 5.0,
+            output: "hello".into(),
+            output_file: "/tmp/task-1.log".into(),
+            truncated: false,
+            truncation_hint: String::new(),
+            raw_output_bytes: 5,
+        }));
+        let prompt = out.to_prompt_format();
+        assert!(prompt.contains("Duration: 5.00s"), "{prompt}");
+        assert!(prompt.contains("Output File: /tmp/task-1.log"), "{prompt}");
+        assert!(
+            !prompt.contains("Started") && !prompt.contains("Ended"),
+            "absolute instants must not be model-visible: {prompt}"
+        );
+        assert!(
+            !prompt.contains("2026-03-09"),
+            "no wall-clock date may survive into the prompt: {prompt}"
+        );
+    }
+    #[test]
+    fn task_output_prompt_omits_empty_output_file() {
+        let out = ToolOutput::TaskOutput(TaskOutputOutput::Result(TaskOutputResult {
+            task_id: "task-2".into(),
+            command: "true".into(),
+            status: "completed".into(),
+            exit_code: Some(0),
+            started: String::new(),
+            ended: None,
+            duration_secs: 0.1,
+            output: "done".into(),
+            output_file: String::new(),
+            truncated: false,
+            truncation_hint: String::new(),
+            raw_output_bytes: 4,
+        }));
+        let prompt = out.to_prompt_format();
+        assert!(!prompt.contains("Output File"), "{prompt}");
     }
     fn make_result(status: &str, raw_output_bytes: usize) -> TaskOutputResult {
         TaskOutputResult {
@@ -1719,8 +2046,10 @@ mod tests {
         );
         assert_eq!(
             json,
-            json!({ "type" : "TaskOutput", "TaskNotFound" :
-            "Task xyz not found. Known task IDs: [task-1, task-2]" })
+            json!({
+                "type": "TaskOutput",
+                "TaskNotFound": "Task xyz not found. Known task IDs: [task-1, task-2]"
+            })
         );
     }
     #[test]
@@ -1729,8 +2058,7 @@ mod tests {
         let serialized = serde_json::to_value(&original).unwrap();
         let deserialized: TaskOutputOutput = serde_json::from_value(serialized).unwrap();
         assert!(
-            matches!(deserialized, TaskOutputOutput::TaskNotFound(ref msg) if msg ==
-            "not found")
+            matches!(deserialized, TaskOutputOutput::TaskNotFound(ref msg) if msg == "not found")
         );
     }
     #[test]
@@ -1771,8 +2099,9 @@ mod tests {
         );
         assert_eq!(
             json,
-            json!({ "type" : "Todo", "DuplicateId" :
-            "Duplicate todo ID in request: \"dup\". Each todo item must have a unique ID."
+            json!({
+                "type": "Todo",
+                "DuplicateId": "Duplicate todo ID in request: \"dup\". Each todo item must have a unique ID."
             })
         );
     }
@@ -1781,10 +2110,7 @@ mod tests {
         let original = TodoWriteOutput::DuplicateId("dup id".into());
         let serialized = serde_json::to_value(&original).unwrap();
         let deserialized: TodoWriteOutput = serde_json::from_value(serialized).unwrap();
-        assert!(
-            matches!(deserialized, TodoWriteOutput::DuplicateId(ref msg) if msg ==
-            "dup id")
-        );
+        assert!(matches!(deserialized, TodoWriteOutput::DuplicateId(ref msg) if msg == "dup id"));
     }
     #[test]
     fn todo_write_success_round_trip() {
@@ -1874,10 +2200,6 @@ mod tests {
             rendered.contains("persona=\"implementer\""),
             "persona hint present"
         );
-        assert!(
-            rendered.contains("Pass the same persona when resuming"),
-            "persona instruction present"
-        );
     }
     #[test]
     fn subagent_completed_prompt_format_with_worktree() {
@@ -1956,19 +2278,16 @@ mod tests {
     #[test]
     fn enter_plan_mode_prompt_format_with_default_hints() {
         let output = ToolOutput::EnterPlanMode(EnterPlanModeOutput::Entered {
-            message: "Entered plan mode.".into(),
+            message: "entered-msg-token".into(),
             plan_file_path: "/tmp/plan.md".into(),
             tool_hints: EnterPlanModeToolHints::default(),
             plan_file_seed: PlanFileSeedStatus::Empty,
         });
         let prompt = output.to_prompt_format();
-        assert!(prompt.contains("Entered plan mode."));
-        assert!(prompt.contains("Write your plan to /tmp/plan.md. The file exists and is empty."));
+        assert!(prompt.contains("entered-msg-token"));
         assert!(prompt.contains("/tmp/plan.md"));
         assert!(prompt.contains("ask_user_question"));
         assert!(prompt.contains("exit_plan_mode"));
-        assert!(prompt.contains("5. Write your plan to the plan file above"));
-        assert!(prompt.contains("present your plan to the user"));
         assert!(
             !prompt.contains("subagent_type"),
             "should not contain subagent guidance without task tool"
@@ -1982,16 +2301,13 @@ mod tests {
             tool_hints: EnterPlanModeToolHints {
                 ask_user: "ask_user_question".into(),
                 exit_plan: "exit_plan_mode".into(),
-                task: "task".into(),
+                task: "delegate-xyz".into(),
             },
             plan_file_seed: PlanFileSeedStatus::Empty,
         });
         let prompt = output.to_prompt_format();
-        assert!(
-            prompt.contains("task tool with subagent_type"),
-            "should include subagent guidance when task tool is set"
-        );
-        assert!(prompt.contains("parallelize codebase exploration"));
+        assert!(prompt.contains("delegate-xyz"));
+        assert!(prompt.contains("subagent_type"));
     }
     #[test]
     fn enter_plan_mode_prompt_format_with_custom_tool_names() {
@@ -2006,26 +2322,10 @@ mod tests {
             plan_file_seed: PlanFileSeedStatus::Empty,
         });
         let prompt = output.to_prompt_format();
-        assert!(prompt.contains("Use AskUser if you need"));
-        assert!(prompt.contains("use FinishPlan to present"));
+        assert!(prompt.contains("AskUser"));
+        assert!(prompt.contains("FinishPlan"));
         assert!(!prompt.contains("ask_user_question"));
         assert!(!prompt.contains("exit_plan_mode"));
-    }
-    #[test]
-    fn enter_plan_mode_prompt_format_contains_six_steps() {
-        let output = ToolOutput::EnterPlanMode(EnterPlanModeOutput::Entered {
-            message: "Entered plan mode.".into(),
-            plan_file_path: "/tmp/plan.md".into(),
-            tool_hints: EnterPlanModeToolHints::default(),
-            plan_file_seed: PlanFileSeedStatus::Empty,
-        });
-        let prompt = output.to_prompt_format();
-        assert!(prompt.contains("1. Thoroughly explore"));
-        assert!(prompt.contains("2. Identify similar"));
-        assert!(prompt.contains("3. Use ask_user_question"));
-        assert!(prompt.contains("4. Design a concrete"));
-        assert!(prompt.contains("5. Write your plan to the plan file above"));
-        assert!(prompt.contains("6. When ready, use exit_plan_mode"));
     }
     #[test]
     fn enter_plan_mode_output_serde_with_tool_hints() {
@@ -2060,10 +2360,12 @@ mod tests {
     }
     #[test]
     fn enter_plan_mode_output_serde_defaults_tool_hints_when_absent() {
-        let json = json!(
-            { "Entered" : { "message" : "Entered plan mode.", "plan_file_path" :
-            "/tmp/plan.md" } }
-        );
+        let json = json!({
+            "Entered": {
+                "message": "Entered plan mode.",
+                "plan_file_path": "/tmp/plan.md"
+            }
+        });
         let deserialized: EnterPlanModeOutput = serde_json::from_value(json).unwrap();
         match deserialized {
             EnterPlanModeOutput::Entered {
@@ -2089,12 +2391,16 @@ mod tests {
             tool_hints: EnterPlanModeToolHints::default(),
             plan_file_seed: PlanFileSeedStatus::NonEmpty,
         });
+        let empty = ToolOutput::EnterPlanMode(EnterPlanModeOutput::Entered {
+            message: "Entered plan mode.".into(),
+            plan_file_path: "/tmp/plan.md".into(),
+            tool_hints: EnterPlanModeToolHints::default(),
+            plan_file_seed: PlanFileSeedStatus::Empty,
+        })
+        .to_prompt_format();
         let prompt = output.to_prompt_format();
-        assert!(
-            prompt.contains("Write your plan to /tmp/plan.md. The file exists but is not empty.")
-        );
-        assert!(!prompt.contains("and is empty"));
-        assert!(prompt.contains("5. Write your plan to the plan file above\n"));
+        assert!(prompt.contains("/tmp/plan.md"));
+        assert_ne!(prompt, empty, "non-empty seed must change compiled status");
     }
     #[test]
     fn enter_plan_mode_prompt_format_missing_seed() {
@@ -2104,57 +2410,71 @@ mod tests {
             tool_hints: EnterPlanModeToolHints::default(),
             plan_file_seed: PlanFileSeedStatus::Missing(PlanFileSeedFailure::NotCreated),
         });
+        let empty = ToolOutput::EnterPlanMode(EnterPlanModeOutput::Entered {
+            message: "Entered plan mode.".into(),
+            plan_file_path: "/tmp/plan.md".into(),
+            tool_hints: EnterPlanModeToolHints::default(),
+            plan_file_seed: PlanFileSeedStatus::Empty,
+        })
+        .to_prompt_format();
         let prompt = output.to_prompt_format();
-        assert!(
-            prompt.contains("Write your plan to /tmp/plan.md. The file has not yet been created.")
-        );
-        assert!(prompt.contains("5. Write your plan to the plan file above"));
+        assert!(prompt.contains("/tmp/plan.md"));
+        assert_ne!(prompt, empty, "missing seed must change compiled status");
     }
     #[test]
     fn enter_plan_mode_absent_seed_field_prompt_is_missing() {
-        let json = json!(
-            { "Entered" : { "message" : "Entered plan mode.", "plan_file_path" :
-            "/tmp/plan.md" } }
-        );
+        let json = json!({
+            "Entered": {
+                "message": "Entered plan mode.",
+                "plan_file_path": "/tmp/plan.md"
+            }
+        });
         let deserialized: EnterPlanModeOutput = serde_json::from_value(json).unwrap();
         let prompt = ToolOutput::EnterPlanMode(deserialized).to_prompt_format();
-        assert!(
-            prompt.contains("Write your plan to /tmp/plan.md. The file has not yet been created.")
+        let empty = ToolOutput::EnterPlanMode(EnterPlanModeOutput::Entered {
+            message: "Entered plan mode.".into(),
+            plan_file_path: "/tmp/plan.md".into(),
+            tool_hints: EnterPlanModeToolHints::default(),
+            plan_file_seed: PlanFileSeedStatus::Empty,
+        })
+        .to_prompt_format();
+        assert!(prompt.contains("/tmp/plan.md"));
+        assert_ne!(
+            prompt, empty,
+            "absent seed field must compile as missing, not empty"
         );
     }
     #[test]
     fn enter_plan_mode_missing_reason_suffixes() {
         let cases = [
-            (
-                PlanFileSeedFailure::NotCreated,
-                "The file has not yet been created.",
-            ),
-            (
-                PlanFileSeedFailure::NotAFile,
-                "A directory already exists at that path.",
-            ),
-            (
-                PlanFileSeedFailure::Inaccessible,
-                "The file could not be accessed.",
-            ),
-            (
-                PlanFileSeedFailure::Unavailable,
-                "The plan file location is unavailable.",
-            ),
+            PlanFileSeedFailure::NotCreated,
+            PlanFileSeedFailure::NotAFile,
+            PlanFileSeedFailure::Inaccessible,
+            PlanFileSeedFailure::Unavailable,
         ];
-        for (reason, expected) in cases {
-            let output = ToolOutput::EnterPlanMode(EnterPlanModeOutput::Entered {
-                message: "Entered plan mode.".into(),
+        let mut compiled = Vec::new();
+        for reason in cases {
+            let prompt = ToolOutput::EnterPlanMode(EnterPlanModeOutput::Entered {
+                message: "entered-msg-token".into(),
                 plan_file_path: "/tmp/plan.md".into(),
                 tool_hints: EnterPlanModeToolHints::default(),
                 plan_file_seed: PlanFileSeedStatus::Missing(reason),
-            });
-            let prompt = output.to_prompt_format();
+            })
+            .to_prompt_format();
+            assert!(prompt.contains("entered-msg-token"), "reason {reason:?}");
             assert!(
-                prompt.contains(&format!("Write your plan to /tmp/plan.md. {expected}")),
+                prompt.contains("/tmp/plan.md"),
                 "reason {reason:?}: {prompt}"
             );
+            compiled.push(prompt);
         }
+        compiled.sort();
+        compiled.dedup();
+        assert_eq!(
+            compiled.len(),
+            cases.len(),
+            "each missing-seed reason must compile distinctly"
+        );
     }
     #[test]
     fn plan_file_seed_missing_serde_shape() {
@@ -2167,7 +2487,7 @@ mod tests {
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(
             json["Entered"]["plan_file_seed"],
-            json!({ "missing" : "not_a_file" })
+            json!({ "missing": "not_a_file" })
         );
         let back: EnterPlanModeOutput = serde_json::from_value(json).unwrap();
         let EnterPlanModeOutput::Entered { plan_file_seed, .. } = back;
@@ -2404,6 +2724,100 @@ mod tests {
         assert!(
             xai_tool_runtime::ToolOutput::chat_completion_output(&ToolOutput::Text(
                 TextOutput::from("noop")
+            ))
+            .is_none()
+        );
+    }
+    fn sample_edits_applied(old_lines: &[usize]) -> SearchReplaceEditsApplied {
+        sample_edits_applied_for("b", old_lines)
+    }
+    fn sample_edits_applied_for(
+        old_string: &str,
+        old_lines: &[usize],
+    ) -> SearchReplaceEditsApplied {
+        SearchReplaceEditsApplied {
+            old_string: old_string.into(),
+            new_string: "z".into(),
+            tool_output_for_prompt: "edited".into(),
+            tool_output_for_prompt_concise: None,
+            absolute_path: PathBuf::from("/w/a.rs"),
+            edits: SearchReplaceEditContextInformation {
+                details: old_lines
+                    .iter()
+                    .map(|&old_line| SearchReplaceEditDetail {
+                        old_string: old_string.into(),
+                        old_line,
+                        new_string: "z".into(),
+                        new_line: old_line,
+                        context_before: String::new(),
+                        context_after: String::new(),
+                        line_prefix: String::new(),
+                    })
+                    .collect(),
+            },
+            patch: None,
+            unicode_normalized: false,
+        }
+    }
+    /// Every applied edit settles the card through the empty success shell;
+    /// only a single-match edit of an existing file also carries the anchor.
+    fn assert_applied_edit_frame(
+        resp: xai_tool_runtime::ToolChatCompletionResponse,
+        anchor: Option<xai_tool_runtime::EditFileAnchor>,
+    ) {
+        let result = resp.result.unwrap();
+        assert_eq!(result.message_tag.as_deref(), Some("raw_function_result"));
+        assert_eq!(result.edit_file_result, anchor);
+        let cer = result.code_execution_result.expect("settle shell");
+        assert_eq!(
+            (
+                cer.stdout.as_str(),
+                cer.stderr.as_str(),
+                cer.exit_code,
+                cer.command_timed_out
+            ),
+            ("", "", 0, false)
+        );
+        assert!(result.extra.is_empty());
+    }
+    #[test]
+    fn search_replace_chat_completion_anchors_single_edit() {
+        let anchor = Some(xai_tool_runtime::EditFileAnchor { start_line: 137 });
+        let applied = SearchReplaceOutput::EditsApplied(sample_edits_applied(&[137]));
+        assert_applied_edit_frame(
+            xai_tool_runtime::ToolOutput::chat_completion_output(&applied).unwrap(),
+            anchor,
+        );
+        assert_applied_edit_frame(
+            xai_tool_runtime::ToolOutput::chat_completion_output(&ToolOutput::SearchReplace(
+                applied,
+            ))
+            .unwrap(),
+            anchor,
+        );
+    }
+    #[test]
+    fn search_replace_chat_completion_settles_multi_match_and_creation_without_anchor() {
+        assert_applied_edit_frame(
+            xai_tool_runtime::ToolOutput::chat_completion_output(&ToolOutput::SearchReplace(
+                SearchReplaceOutput::EditsApplied(sample_edits_applied(&[2, 9])),
+            ))
+            .unwrap(),
+            None,
+        );
+        assert_applied_edit_frame(
+            xai_tool_runtime::ToolOutput::chat_completion_output(
+                &SearchReplaceOutput::EditsApplied(sample_edits_applied_for("", &[1])),
+            )
+            .unwrap(),
+            None,
+        );
+    }
+    #[test]
+    fn search_replace_chat_completion_skips_failures() {
+        assert!(
+            xai_tool_runtime::ToolOutput::chat_completion_output(&ToolOutput::SearchReplace(
+                SearchReplaceOutput::MultipleMatchesFound("two".into())
             ))
             .is_none()
         );

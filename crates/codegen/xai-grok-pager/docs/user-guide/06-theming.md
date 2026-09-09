@@ -6,7 +6,7 @@ Grok Build draws all TUI colors from a central theme. You can switch themes whil
 
 ## Available Themes
 
-Grok includes five built-in themes, plus an `auto` option that follows your system appearance:
+Grok includes six built-in themes, plus an `auto` option that follows your system appearance:
 
 | Theme | Config Names | Description | Truecolor Required |
 |-------|-------------|-------------|--------------------|
@@ -15,12 +15,30 @@ Grok includes five built-in themes, plus an `auto` option that follows your syst
 | **TokyoNight** | `tokyonight`, `tokyo-night`, `tokyo` | Dark, blue-tinted backgrounds from the Tokyo Night palette. Loses its character when quantized. | Yes |
 | **RosePineMoon** | `rosepine`, `rose-pine`, `rosepine-moon`, `rose-pine-moon` | Muted dark palette with mauve accents, from the Rosé Pine family. | Yes |
 | **OscuraMidnight** | `oscura`, `oscura-midnight` | Deep dark base with purple accents. | Yes |
+| **Terminal** | `terminal`, `terminal-default`, `transparent`, `native` | Your terminal's own colors: no background of its own, so the terminal canvas (translucency, background images) shows through. | No |
 
 Theme names are case-insensitive. The `auto` option (alias `system`) is documented under [Auto Theme (System Appearance)](#auto-theme-system-appearance).
+
+### Terminal Theme
+
+`terminal` paints no surface backgrounds and defines almost no colors of its own — everything comes from your terminal profile. The scrollback, composer, modals, and status line leave the terminal's canvas visible (a translucent or image-backed window shows through Grok the way it shows through your shell), body text uses the terminal's default foreground, and accents (errors, diffs, links, syntax) come from your profile's 16-color ANSI palette. Because it borrows your profile's colors instead of assuming a light or dark background, it stays readable on any profile with no appearance detection, and it renders identically at every color depth.
+
+The theme paints no backgrounds at all: your messages render in bold instead of on a band, menus and prompt panels sit directly on the terminal canvas, and the selected or hovered row in any menu uses reverse video (your terminal's own foreground/background swap), so every combination stays readable on any profile. Decoration — idle borders, dividers, the scrollbar thumb — uses ANSI *bright black* as a foreground, the palette slot your profile tunes as its own dimmed tone. Focused chrome, like the active composer border, stays at the full default foreground so focus still pops. Grok also leaves your cursor color alone on this theme (other themes recolor it to their accent).
+
+```toml
+[ui]
+theme = "terminal"
+```
+
+Contrast is only as good as your terminal profile: a profile with a very dark bright-black slot will render faint dividers, since Grok derives everything from your palette rather than hard-coding colors.
+
+The theme is rolling out gradually. Until the rollout reaches your account it is hidden from `/theme` and `/settings`, its names do not parse, and a configured `theme = "terminal"` falls back to the default theme. Set `GROK_TERMINAL_THEME=1` (or `[features] terminal_theme = true` in `config.toml`) to enable it locally ahead of the rollout.
 
 ### Minimal Mode Has No Theming
 
 **Minimal mode** (`--minimal`) always renders with a single fixed terminal-native palette and ignores the `theme` settings entirely (they still apply to the full TUI). Minimal draws directly on your terminal's own background, so it uses your terminal's default foreground/background plus its 16-color ANSI palette — the same colors `git` or `ls` use — which stays readable on any light or dark terminal profile without detection or configuration. `/theme` and the theme rows in `/settings` are unavailable in minimal mode.
+
+Syntax highlighting in minimal mode does **not** switch between light and dark theme files (polarity detection is intentionally avoided). Near-gray tokens inherit the terminal default foreground; chromatic tokens use base ANSI accents (red/green/yellow/blue/magenta/cyan) so read-file output and fenced code stay legible on both light and dark profiles.
 
 ---
 
@@ -28,7 +46,7 @@ Theme names are case-insensitive. The `auto` option (alias `system`) is document
 
 ### In the TUI
 
-Run the `/theme` slash command (alias `/t`) to open the theme picker. As you move through the list with the arrow keys, Grok previews each theme in real time. Press Enter to apply and save your choice, or press Escape to revert.
+Run the `/theme` slash command (alias `/t`) to open the theme picker. As you move through the list with the arrow keys, Grok previews each theme in real time. Press Enter to apply and save your choice, or press Escape to revert. Typing filters the list by any of a theme's config names, so `/theme transparent` narrows it to the Terminal row.
 
 To switch without the picker, pass a name directly:
 
@@ -76,9 +94,11 @@ auto_light_theme = "grokday"
 | **macOS** | Reads `AppleInterfaceStyle` system preference |
 | **Linux** | Queries XDG Desktop Portal (`org.freedesktop.appearance.color-scheme`) |
 | **Windows** | Reads the system personalization registry |
-| **SSH / headless** | Falls back to an OSC 11 terminal background query at startup |
+| **SSH / tmux / headless** | `GROK_APPEARANCE` or `LC_GROK_APPEARANCE` (`dark`/`light`), then `COLORFGBG`, then a startup OSC 11 background query. `grok wrap ssh …` stamps `LC_GROK_APPEARANCE` from the local OS theme so it survives SSH into the login shell. New tmux sessions inherit it only if the tmux server/session was created with that env (or `update-environment` includes it). OSC 11 is DCS-wrapped for tmux ≥ 3.3 when tmux is the immediate terminal (not an editor `:terminal`); reaching the outer emulator also needs `allow-passthrough`, and replies are best-effort. |
 
-Once running, Grok polls for appearance changes every 5 seconds. Toggling your OS between light and dark mode takes effect within seconds without restarting.
+Once running, Grok polls desktop APIs and env hints every 5 seconds. Toggling your OS between light and dark mode on a local desktop takes effect within seconds without restarting. Over SSH the wrap-stamped env is fixed for that hop.
+
+You can also set `GROK_THEME` (or `LC_GROK_THEME`) to force a theme or `auto` without editing `config.toml`.
 
 ### Via the Settings Pane
 
@@ -98,7 +118,7 @@ On startup, Grok detects your terminal's color capability level:
 
 When you set `NO_COLOR`, Grok emits no color and renders in monochrome.
 
-Run `/terminal-setup` to see the detected level (`color` row) and which themes the picker offers on this terminal (`themes` row). When truecolor is missing, the issues section explains how to enable it (or that Terminal.app cannot).
+Run `/doctor` to see the detected color level and the themes available on this terminal. If truecolor is unavailable, Doctor shows the relevant setup steps or explains the terminal limitation.
 
 ### Automatic Quantization
 
@@ -187,7 +207,7 @@ gap_right = 0           # Gap between scrollbar and screen edge (0 = at edge)
 [scrollback.scroll]
 margin = 0                  # Context lines above/below selected entry (0 = edge)
 min_page_fraction = 0       # Minimum scroll as % of viewport (0-100)
-follow_indicator = "center" # "center" = show down-arrow, "none" = hidden
+follow_indicator = "center" # "center" = show the ▼/▲ scroll arrows, "none" = hidden
 follow_auto_select = true   # Auto-select latest entry when following
 follow_by_overscroll = true # Scrolling past bottom engages follow mode
 anchor_on_fold = true       # Keep block header at same screen position when folding
@@ -292,13 +312,6 @@ mouse_hover = true           # Show hover highlight on mouse over
 show_prefix = true           # Show the prompt prefix character
 ```
 
-### Todo Badges
-
-```toml
-[todo]
-badge_format = "default"   # "default" = 2/5 (done/total), "colon" = [▶:1 □:4 ✓:3 ✗:2], "comma" = [1 ▶, 4 □, 3 ✓, 2 ✗]
-```
-
 ### Terminal Behavior
 
 ```toml
@@ -325,7 +338,7 @@ Each theme defines the following color slots that are used throughout the TUI:
 
 **Backgrounds:** `bg_base`, `bg_light`, `bg_dark`, `bg_highlight`, `bg_hover`, `bg_terminal`, `bg_visual`
 
-**Accents:** `accent_user`, `accent_assistant`, `accent_thinking`, `accent_tool`, `accent_system`, `accent_error`, `accent_success`, `accent_running`, `accent_skill`, `accent_plan`, `accent_verify`, `accent_feedback`, `accent_remember`, `accent_model`
+**Accents:** `accent_user`, `accent_assistant`, `accent_thinking`, `accent_tool`, `accent_system`, `accent_error`, `accent_success`, `accent_running`, `accent_skill`, `accent_plan`, `accent_verify`, `accent_remember`, `accent_model`
 
 **Text:** `text_primary`, `text_secondary`
 

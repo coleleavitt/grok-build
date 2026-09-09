@@ -20,11 +20,9 @@ pub struct BashNotificationBase {
     /// The command being executed
     pub command: String,
 
-    /// Output bytes (may be truncated if exceeds limit).
-    /// Use `output_lossy()` for string conversion.
-    ///
-    /// Serialized as base64; see `crate::util::serde_base64` for the wire format
-    /// and deploy ordering.
+    /// Output bytes (may be truncated if exceeds limit). Use `output_lossy()` for string
+    /// conversion. Serialized as base64; see `crate::util::serde_base64` for the wire format and
+    /// deploy ordering.
     #[cfg_attr(feature = "serde", serde(with = "crate::util::serde_base64"))]
     // Wire form is a base64 string, not a byte array, so advertise `String`.
     #[schemars(with = "String")]
@@ -41,10 +39,8 @@ pub struct BashNotificationBase {
 }
 
 impl BashNotificationBase {
-    /// Lossy UTF-8 conversion of the raw `output` bytes.
-    ///
-    /// Bytes that are not valid UTF-8 (e.g. a delta that begins or ends
-    /// mid–multi-byte sequence) are replaced with the Unicode replacement
+    /// Lossy UTF-8 conversion of the raw `output` bytes. Bytes that are not valid UTF-8 (e.g. a
+    /// delta that begins or ends mid–multi-byte sequence) are replaced with the Unicode replacement
     /// character. Suitable for human-readable log display.
     pub fn output_lossy(&self) -> String {
         String::from_utf8_lossy(&self.output).into_owned()
@@ -101,11 +97,9 @@ pub struct BashExecutionTimeout {
     pub timeout: std::time::Duration,
 }
 
-/// Notification that a bash command was moved to background.
-/// Sent when user backgrounds a running command or when is_background=true.
-///
-/// NOTE: This is the final notification from the tool layer. The background
-/// task monitor will send BashExecutionComplete when the process exits.
+/// Notification that a bash command was moved to background. Sent when user backgrounds a running
+/// command or when is_background=true. NOTE: This is the final notification from the tool layer.
+/// The background task monitor will send BashExecutionComplete when the process exits.
 #[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BashExecutionBackgrounded {
@@ -117,33 +111,23 @@ pub struct BashExecutionBackgrounded {
     /// Background tasks always write to file for later retrieval.
     pub output_file: PathBuf,
 
-    /// Task ID for background task registry.
-    ///
-    /// This is different from `tool_call_id`:
-    /// - `tool_call_id` (in base): Correlates with the original tool call in TUI
-    /// - `task_id`: Used with `get_task_output` tool to query status later
-    ///
-    /// They are always different because task_id is generated when backgrounding,
-    /// while tool_call_id was assigned when the tool was invoked.
+    /// Task ID for background task registry. `tool_call_id` (in base): Correlates with the original tool call in TUI
+    /// `task_id`: Used with `get_task_output` tool to query status later They are always different because task_id is
+    /// generated when backgrounding, while tool_call_id was assigned when the tool was invoked.
     pub task_id: String,
 
-    /// When `Some`, this backgrounded task is a **monitor** (not an ordinary
-    /// bash command), and the string is the monitor's human-readable
-    /// description (e.g. "errors in deploy.log"). Consumers (the pager) use
-    /// it both as the display label and as the signal to tag the row as a
-    /// monitor rather than syntax-highlighting the command. `None` for
-    /// ordinary backgrounded commands.
+    /// When `Some`, this backgrounded task is a **monitor** (not an ordinary bash command), and the string is the monitor's human-readable
+    /// description (e.g. "errors in deploy.log"). Consumers (the pager) use it both as the display label and as the signal to tag the row as a
+    /// monitor rather than syntax-highlighting the command. `None` for ordinary backgrounded commands.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub monitor_description: Option<String>,
 
-    /// Human-readable description from the tool call (e.g. model-supplied
-    /// `description` on `run_terminal_command`). Used by the pager for
-    /// "Task started: …" / tasks-pane labels instead of the raw command.
-    /// `None` only on legacy paths that never had a model description
-    /// (e.g. reparented monitors).
+    /// Human-readable description from the tool call (e.g. model-supplied `description` on `run_terminal_command`). Used by
+    /// the pager for "Task started: …" / tasks-pane labels instead of the raw command. `None` only on legacy paths that
+    /// never had a model description (e.g. reparented monitors).
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
@@ -199,21 +183,18 @@ pub struct FileWritten {
     /// For replacements: the full file content after applying the edit.
     pub content: String,
 
-    /// Full file content BEFORE the write.
-    /// `None` if this is a new file creation (file didn't exist before).
-    /// `Some(text)` if this is an edit to an existing file.
-    /// Consumers use this for rewind — restoring the file to its pre-edit state.
+    /// Full file content BEFORE the write. `None` if this is a new file creation (file didn't exist
+    /// before). `Some(text)` if this is an edit to an existing file. Consumers use this for rewind
+    /// — restoring the file to its pre-edit state.
     pub previous_content: Option<String>,
 
     /// Whether this was a new file creation (old_string was empty)
     pub is_new_file: bool,
 }
 
-/// Notification that the agent has entered plan mode.
-///
-/// Sent by the `EnterPlanMode` tool so the gateway / client can transition
-/// into plan-mode state (enforce read-only constraints, inject plan-mode
-/// system prompts, display plan-mode UI indicators, etc.).
+/// Notification that the agent has entered plan mode. Sent by the `EnterPlanMode` tool so the
+/// gateway / client can transition into plan-mode state (enforce read-only constraints, inject
+/// plan-mode system prompts, display plan-mode UI indicators, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PlanModeEntered {
@@ -221,12 +202,9 @@ pub struct PlanModeEntered {
     pub tool_call_id: String,
 }
 
-/// Notification that the agent has exited plan mode.
-///
-/// Sent by the `ExitPlanMode` tool so the gateway / client can transition
-/// out of plan-mode state. The notification carries the plan file content
-/// (if any) so the client can present it for user approval without needing
-/// a separate file-read round-trip.
+/// Notification that the agent has exited plan mode. Sent by the `ExitPlanMode` tool so the gateway / client can
+/// transition out of plan-mode state. The notification carries the plan file content (if any) so the client can present
+/// it for user approval without needing a separate file-read round-trip.
 #[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PlanModeExited {
@@ -241,11 +219,9 @@ pub struct PlanModeExited {
     pub plan_file_path: String,
 }
 
-/// Notification that the agent is asking the user a question.
-///
-/// Sent by the `AskUserQuestion` tool so the gateway / client can present
-/// a structured question UI with options. The client collects the user's
-/// answers and returns them as the tool result.
+/// Notification that the agent is asking the user a question. Sent by the `AskUserQuestion` tool so
+/// the gateway / client can present a structured question UI with options. The client collects the
+/// user's answers and returns them as the tool result.
 #[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UserQuestionAsked {
@@ -311,13 +287,66 @@ pub struct ScheduledTaskFired {
     pub human_schedule: String,
     /// RFC3339 timestamp of next fire (for live countdown viz).
     pub next_fire_at: Option<String>,
+    pub subagent_id: Option<String>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub generation: String,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub revision: u64,
+}
+
+/// Why a scheduled task was removed. Drives client UX: only `Expired` needs a visible notice
+/// (the task died without any user or model action).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, schemars::JsonSchema)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
+pub enum ScheduledTaskRemovedReason {
+    /// A one-shot task fired and completed.
+    Completed,
+    /// A recurring task reached `expires_at` (7 days after creation).
+    Expired,
+    /// Explicit `scheduler_delete` by the user or model.
+    Deleted,
+    /// Actor shutdown chip-cleanup. The task itself persists on disk and re-arms on session
+    /// resume, so this must not read as a real removal.
+    Shutdown,
+    /// Absent on legacy payloads, or a variant this build doesn't know. Consumers must treat
+    /// it as "no special handling".
+    #[default]
+    #[cfg_attr(feature = "serde", serde(other))]
+    Unknown,
 }
 
 /// Notification that a scheduled task was removed (deleted, expired, or one-shot completed).
+/// `#[non_exhaustive]`: downstream crates construct via [`Self::new`], so the next wire field
+/// stays additive there instead of breaking every struct literal again.
 #[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct ScheduledTaskRemoved {
     pub task_id: String,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub reason: ScheduledTaskRemovedReason,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub generation: String,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub revision: u64,
+}
+
+impl ScheduledTaskRemoved {
+    pub fn new(
+        task_id: String,
+        reason: ScheduledTaskRemovedReason,
+        generation: String,
+        revision: u64,
+    ) -> Self {
+        Self {
+            task_id,
+            reason,
+            generation,
+            revision,
+        }
+    }
 }
 
 /// Notification that a scheduled task was created and should appear in the tasks pane.
@@ -332,6 +361,10 @@ pub struct ScheduledTaskCreated {
     pub human_schedule: String,
     /// RFC3339 timestamp of next fire (for live countdown viz).
     pub next_fire_at: Option<String>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub generation: String,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub revision: u64,
 }
 
 /// A streaming event from a Monitor tool background process.
@@ -351,6 +384,21 @@ pub struct MonitorEvent {
     pub raw_text: String,
     /// Session that owns the monitor task (from the task snapshot). `None` for
     /// legacy backends. The bridge drops events whose owner isn't its session.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub owner_session_id: Option<String>,
+}
+
+/// A background subagent reached a terminal state while the parent held a handle.
+#[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SubagentCompleted {
+    pub subagent_id: String,
+    pub subagent_type: String,
+    pub description: String,
+    pub status: String,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub error: Option<String>,
+    pub duration_ms: u64,
     #[cfg_attr(feature = "serde", serde(default))]
     pub owner_session_id: Option<String>,
 }
@@ -385,10 +433,12 @@ pub enum ToolNotification {
     /// about the task being finished status
     TaskCompleted(TaskSnapshot),
 
-    /// The agent requested to enter plan mode.
-    /// Consumers (gateway, TUI) use this to transition the client into
-    /// plan-mode UI state (e.g., enforce read-only, inject plan-mode
-    /// system prompts, show plan-mode indicators).
+    /// A background subagent reached a terminal state.
+    SubagentCompleted(SubagentCompleted),
+
+    /// The agent requested to enter plan mode. Consumers (gateway, TUI) use this to transition the
+    /// client into plan-mode UI state (e.g., enforce read-only, inject plan-mode system prompts,
+    /// show plan-mode indicators).
     PlanModeEntered(PlanModeEntered),
 
     /// The agent signaled it is done planning and wants to exit plan mode.
@@ -420,23 +470,18 @@ pub enum ToolNotification {
     MonitorEvent(MonitorEvent),
 }
 
-/// Single source of truth for the `(variant tag => payload type)` mapping of
-/// [`ToolNotification`], feeding [`ALL_NOTIFICATION_TAGS`] and
-/// [`notification_schema_catalog`]. A compile-time exhaustive `match`
-/// (`_assert_all_variants_listed`) forces this list to stay in sync with the enum.
+/// Single source of truth for the `(variant tag => payload type)` mapping of [`ToolNotification`],
+/// feeding [`ALL_NOTIFICATION_TAGS`] and [`notification_schema_catalog`]. A compile-time exhaustive
+/// `match` (`_assert_all_variants_listed`) forces this list to stay in sync with the enum.
 macro_rules! notification_variants {
     ($($tag:ident => $payload:ty),+ $(,)?) => {
         /// Every [`ToolNotification`] variant tag (its serde `type`
         /// discriminator), in enum-declaration order.
         pub const ALL_NOTIFICATION_TAGS: &[&str] = &[$(stringify!($tag)),+];
 
-        /// Build the shared notification-schema catalog: every
-        /// [`ToolNotification`] variant tag → the JSON Schema of its payload,
-        /// using the same draft07 settings as tool input schemas.
-        ///
-        /// Requires the `serde` feature for wire-faithful schemas: the
-        /// `serde(tag/flatten)` attributes that shape payloads are only read by
-        /// schemars when `serde` is on (the default for the generator and tests).
+        /// Build the shared notification-schema catalog: every [`ToolNotification`] variant tag → the JSON Schema of its payload, using the same
+        /// draft07 settings as tool input schemas. Requires the `serde` feature for wire-faithful schemas: the `serde(tag/flatten)` attributes that
+        /// shape payloads are only read by schemars when `serde` is on (the default for the generator and tests).
         pub fn notification_schema_catalog()
             -> std::collections::BTreeMap<String, serde_json::Value>
         {
@@ -467,6 +512,7 @@ notification_variants! {
     BashExecutionFailed => BashExecutionFailed,
     FileWritten => FileWritten,
     TaskCompleted => TaskSnapshot,
+    SubagentCompleted => SubagentCompleted,
     PlanModeEntered => PlanModeEntered,
     PlanModeExited => PlanModeExited,
     UserQuestionAsked => UserQuestionAsked,
@@ -603,5 +649,36 @@ mod tests {
             }
             other => panic!("expected BashOutputChunk, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn scheduler_lifecycle_versions_default_for_legacy_json_and_round_trip() {
+        let legacy: ScheduledTaskRemoved =
+            serde_json::from_value(serde_json::json!({ "task_id": "loop-1" })).unwrap();
+        assert_eq!(legacy.generation, "");
+        assert_eq!(legacy.revision, 0);
+        assert_eq!(
+            legacy.reason,
+            ScheduledTaskRemovedReason::Unknown,
+            "legacy payloads decode to the no-op reason"
+        );
+
+        let current = ScheduledTaskRemoved {
+            task_id: "loop-1".into(),
+            reason: ScheduledTaskRemovedReason::Expired,
+            generation: "019b0000-0000-7000-8000-000000000000".into(),
+            revision: 7,
+        };
+        let json = serde_json::to_value(&current).unwrap();
+        assert_eq!(json["reason"], "expired", "reason serializes snake_case");
+        let round_trip: ScheduledTaskRemoved = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip, current);
+
+        // A reason variant from a newer sender must not break deserialization.
+        let future: ScheduledTaskRemoved = serde_json::from_value(
+            serde_json::json!({ "task_id": "loop-1", "reason": "vaporized" }),
+        )
+        .unwrap();
+        assert_eq!(future.reason, ScheduledTaskRemovedReason::Unknown);
     }
 }

@@ -2,7 +2,7 @@ use crate::types::requirements::{Expr, ToolRequirement};
 
 use crate::types::tool::{ToolKind, ToolNamespace};
 
-use super::types::{SchedulerCommand, SchedulerHandle};
+use super::types::{SchedulerCommand, SchedulerHandle, scheduler_tool_error};
 
 /// Canonical tool name advertised by `SchedulerDeleteTool::id()`.
 /// See note on `SCHEDULER_CREATE_TOOL_NAME`.
@@ -46,13 +46,7 @@ Returns success: true if the task was found and removed, false if no task with t
     }
 
     fn requires_expr(&self) -> Expr<ToolRequirement> {
-        use super::create::SchedulerCreateTool;
-        use crate::types::tool_metadata::ToolMetadata as TM;
-        Expr::Value(ToolRequirement::Tool {
-            namespace: TM::tool_namespace(&SchedulerCreateTool).to_string(),
-            id: xai_tool_runtime::Tool::id(&SchedulerCreateTool).to_string(),
-            if_params: None,
-        })
+        super::scheduler_bundle_requires_expr()
     }
 }
 
@@ -70,7 +64,7 @@ impl xai_tool_runtime::Tool for SchedulerDeleteTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "scheduler_delete",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -115,9 +109,15 @@ impl xai_tool_runtime::Tool for SchedulerDeleteTool {
                 xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor stopped")
             })?;
 
-        let removed = reply_rx.await.map_err(|_| {
-            xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor dropped reply")
-        })?;
+        let removed = reply_rx
+            .await
+            .map_err(|_| {
+                xai_tool_runtime::ToolError::custom(
+                    "process_manager",
+                    "Scheduler actor dropped reply",
+                )
+            })?
+            .map_err(scheduler_tool_error)?;
 
         if removed {
             Ok(SchedulerDeleteOutput {

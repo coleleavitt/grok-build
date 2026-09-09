@@ -1,20 +1,22 @@
-//! Clipboard providers for copy/paste.
+//! Re-exports [`ClipboardProvider`] and [`InternalClipboard`] from `xai-ratatui-textarea`, and adds [`SystemClipboard`] backed by `arboard`.
 //!
-//! Re-exports [`ClipboardProvider`] and [`InternalClipboard`] from
-//! `xai-ratatui-textarea`, and adds [`SystemClipboard`] backed by `arboard`.
-//!
-//! Multi-fire writes (native / tmux / OSC 52); delivery evidence is [`ClipboardDelivery`].
+//! A copy writes every active leg (native / tmux / OSC 52); [`ClipboardDelivery`] is the evidence the write reached its destination.
 
 mod trust;
 
 pub use trust::{
-    ClipboardDelivery, NativeClipboardPreflight, expected_delivery, native_clipboard_preflight,
+    ClipboardDelivery, ClipboardEnvironment, NativeClipboardPreflight, Osc52Capability,
+    expected_delivery, native_clipboard_preflight,
 };
 pub use xai_ratatui_textarea::{ClipboardProvider, InternalClipboard};
 
 use std::sync::OnceLock;
 
 use crate::terminal::{MultiplexerKind, TerminalContext};
+
+/// Env var overriding where the copy backup file is written (supports `~`).
+/// Documented in `xai-grok-pager/docs/internal/22-environment-variables.md`.
+pub const GROK_COPY_FILE_ENV: &str = "GROK_COPY_FILE";
 
 /// Cached result of the remote-session check (env vars don't change at runtime).
 fn is_remote() -> bool {
@@ -28,26 +30,20 @@ fn is_container_no_display() -> bool {
     *CONTAINER.get_or_init(xai_grok_shared::clipboard::is_containerized_without_display)
 }
 
-/// Cached result of the "an upstream OSC 52 sink is capturing our output" check.
-///
-/// `grok wrap` runs a command inside a local PTY, scans its output for OSC 52
-/// clipboard sequences, and writes their payload to the *real* (local) system
-/// clipboard (see `xai-grok-pager`'s `pty_wrap` module). It advertises this to
-/// the wrapped program via an environment variable so the
-/// inner `grok` knows its OSC 52 writes are reliably intercepted and copied,
-/// even when the inner terminal brand is misdetected (e.g. over SSH, where only
-/// `TERM` propagates and Apple Terminal / unknown brands look OSC-52-incapable).
-///
-/// Two names are accepted: the canonical `GROK_OSC52_SINK` (inherited by local
-/// children) and the `LC_`-prefixed `LC_GROK_OSC52_SINK`, which the default
-/// OpenSSH client/server configs forward (`SendEnv LANG LC_*` /
-/// `AcceptEnv LANG LC_*`) so the signal survives the hop into a remote `grok`.
+/// `grok wrap` intercepts OSC 52 onto the local clipboard and advertises it. Over SSH only `TERM` propagates, so brands look incapable.
+/// `LC_GROK_OSC52_SINK` survives default OpenSSH `SendEnv`/`AcceptEnv` of `LC_*`.
 pub fn osc52_sink_active() -> bool {
     static SINK: OnceLock<bool> = OnceLock::new();
     *SINK.get_or_init(|| {
         std::env::var_os("GROK_OSC52_SINK").is_some()
             || std::env::var_os("LC_GROK_OSC52_SINK").is_some()
     })
+}
+
+/// `GROK_CLIPBOARD_NO_OSC52` forces OSC 52 off everywhere, including Linux always-emit and the wrap sink. For hosts that paint OSC 52 as garbage.
+pub fn osc52_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("GROK_CLIPBOARD_NO_OSC52").is_some())
 }
 
 /// Cached clipboard route resolved at first use from the terminal context.
@@ -59,8 +55,7 @@ pub fn clipboard_route() -> &'static ClipboardRoute {
     })
 }
 
-/// Wayland data-control availability as a display/telemetry label:
-/// `"yes"`/`"no"` on Wayland sessions, `"n/a"` elsewhere.
+/// Wayland data-control availability as a display/telemetry label: `"yes"`/`"no"` on Wayland sessions, `"n/a"` elsewhere.
 pub fn wayland_data_control_label() -> &'static str {
     match crate::host::DisplayServer::current() {
         crate::host::DisplayServer::Wayland => {
@@ -85,9 +80,9 @@ pub struct ClipboardRoute {
     pub tmux_buffer: bool,
     /// Emit an OSC 52 escape sequence toward the outer terminal.
     pub osc52: bool,
-    /// Wrap OSC 52 in the tmux DCS passthrough envelope. True only when tmux is
-    /// the IMMEDIATE terminal (tmux-backed and not inside an editor `:terminal`).
-    /// Not a clipboard "leg" — excluded from `Display`.
+    /// Wrap OSC 52 in the tmux DCS passthrough envelope.
+    /// True only when tmux is the IMMEDIATE terminal (tmux-backed and not inside an editor `:terminal`).
+    /// This flag is not a clipboard "leg" and is excluded from `Display`.
     pub osc52_tmux_passthrough: bool,
 }
 
@@ -111,31 +106,42 @@ impl std::fmt::Display for ClipboardRoute {
     }
 }
 
-/// Resolve the clipboard route from a terminal context.
-///
-/// Note: the `osc52` field depends on [`is_remote()`] and
-/// [`is_container_no_display()`] which read ambient env vars / filesystem
-/// markers (cached in `OnceLock`s). In tmux-backed environments `osc52` is
-/// unconditionally `true` regardless of SSH/container state, so this only
-/// matters for non-tmux contexts. Tests that cannot control SSH env vars
-/// should skip asserting `osc52` for non-tmux cases.
+/// `osc52` reads cached ambient markers. Tmux is normally true regardless of SSH; `GROK_CLIPBOARD_NO_OSC52` forces it off everywhere.
 pub fn resolve_clipboard_route(ctx: &TerminalContext) -> ClipboardRoute {
+    resolve_clipboard_route_with(
+        ctx,
+        ClipboardRouteOpts {
+            no_osc52: osc52_disabled(),
+            wrap_sink: osc52_sink_active(),
+        },
+    )
+}
+
+/// Test/production overrides for pure clipboard-route resolution.
+#[derive(Clone, Copy)]
+struct ClipboardRouteOpts {
+    no_osc52: bool,
+    wrap_sink: bool,
+}
+
+/// Pure clipboard-route resolution (kill-switch / wrap-sink injected for tests).
+fn resolve_clipboard_route_with(ctx: &TerminalContext, opts: ClipboardRouteOpts) -> ClipboardRoute {
     let is_tmux = ctx.multiplexer == MultiplexerKind::Tmux;
-    ClipboardRoute {
-        native: true,
-        tmux_buffer: is_tmux,
-        // Linux: always emit OSC 52 as a safety net. This matches other
-        // terminal agent CLIs which emit OSC 52 on every copy.
-        // macOS/Windows: only in tmux/SSH/container contexts, or when an
-        // upstream `grok wrap` sink is capturing our output and will forward
-        // the sequence to the real clipboard.
-        osc52: cfg!(target_os = "linux")
+    // Linux always emits OSC 52. macOS/Windows only in tmux/SSH/container or when a wrap sink captures it.
+    // `GROK_CLIPBOARD_NO_OSC52` wins over every automatic path.
+    let osc52 = !opts.no_osc52
+        && (cfg!(target_os = "linux")
             || is_tmux
             || is_remote()
             || is_container_no_display()
-            || osc52_sink_active(),
-        // Editor :terminal's immediate emulator is libvterm, not tmux — don't wrap there.
-        osc52_tmux_passthrough: is_tmux && ctx.embedded_editor.is_none(),
+            || opts.wrap_sink);
+    ClipboardRoute {
+        native: true,
+        tmux_buffer: is_tmux,
+        osc52,
+        // Editor :terminal's immediate emulator is libvterm, not tmux, so don't wrap there
+        // No point in tmux passthrough when OSC 52 itself is disabled.
+        osc52_tmux_passthrough: osc52 && is_tmux && ctx.embedded_editor.is_none(),
     }
 }
 
@@ -146,9 +152,8 @@ fn write_tmux_buffer(text: &str) -> bool {
     use std::process::{Command, Stdio};
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        // Spooled stdin (not a pipe): a wedged tmux server that stops draining
-        // stdin would block the UI thread once the payload exceeds the pipe
-        // buffer, and the bounded wait below needs stdin already closed.
+        // Spooled stdin, not a pipe: a payload past the pipe buffer would block the UI thread if a wedged tmux server stops draining stdin
+        // The bounded wait below also needs stdin already closed
         let stdin = xai_grok_shared::clipboard::spool_for_stdin(text.as_bytes())?;
         let mut cmd = Command::new("tmux");
         cmd.args(["load-buffer", "-"])
@@ -156,6 +161,7 @@ fn write_tmux_buffer(text: &str) -> bool {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         xai_tty_utils::detach_std_command(&mut cmd);
+        #[allow(clippy::disallowed_methods)] // short-lived clipboard helper, waited on below
         let mut child = cmd.spawn()?;
         // Bounded wait: a wedged tmux server must not freeze the UI thread.
         let status = xai_grok_shared::clipboard::wait_with_deadline(
@@ -173,22 +179,17 @@ fn write_tmux_buffer(text: &str) -> bool {
     result.is_ok()
 }
 
-/// System clipboard provider.
+/// Delegates to [`xai_grok_shared::clipboard`], which uses `pbcopy`/`pbpaste` on macOS (avoiding AppKit GPU overhead) and `arboard` elsewhere.
 ///
-/// Delegates to [`xai_grok_shared::clipboard`] which uses
-/// `pbcopy`/`pbpaste` on macOS (to avoid AppKit GPU overhead) and `arboard`
-/// on other platforms.
-///
-/// In tmux-backed environments, clipboard writes follow the full three-leg
-/// contract: native clipboard + tmux buffer + OSC 52.
+/// In tmux-backed environments, clipboard writes follow the full three-leg contract: native clipboard, tmux buffer, and OSC 52.
 #[derive(Debug)]
 pub struct SystemClipboard;
 
 impl SystemClipboard {
-    /// Full write route classified by the environment-based delivery policy.
+    /// Runs the full write route and classifies the result via the environment-based delivery policy.
     pub fn try_set(text: &str) -> ClipboardDelivery {
         let legs = clipboard_write_with_route(text, clipboard_route());
-        decision_for_legs(&legs, text).delivery
+        decision_for_legs(&legs, text).delivery()
     }
 }
 
@@ -202,7 +203,7 @@ impl ClipboardProvider for SystemClipboard {
     }
 }
 
-/// Per-leg outcome of a routed clipboard write (for telemetry + trust).
+/// Per-leg outcome of a routed clipboard write (for telemetry and trust).
 pub(crate) struct ClipboardWriteLegs {
     /// Whether the route enabled the native leg.
     pub(crate) route_native: bool,
@@ -212,9 +213,8 @@ pub(crate) struct ClipboardWriteLegs {
     pub(crate) wl_copy_ok: bool,
     pub(crate) cli_ok: bool,
     pub(crate) arboard_ok: bool,
-    /// Wayland data-control was available for the native leg (environment
-    /// probe); the arboard write is focus-free and authoritative only when
-    /// `arboard_ok` also holds (see `trust::trusted_native`).
+    /// Wayland data-control was available for the native leg (environment probe).
+    /// The arboard write is focus-free and authoritative only when `arboard_ok` also holds (see `trust::trusted_native`).
     pub(crate) data_control: bool,
     pub(crate) tmux_ok: bool,
     pub(crate) osc52_ok: bool,
@@ -264,10 +264,14 @@ fn clipboard_write_with_route(text: &str, route: &ClipboardRoute) -> ClipboardWr
 }
 
 /// Result of a clipboard write with toast info for the caller to display.
+#[derive(Debug)]
 pub struct CopyResult {
-    /// User-facing toast message.
+    /// Full user-facing toast message.
     pub message: &'static str,
-    /// Toast duration in ticks (30fps: 30 = ~1s, 120 = ~4s).
+    /// Compact lead of `message` (no trailing guidance).
+    /// Used when the toast names a backup path so the lead plus the path fits a narrow terminal.
+    pub message_lead: &'static str,
+    /// Toast duration in ticks (30fps: 30 ticks is ~1s, 120 is ~4s).
     pub ticks: u8,
     /// Evidence that the write reached the destination named by the UI.
     pub delivery: ClipboardDelivery,
@@ -275,9 +279,8 @@ pub struct CopyResult {
 
 /// Kind of clipboard feedback (success route, unverified send, or failure).
 ///
-/// Telemetry labels come from `IntoStaticStr` (`snake_case`); user-facing copy
-/// lives in [`ClipboardFeedback::message`] (intentionally different).
-#[derive(Debug, Clone, Copy, Eq, PartialEq, strum::IntoStaticStr)]
+/// Telemetry labels come from `IntoStaticStr` (`snake_case`); user-facing copy lives in [`ClipboardFeedback::message`] (intentionally different).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, strum::AsRefStr, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum ClipboardFeedback {
     /// Plain successful copy (native clipboard).
@@ -292,7 +295,7 @@ pub(crate) enum ClipboardFeedback {
     UnverifiedOscRemote,
     /// OSC 52 emitted from a displayless container with unknown outer support.
     UnverifiedOscContainer,
-    /// VS Code over SSH/remote + non-ASCII: OSC 52 may mojibake.
+    /// VS Code over SSH/remote with non-ASCII text: OSC 52 may garble it.
     VsCodeSshNonAscii,
     /// No route reached the user's local clipboard from a remote/container topology.
     FailedRemote,
@@ -301,7 +304,23 @@ pub(crate) enum ClipboardFeedback {
 }
 
 impl ClipboardFeedback {
+    pub(crate) fn delivery(self) -> ClipboardDelivery {
+        match self {
+            Self::Copied
+            | Self::CopiedTmux
+            | Self::CopiedOscContainer
+            | Self::CopiedOscRemote
+            | Self::VsCodeSshNonAscii => ClipboardDelivery::Confirmed,
+            Self::UnverifiedOscRemote | Self::UnverifiedOscContainer => {
+                ClipboardDelivery::Unverified
+            }
+            Self::FailedRemote | Self::Failed => ClipboardDelivery::Failed,
+        }
+    }
+
     /// User-facing toast message for this kind.
+    ///
+    /// Must start with [`Self::message_lead`] (asserted in tests) so the path-bearing toast built from the lead never rewords the static copy.
     fn message(self) -> &'static str {
         match self {
             Self::Copied => "Copied!",
@@ -314,11 +333,24 @@ impl ClipboardFeedback {
             Self::VsCodeSshNonAscii => {
                 "Copied. VS Code over SSH may garble non-ASCII; use /minimal if needed."
             }
-            Self::FailedRemote | Self::Failed => "Copy failed. Try /terminal-setup or /minimal.",
+            Self::FailedRemote | Self::Failed => "Copy failed. Try /doctor or /minimal.",
         }
     }
 
-    /// Toast duration in ticks (30fps: 30 = ~1s, 120 = ~4s).
+    /// Compact lead of [`Self::message`] (no trailing guidance sentence).
+    fn message_lead(self) -> &'static str {
+        match self {
+            Self::Copied => "Copied!",
+            Self::CopiedTmux => "Copied to tmux buffer, paste with prefix + ]",
+            Self::CopiedOscContainer => "Copied via OSC 52 from the container",
+            Self::CopiedOscRemote => "Copied via OSC 52",
+            Self::UnverifiedOscRemote | Self::UnverifiedOscContainer => "Copy sent",
+            Self::VsCodeSshNonAscii => "Copied",
+            Self::FailedRemote | Self::Failed => "Copy failed",
+        }
+    }
+
+    /// Toast duration in ticks (30fps: 30 ticks is ~1s, 120 is ~4s).
     fn ticks(self) -> u8 {
         match self {
             Self::Copied => 30,
@@ -333,32 +365,31 @@ impl ClipboardFeedback {
         }
     }
 
-    fn to_result(self, delivery: ClipboardDelivery) -> CopyResult {
+    fn to_result(self) -> CopyResult {
         CopyResult {
             message: self.message(),
+            message_lead: self.message_lead(),
             ticks: self.ticks(),
-            delivery,
+            delivery: self.delivery(),
         }
     }
 }
 
-fn decision_for_legs(legs: &ClipboardWriteLegs, text: &str) -> trust::ClipboardDecision {
-    let remote = is_remote();
-    let container = is_container_no_display();
-    let mut decision = trust::resolve_copy_decision(
-        legs,
-        text,
-        crate::terminal::terminal_context().brand,
-        crate::host::HostOs::current(),
-        crate::host::DisplayServer::current(),
-        remote,
-        container,
-        osc52_sink_active(),
-    );
-    if decision.delivery == ClipboardDelivery::Failed && (remote || container) {
-        decision.feedback = ClipboardFeedback::FailedRemote;
+fn clipboard_environment(legs: &ClipboardWriteLegs) -> ClipboardEnvironment {
+    ClipboardEnvironment {
+        brand: crate::terminal::terminal_context().brand,
+        host_os: crate::host::HostOs::current(),
+        display_server: crate::host::DisplayServer::current(),
+        remote: is_remote(),
+        container: is_container_no_display(),
+        osc52_sink: osc52_sink_active(),
+        wayland_data_control: legs.data_control,
+        wl_copy_available: legs.wl_copy_ok,
     }
-    decision
+}
+
+fn decision_for_legs(legs: &ClipboardWriteLegs, text: &str) -> ClipboardFeedback {
+    trust::resolve_copy_decision(legs, text, clipboard_environment(legs))
 }
 
 /// Write text and return a toast; emits `grok-shell-clipboard_copy` when enabled.
@@ -366,25 +397,206 @@ pub fn copy_text(text: &str) -> CopyResult {
     let started = std::time::Instant::now();
     let route = clipboard_route();
     let legs = clipboard_write_with_route(text, route);
-    let decision = decision_for_legs(&legs, text);
-    if decision.delivery.is_failed() {
+    let feedback = decision_for_legs(&legs, text);
+    if feedback.delivery().is_failed() {
         tracing::warn!(
             len = text.len(),
             display_server = %crate::host::DisplayServer::current(),
             "clipboard write failed on all trusted backends"
         );
     }
-    let result = decision.feedback.to_result(decision.delivery);
-    let toast_kind: &'static str = decision.feedback.into();
-    log_clipboard_copy_event(text, route, &legs, decision, toast_kind, started);
+    let result = feedback.to_result();
+    let toast_kind: &'static str = feedback.into();
+    log_clipboard_copy_event(text, route, &legs, feedback, toast_kind, started);
     result
+}
+
+/// Where a copy landed after [`copy_text_or_file`].
+#[derive(Debug)]
+pub enum CopyDelivery {
+    /// Trusted clipboard backend accepted the write.
+    /// `file` is the always-written backup copy (`None` only when the file write itself failed; that never fails the copy).
+    Clipboard {
+        result: CopyResult,
+        file: Option<std::path::PathBuf>,
+    },
+    /// Clipboard failed; text was written to this path instead.
+    File { path: std::path::PathBuf },
+    /// Clipboard and file fallback both failed.
+    Failed {
+        clipboard: CopyResult,
+        file_error: std::io::Error,
+    },
+}
+
+impl CopyDelivery {
+    /// `true` when the user can retrieve the text (clipboard or file).
+    pub fn success(&self) -> bool {
+        !matches!(self, Self::Failed { .. })
+    }
+
+    /// Confirmed writes use the static message. Unverified OSC 52 and file-only fallbacks name the backup path.
+    pub fn toast_message(&self) -> std::borrow::Cow<'static, str> {
+        use std::borrow::Cow;
+        match self {
+            Self::Clipboard { result, file } => match (result.delivery, file) {
+                (ClipboardDelivery::Unverified, Some(path)) => Cow::Owned(format!(
+                    "{}, saved to {}",
+                    result.message_lead,
+                    display_copy_path(path)
+                )),
+                _ => Cow::Borrowed(result.message),
+            },
+            Self::File { path } => Cow::Owned(format!(
+                "Clipboard unreachable: wrote {}",
+                display_copy_path(path)
+            )),
+            Self::Failed { clipboard, .. } => Cow::Borrowed(clipboard.message),
+        }
+    }
+
+    /// Toast duration in ticks for [`Self::toast_message`].
+    pub fn toast_ticks(&self) -> u8 {
+        match self {
+            Self::Clipboard { result, .. } => result.ticks,
+            Self::File { .. } => 120,
+            Self::Failed { clipboard, .. } => clipboard.ticks,
+        }
+    }
+}
+
+/// [`GROK_COPY_FILE_ENV`] or `~/.grok/last-copy.txt`. `None` skips the file rather than writing a world-visible temp path.
+pub fn default_copy_fallback_path() -> Option<std::path::PathBuf> {
+    if let Ok(raw) = std::env::var(GROK_COPY_FILE_ENV) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(std::path::PathBuf::from(
+                shellexpand::tilde(trimmed).as_ref(),
+            ));
+        }
+    }
+    xai_grok_config::user_grok_home().map(|grok_home| grok_home.join("last-copy.txt"))
+}
+
+/// Abbreviate via [`crate::util::abbreviate_path`] so toasts stay short (`~/.grok` or `~`).
+pub fn display_copy_path(path: &std::path::Path) -> String {
+    crate::util::abbreviate_path(&path.to_string_lossy()).into_owned()
+}
+
+/// Tilde-expand and create parents. Unix mode `0600`: copied text can be sensitive and the default path is predictable.
+pub fn write_text_to_copy_file(
+    text: &str,
+    path: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
+    let expanded = std::path::PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).as_ref());
+    if let Some(parent) = expanded.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_owner_only(&expanded, text)?;
+    Ok(expanded)
+}
+
+/// Unix `0600`, including tightening a pre-existing `0644` file (create-time mode does not). Non-unix is a plain write.
+fn write_owner_only(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(text.as_bytes())
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, text)
+}
+
+/// `NotFound` when no path resolves, rather than a predictable temp location. Unix creates a missing parent `0700`.
+pub fn write_copy_fallback(text: &str) -> std::io::Result<std::path::PathBuf> {
+    let Some(path) = default_copy_fallback_path() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no home directory resolves; set GROK_COPY_FILE to enable the copy backup file",
+        ));
+    };
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    write_text_to_copy_file(text, &path)
+}
+
+/// Compose a [`CopyDelivery`] from the clipboard toast and the (always attempted) backup-file write.
+/// Pure so the matrix is unit-testable without firing real clipboard legs.
+fn resolve_delivery(
+    clipboard: CopyResult,
+    file: std::io::Result<std::path::PathBuf>,
+) -> CopyDelivery {
+    if clipboard.delivery.reported_success() {
+        return CopyDelivery::Clipboard {
+            result: clipboard,
+            file: file.ok(),
+        };
+    }
+    match file {
+        Ok(path) => CopyDelivery::File { path },
+        Err(file_error) => CopyDelivery::Failed {
+            clipboard,
+            file_error,
+        },
+    }
+}
+
+/// Always write the backup file too. It is the recovery path when SSH cannot reach the local clipboard; a failed file write does not fail a successful clipboard leg.
+pub fn copy_text_or_file(text: &str) -> CopyDelivery {
+    let clipboard = copy_text(text);
+    let file = write_copy_fallback(text);
+    match &file {
+        Ok(path) => {
+            if !clipboard.delivery.reported_success() {
+                tracing::info!(
+                    path = %path.display(),
+                    len = text.len(),
+                    "clipboard unreachable; copy retrievable from backup file"
+                );
+            }
+        }
+        Err(error) => {
+            if clipboard.delivery.reported_success() {
+                tracing::debug!(
+                    error = %error,
+                    len = text.len(),
+                    "copy backup file write failed (clipboard succeeded)"
+                );
+            } else {
+                tracing::warn!(
+                    error = %error,
+                    len = text.len(),
+                    "clipboard and copy file fallback both failed"
+                );
+            }
+        }
+    }
+    resolve_delivery(clipboard, file)
 }
 
 fn log_clipboard_copy_event(
     text: &str,
     route: &ClipboardRoute,
     legs: &ClipboardWriteLegs,
-    decision: trust::ClipboardDecision,
+    feedback: ClipboardFeedback,
     toast_kind: &'static str,
     started: std::time::Instant,
 ) {
@@ -406,10 +618,10 @@ fn log_clipboard_copy_event(
         data_control: legs.data_control,
         tmux_ok: legs.tmux_ok,
         osc52_ok: legs.osc52_ok,
-        delivery: decision.delivery.telemetry_label(),
+        delivery: feedback.delivery().telemetry_label(),
         osc52_sink: osc52_sink_active(),
         container_no_display: is_container_no_display(),
-        reported_success: decision.delivery.reported_success(),
+        reported_success: feedback.delivery().reported_success(),
         toast_kind,
         duration_ms: started.elapsed().as_millis() as u64,
     });
@@ -417,8 +629,6 @@ fn log_clipboard_copy_event(
 
 /// Return the parenthetical stats suffix used in clipboard success messages.
 /// Format: " (N chars, M lines)" with proper pluralization.
-/// Extracted to eliminate the exact duplication between assistant copy and
-/// full-conversation export (and any future clipboard users).
 pub fn clipboard_stats_suffix(text: &str) -> String {
     let chars = text.len();
     let lines = text.lines().count();
@@ -478,7 +688,7 @@ fn is_native_x11(display_server: crate::host::DisplayServer) -> bool {
     display_server == crate::host::DisplayServer::X11
 }
 
-/// Runtime X11 gate for empty Ctrl+V guidance.
+/// Runtime gate for the empty Ctrl+V guidance: native X11 with a display present.
 pub fn x11_primary_guidance_available() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -496,8 +706,8 @@ pub fn clipboard_text_is_pasteable(text: Option<&str>) -> bool {
     text.is_some_and(|t| !t.trim().is_empty())
 }
 
-/// Telemetry when a paste key was pressed but the host clipboard had nothing
-/// pasteable. Behavior is unchanged — callers still consume the key.
+/// Telemetry when a paste key was pressed but the host clipboard had nothing pasteable.
+/// Callers still consume the key.
 /// Emits structured logs and a product analytics event when telemetry is enabled.
 pub fn log_paste_key_empty_host_clipboard(surface: &str) {
     let terminal = crate::terminal::terminal_context().telemetry_snapshot();
@@ -530,14 +740,13 @@ fn lone_http_url_trimmed(t: &str) -> bool {
     !t.is_empty() && !t.contains('\n') && (t.starts_with("http://") || t.starts_with("https://"))
 }
 
-/// True when a lone `http(s)://` URL with no newlines (normal link paste).
+/// True when the text is a lone `http(s)://` URL with no newlines (normal link paste).
 pub fn looks_like_lone_http_url(text: &str) -> bool {
     lone_http_url_trimmed(text.trim())
 }
 
-/// Non-empty plain text where the `«class furl»` probe is unnecessary (UTF-8 already
-/// carries paths or prose). Does **not** suppress `get_image` — see
-/// [`clipboard_attachment_probe_needed`].
+/// Non-empty plain text where the `«class furl»` probe is unnecessary (UTF-8 already carries paths or prose).
+/// Does **not** suppress `get_image`; see [`clipboard_attachment_probe_needed`].
 pub(crate) fn plain_text_skips_furl_probe(trimmed: &str) -> bool {
     if trimmed.is_empty() {
         return false;
@@ -557,10 +766,7 @@ pub(crate) fn plain_text_skips_furl_probe(trimmed: &str) -> bool {
     !trimmed.contains("://")
 }
 
-/// Whether `get_image` / `get_file_urls` should run given [`system_clipboard_get`] output.
-///
-/// Returns false only for a lone `http(s)://` URL (normal link paste). Prose, code,
-/// and `file://` text still allow an image probe so "Copy Image" + caption keeps working.
+/// False only for a lone `http(s)://` URL. Prose and `file://` still probe so a captioned "Copy Image" keeps working.
 pub fn clipboard_attachment_probe_needed(clipboard_text: Option<&str>) -> bool {
     match clipboard_text {
         None => true,
@@ -571,10 +777,7 @@ pub fn clipboard_attachment_probe_needed(clipboard_text: Option<&str>) -> bool {
     }
 }
 
-/// Whether bracketed-paste payload should probe the system clipboard (macOS/Windows).
-///
-/// Matches the historical rule (empty, short ≤4 lines, or `://`) except lone `https://`
-/// link pastes, which skip the ~100–200 ms macOS `osascript` cost.
+/// Probe when empty, short, or containing `://`. A lone `https://` skips the macOS `osascript` cost.
 pub fn paste_payload_needs_clipboard_attachment_probe(payload: &str) -> bool {
     if payload.is_empty() {
         return true;
@@ -590,14 +793,8 @@ pub fn paste_payload_needs_clipboard_attachment_probe(payload: &str) -> bool {
     line_count <= 4 || t.contains("://")
 }
 
-/// Whether a bracketed-paste payload plausibly came from the system clipboard.
-///
-/// Terminals rewrite newlines on paste (`\n` → `\r`); a non-matching payload
-/// is not a clipboard paste (e.g. Otty IME commits as bracketed paste,
-/// or a tmux paste-buffer that diverged from the OS clipboard).
-///
-/// Reads the clipboard text (a `pbpaste` subprocess on macOS) — call only off
-/// the event loop.
+/// Terminals rewrite `\n` to `\r` on paste. A mismatch is an IME commit or a diverged tmux buffer, not a clipboard paste.
+/// Reads `pbpaste`; call only off the event loop.
 pub fn bracketed_payload_came_from_clipboard(payload: &str) -> bool {
     bracketed_payload_came_from_clipboard_result(payload).unwrap_or(false)
 }
@@ -611,13 +808,12 @@ pub fn bracketed_payload_came_from_clipboard_result(
 }
 
 /// Pure comparison behind [`bracketed_payload_came_from_clipboard`].
-/// `None` = no UTF-8 string on the pasteboard (image-only pasteboards).
+/// `None` means no UTF-8 string on the pasteboard (image-only pasteboards).
 pub fn bracketed_payload_matches_clipboard_text(
     payload: &str,
     clipboard_text: Option<&str>,
 ) -> bool {
-    // Terminals rewrite pasted newlines as `\r` (Windows clipboards carry
-    // `\r\n`); some copy sources append a trailing newline the paste omits.
+    // Terminals rewrite pasted newlines as `\r` (Windows clipboards carry `\r\n`); some copy sources append a trailing newline the paste omits
     fn normalized(s: &str) -> String {
         s.replace("\r\n", "\n")
             .replace('\r', "\n")
@@ -633,7 +829,7 @@ pub fn bracketed_payload_matches_clipboard_text(
 /// Routing plan for attachment pasteboard probes (testable without subprocesses).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentProbeRoute {
-    /// Lone `http(s)://` link paste — no `osascript`.
+    /// Lone `http(s)://` link paste: no `osascript`.
     Skip,
     /// Empty pasteboard UTF-8: `furl` first, then image if needed.
     FileUrlsThenImage,
@@ -654,13 +850,7 @@ pub fn attachment_probe_route(clipboard_text: Option<&str>) -> AttachmentProbeRo
     }
 }
 
-/// Whether the heavy `osascript` attachment probe should run for `route`, given
-/// the sub-millisecond native pasteboard snapshot.
-///
-/// `ImageOnly` (non-empty non-URL text) only ever looks for raster bytes, so it
-/// is safe to skip when the snapshot is available and reports none. `Skip` never
-/// probes; `FileUrlsThenImage` (empty text — the Finder file-URL case) is never
-/// gated because the snapshot cannot vouch for `public.file-url` presence.
+/// `ImageOnly` may skip when the snapshot reports no raster. `FileUrlsThenImage` is never gated: the snapshot cannot vouch for `public.file-url`.
 fn should_run_attachment_probe(
     route: AttachmentProbeRoute,
     snapshot_supported: bool,
@@ -679,18 +869,10 @@ fn should_run_attachment_probe(
     }
 }
 
-/// Gate + TOCTOU baseline for a deferred attachment probe: `None` = do not
-/// probe; `Some(change_count)` = probe, carrying the pasteboard `changeCount`
-/// this gate's OWN snapshot read observed. Enqueue sites thread that baseline
-/// into the off-thread probe's staleness check instead of taking a second
-/// native read that could land after a clipboard change.
-///
-/// Cheap (native snapshot only, no subprocess) so paste handlers can call it on
-/// the event loop to decide whether to DEFER the heavy probe to a background
-/// task instead of blocking inline.
+/// `None` skips the probe. `Some(change_count)` is this gate's own snapshot baseline — a later read can land after a clipboard change.
+/// Cheap enough for the event loop; the heavy probe is deferred.
 pub fn attachment_probe_gate(clipboard_text: Option<&str>) -> Option<Option<u64>> {
-    // One snapshot read; a None change_count is unavailable, so the gate must not
-    // rule out a raster (propagates the availability fix into the defer gate).
+    // One snapshot read; a None change_count means the snapshot was unavailable, so the gate must not rule out a raster
     let (snapshot_change_count, snapshot_has_image) = clipboard_image_snapshot();
     should_run_attachment_probe(
         attachment_probe_route(clipboard_text),
@@ -701,9 +883,7 @@ pub fn attachment_probe_gate(clipboard_text: Option<&str>) -> Option<Option<u64>
     .then_some(snapshot_change_count)
 }
 
-/// Whether [`system_clipboard_probe_attachments`] would actually run the
-/// osascript probe for `clipboard_text` (thin bool view of
-/// [`attachment_probe_gate`]).
+/// Whether [`system_clipboard_probe_attachments`] would run the osascript probe for `clipboard_text` (thin bool view of [`attachment_probe_gate`]).
 pub fn attachment_probe_would_run(clipboard_text: Option<&str>) -> bool {
     attachment_probe_gate(clipboard_text).is_some()
 }
@@ -716,8 +896,8 @@ pub struct ClipboardProbeError;
 pub fn system_clipboard_probe_attachments(
     clipboard_text: Option<&str>,
 ) -> Result<(Option<ImageData>, Option<String>), ClipboardProbeError> {
-    // Native snapshot (sub-ms, no subprocess) skips the osascript image probe
-    // for a text paste when the pasteboard holds no raster (single gate site).
+    // Native snapshot (sub-ms, no subprocess) skips the osascript image probe for a text paste when the pasteboard holds no raster
+    // This is the single gate site
     if !attachment_probe_would_run(clipboard_text) {
         return Ok((None, None));
     }
@@ -740,10 +920,7 @@ pub fn system_clipboard_probe_attachments(
     }
 }
 
-/// Emit a `clipboard_image_paste` telemetry event for one clipboard read.
-///
-/// `outcome`: "image" | "file_urls" | "empty" | "error". No-op (and no
-/// terminal-context detection) when telemetry is disabled.
+/// One clipboard-read event. No-op, and no terminal-context detection, when telemetry is disabled.
 fn log_clipboard_paste_event(
     probe: &str,
     outcome: &str,
@@ -798,9 +975,8 @@ struct AttachmentsProbeResult {
 /// Re-export [`ImageData`] so pager code does not import the shell directly.
 pub use xai_grok_shared::clipboard::ImageData;
 
-/// One pasteboard snapshot `(change_count, has_pasteable_image)` read in a
-/// single native pass (macOS native, sub-millisecond, no data read). `(None,
-/// false)` off-macOS or when AppKit cannot be loaded.
+/// One pasteboard snapshot `(change_count, has_pasteable_image)` read in a single native pass (macOS native, sub-millisecond, no data read).
+/// `(None, false)` off-macOS or when AppKit cannot be loaded.
 pub fn clipboard_image_snapshot() -> (Option<u64>, bool) {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(snapshot) = test_support::hook_image_snapshot() {
@@ -809,12 +985,11 @@ pub fn clipboard_image_snapshot() -> (Option<u64>, bool) {
     xai_grok_shared::clipboard::clipboard_image_snapshot()
 }
 
-/// Cheap pasteboard `changeCount` read (one native message, no type scan, no
-/// data read). The changeCount-first hot path of the focus-driven
-/// clipboard-image tip: a delta here is what gates the heavier
-/// [`clipboard_image_snapshot`] classification. `None` off-macOS.
+/// Cheap pasteboard `changeCount` read (one native message, no type scan, no data read).
+/// The focus-driven clipboard-image tip checks this first: a delta here is what gates the heavier [`clipboard_image_snapshot`] classification.
+/// `None` off-macOS.
 pub fn clipboard_change_count() -> Option<u64> {
-    // Seam consistency: a hooked snapshot's change_count is the changeCount.
+    // Hook consistency: a hooked snapshot's change_count is the changeCount
     #[cfg(any(test, feature = "test-support"))]
     if let Some((change_count, _)) = test_support::hook_image_snapshot() {
         return change_count;
@@ -822,8 +997,8 @@ pub fn clipboard_change_count() -> Option<u64> {
     xai_grok_shared::clipboard::clipboard_change_count()
 }
 
-/// Whether the fast image probe exists on this platform. Gates the
-/// focus-driven clipboard-image tip so non-macOS never probes.
+/// Whether the fast image probe exists on this platform.
+/// Gates the focus-driven clipboard-image tip so non-macOS never probes.
 pub fn clipboard_image_probe_supported() -> bool {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(supported) = test_support::hook_image_probe_supported() {
@@ -832,11 +1007,7 @@ pub fn clipboard_image_probe_supported() -> bool {
     xai_grok_shared::clipboard::clipboard_image_probe_supported()
 }
 
-/// Prime the macOS AppKit `dlopen` ONCE on a detached background thread, so the
-/// first synchronous probe (~1s after a focus-gain) is just the cheap metadata
-/// read and never stalls a frame on the one-time framework load. The probe
-/// itself stays synchronous — this is a single one-time prime, not a per-probe
-/// async layer. No-op off-macOS and after the first call.
+/// One-time AppKit `dlopen` off the event loop so the first focus-gain probe does not stall a frame. Probe stays synchronous.
 pub fn prewarm_image_probe() {
     use std::sync::Once;
     static WARMED: Once = Once::new();
@@ -877,25 +1048,8 @@ pub fn system_clipboard_get_image() -> Option<ImageData> {
 // Test support
 // ===========================================================================
 
-/// Injectable clipboard reads for driving the paste handlers in tests without
-/// spawning `pbpaste` / `osascript`.
-///
-/// Callers install a [`ClipboardProbeHook`] via [`set_clipboard_probe_hook`];
-/// [`system_clipboard_get`], [`system_clipboard_read_text`],
-/// `system_primary_selection_get`,
-/// [`system_clipboard_probe_attachments`], [`clipboard_image_snapshot`],
-/// [`clipboard_change_count`], and [`clipboard_image_probe_supported`] then
-/// return the canned values instead of reading the real pasteboard. PRIMARY
-/// reads bump `primary_selection_read_call_count`; every unified-probe call
-/// that clears the snapshot gate bumps a counter read back with
-/// [`clipboard_probe_call_count`] (`count == 0` proves a gated-out probe,
-/// `count == 1` proves the single unified read). The state is thread-local so
-/// parallel tests stay isolated, and the real reads run when no hook is set.
-///
-/// Thread-locality caveat: the hook does NOT propagate to `spawn_blocking`
-/// (the off-thread probe reads the REAL pasteboard there), so tests exercise
-/// deferral by asserting the enqueued effect and then driving
-/// `complete_clipboard_attachment_paste` directly with a canned outcome.
+/// Canned pasteboard while a hook is set; thread-local so parallel tests stay isolated.
+/// Does not propagate to `spawn_blocking` — the off-thread probe reads the real pasteboard. Drive completion directly in tests.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use super::{ClipboardProbeError, ClipboardTextReadError, ImageData};
@@ -904,12 +1058,7 @@ pub mod test_support {
     pub(super) type AttachmentProbeResult =
         Result<(Option<ImageData>, Option<String>), ClipboardProbeError>;
 
-    /// Canned pasteboard contents returned while a hook is installed.
-    ///
-    /// Snapshot vocabulary (`(changeCount, has_image)`): "no raster" =
-    /// `(Some(_), false)`, "has raster" = `(Some(_), true)`, "unavailable"
-    /// (AppKit load failure) = `(None, _)`. Prefer the named constructors
-    /// below over spelling the tuples out.
+    /// Snapshot: no raster `(Some, false)`, has raster `(Some, true)`, unavailable `(None, _)`. Prefer the named constructors.
     #[derive(Clone, Default)]
     pub struct ClipboardProbeHook {
         /// `pbpaste` text for the Ctrl/Cmd+V key-chord path.
@@ -926,16 +1075,15 @@ pub mod test_support {
         pub file_urls: Option<String>,
         /// Make the unified attachment seam return a typed backend failure.
         pub attachment_probe_failed: bool,
-        /// `(changeCount, has_image)` snapshot; unset defaults to available with
-        /// raster iff a canned `image` is set, so text hooks skip and image hooks probe.
+        /// `(changeCount, has_image)` snapshot.
+        /// Unset defaults to available with raster iff a canned `image` is set, so text hooks skip and image hooks probe.
         pub snapshot: Option<(Option<u64>, bool)>,
         /// `clipboard_image_probe_supported()`; real platform value when `None`.
         pub snapshot_supported: Option<bool>,
     }
 
     impl ClipboardProbeHook {
-        /// Canned TEXT clipboard whose snapshot is available with no raster
-        /// (the gate skips the probe; the text inserts synchronously).
+        /// Canned TEXT clipboard whose snapshot is available with no raster (the gate skips the probe; the text inserts synchronously).
         pub fn no_raster(text: Option<&str>) -> Self {
             Self {
                 text: text.map(str::to_owned),
@@ -945,8 +1093,7 @@ pub mod test_support {
             }
         }
 
-        /// Canned raster clipboard: the snapshot reports an image present so
-        /// the gate defers/runs the probe, which returns `image`.
+        /// Canned raster clipboard: the snapshot reports an image present so the gate defers/runs the probe, which returns `image`.
         pub fn with_raster(image: Option<ImageData>) -> Self {
             Self {
                 image,
@@ -956,8 +1103,7 @@ pub mod test_support {
             }
         }
 
-        /// Snapshot unavailable (AppKit load failure): the gate cannot rule
-        /// out a raster and must still probe.
+        /// Snapshot unavailable (AppKit load failure): the gate cannot rule out a raster and must still probe.
         pub fn snapshot_unavailable() -> Self {
             Self {
                 snapshot: Some((None, false)),
@@ -1039,8 +1185,8 @@ pub mod test_support {
         })
     }
 
-    /// Canned pasteboard snapshot for an installed hook; unset defaults to
-    /// available with raster iff a canned `image` is set (text skips, image probes).
+    /// Canned pasteboard snapshot for an installed hook.
+    /// Unset defaults to available with raster iff a canned `image` is set (text skips, image probes).
     pub(super) fn hook_image_snapshot() -> Option<(Option<u64>, bool)> {
         HOOK.with(|h| {
             h.borrow()
@@ -1321,8 +1467,7 @@ mod tests {
     fn should_run_attachment_probe_matrix() {
         use AttachmentProbeRoute::{FileUrlsThenImage, ImageOnly, Skip};
 
-        // Skip never probes; FileUrlsThenImage always probes — regardless of
-        // the native snapshot (supported / available / has_image).
+        // Skip never probes; FileUrlsThenImage always probes, regardless of the native snapshot (supported / available / has_image)
         for supported in [false, true] {
             for available in [false, true] {
                 for has_image in [false, true] {
@@ -1339,12 +1484,11 @@ mod tests {
             }
         }
 
-        // ImageOnly skips ONLY when the snapshot is supported, AVAILABLE, and
-        // reports no raster; an unavailable snapshot (AppKit failure / non-macOS)
-        // can't rule out a raster, so it must probe.
+        // ImageOnly skips ONLY when the snapshot is supported, AVAILABLE, and reports no raster
+        // An unavailable snapshot (AppKit failure / non-macOS) can't rule out a raster, so it must probe
         assert!(!should_run_attachment_probe(ImageOnly, true, true, false));
         assert!(should_run_attachment_probe(ImageOnly, true, true, true));
-        // The bug fix: available=false must probe even when has_image=false.
+        // available=false must probe even when has_image=false
         assert!(should_run_attachment_probe(ImageOnly, true, false, false));
         assert!(should_run_attachment_probe(ImageOnly, true, false, true));
         // Non-macOS (supported=false) always probes.
@@ -1352,9 +1496,8 @@ mod tests {
         assert!(should_run_attachment_probe(ImageOnly, false, false, false));
     }
 
-    /// The gate hands back the changeCount its own snapshot read observed, and
-    /// the seam serves the same value through `clipboard_change_count()` — so
-    /// enqueue sites need no second native read for the TOCTOU baseline.
+    /// The gate hands back the changeCount its own snapshot read observed, and the hook serves the same value through `clipboard_change_count()`.
+    /// Enqueue sites need no second native read for the TOCTOU baseline.
     #[test]
     fn attachment_probe_gate_returns_snapshot_baseline() {
         set_clipboard_probe_hook(ClipboardProbeHook {
@@ -1504,7 +1647,14 @@ mod tests {
         ];
 
         for case in cases {
-            let route = resolve_clipboard_route(&case.ctx);
+            // Pure helper with kill switch off so ambient GROK_CLIPBOARD_NO_OSC52 cannot flake CI (route() itself still reads the real env)
+            let route = resolve_clipboard_route_with(
+                &case.ctx,
+                ClipboardRouteOpts {
+                    no_osc52: false,
+                    wrap_sink: false,
+                },
+            );
             assert_eq!(
                 route.native, case.native,
                 "native mismatch on case '{}'",
@@ -1531,7 +1681,6 @@ mod tests {
 
     #[test]
     fn clipboard_route_native_always_true() {
-        // Every environment should always attempt native clipboard.
         for ctx in [
             plain_terminal_ctx(),
             plain_tmux_ctx(),
@@ -1551,7 +1700,6 @@ mod tests {
 
     #[test]
     fn clipboard_route_tmux_buffer_only_for_tmux_backed() {
-        // tmux_buffer should be true only when multiplexer is Tmux.
         let tmux_cases = [plain_tmux_ctx(), byobu_tmux_ctx()];
         let non_tmux_cases = [
             plain_terminal_ctx(),
@@ -1580,11 +1728,42 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_route_osc52_when_wrap_sink_active() {
+        let on = resolve_clipboard_route_with(
+            &plain_terminal_ctx(),
+            ClipboardRouteOpts {
+                no_osc52: false,
+                wrap_sink: true,
+            },
+        );
+        assert!(
+            on.osc52,
+            "grok wrap sink must emit OSC 52 so the local PTY can intercept it"
+        );
+        let killed = resolve_clipboard_route_with(
+            &plain_terminal_ctx(),
+            ClipboardRouteOpts {
+                no_osc52: true,
+                wrap_sink: true,
+            },
+        );
+        assert!(
+            !killed.osc52,
+            "GROK_CLIPBOARD_NO_OSC52 still wins over the wrap sink"
+        );
+    }
+
+    #[test]
     fn clipboard_route_osc52_always_for_tmux_backed() {
-        // In tmux-backed environments, OSC 52 is always emitted regardless of
-        // remote session status.
+        // In tmux-backed environments, OSC 52 is always emitted regardless of remote session status (unless the kill switch is on, tested below)
         for ctx in [plain_tmux_ctx(), byobu_tmux_ctx()] {
-            let route = resolve_clipboard_route(&ctx);
+            let route = resolve_clipboard_route_with(
+                &ctx,
+                ClipboardRouteOpts {
+                    no_osc52: false,
+                    wrap_sink: false,
+                },
+            );
             assert!(
                 route.osc52,
                 "OSC 52 should always be emitted in tmux-backed env: {:?}",
@@ -1594,15 +1773,96 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_route_no_osc52_kill_switch_forces_off() {
+        // GROK_CLIPBOARD_NO_OSC52 must win over Linux/tmux/SSH automatic emit.
+        for ctx in [
+            plain_terminal_ctx(),
+            plain_tmux_ctx(),
+            byobu_tmux_ctx(),
+            byobu_screen_ctx(),
+            zellij_ctx(),
+            plain_screen_ctx(),
+        ] {
+            let route = resolve_clipboard_route_with(
+                &ctx,
+                ClipboardRouteOpts {
+                    no_osc52: true,
+                    wrap_sink: false,
+                },
+            );
+            assert!(
+                !route.osc52,
+                "OSC 52 must be off under kill switch for {:?}",
+                ctx.multiplexer
+            );
+            assert!(
+                !route.osc52_tmux_passthrough,
+                "tmux passthrough must be off when OSC 52 is killed for {:?}",
+                ctx.multiplexer
+            );
+            // Other legs are unaffected.
+            assert!(route.native);
+        }
+        // tmux buffer still active when in tmux; only OSC 52 is killed
+        let tmux = resolve_clipboard_route_with(
+            &plain_tmux_ctx(),
+            ClipboardRouteOpts {
+                no_osc52: true,
+                wrap_sink: false,
+            },
+        );
+        assert!(tmux.tmux_buffer);
+        assert!(!tmux.osc52);
+    }
+
+    #[test]
     fn clipboard_route_osc52_tmux_passthrough_truth_table() {
-        // tmux + no editor: wrap (tmux is the immediate terminal).
-        assert!(resolve_clipboard_route(&plain_tmux_ctx()).osc52_tmux_passthrough);
-        // tmux + embedded editor: don't wrap (libvterm is the immediate terminal).
+        // tmux with no editor: wrap (tmux is the immediate terminal)
+        assert!(
+            resolve_clipboard_route_with(
+                &plain_tmux_ctx(),
+                ClipboardRouteOpts {
+                    no_osc52: false,
+                    wrap_sink: false
+                }
+            )
+            .osc52_tmux_passthrough
+        );
+        // tmux with an embedded editor: don't wrap (libvterm is the immediate terminal)
         let mut tmux_in_editor = plain_tmux_ctx();
         tmux_in_editor.embedded_editor = Some(EmbeddedEditor::Neovim);
-        assert!(!resolve_clipboard_route(&tmux_in_editor).osc52_tmux_passthrough);
+        assert!(
+            !resolve_clipboard_route_with(
+                &tmux_in_editor,
+                ClipboardRouteOpts {
+                    no_osc52: false,
+                    wrap_sink: false
+                }
+            )
+            .osc52_tmux_passthrough
+        );
         // non-tmux: never wrap.
-        assert!(!resolve_clipboard_route(&plain_terminal_ctx()).osc52_tmux_passthrough);
+        assert!(
+            !resolve_clipboard_route_with(
+                &plain_terminal_ctx(),
+                ClipboardRouteOpts {
+                    no_osc52: false,
+                    wrap_sink: false
+                }
+            )
+            .osc52_tmux_passthrough
+        );
+        // kill switch: never wrap even in plain tmux.
+        assert!(
+            !resolve_clipboard_route_with(
+                &plain_tmux_ctx(),
+                ClipboardRouteOpts {
+                    no_osc52: true,
+                    wrap_sink: false
+                }
+            )
+            .osc52_tmux_passthrough
+        );
     }
 
     // =====================================================================
@@ -1661,7 +1921,13 @@ mod tests {
     #[test]
     fn clipboard_route_tmux_backed_all_three_legs() {
         for ctx in [plain_tmux_ctx(), byobu_tmux_ctx()] {
-            let route = resolve_clipboard_route(&ctx);
+            let route = resolve_clipboard_route_with(
+                &ctx,
+                ClipboardRouteOpts {
+                    no_osc52: false,
+                    wrap_sink: false,
+                },
+            );
             assert!(route.native, "native should be true");
             assert!(route.tmux_buffer, "tmux_buffer should be true");
             assert!(route.osc52, "osc52 should be true for tmux-backed");
@@ -1742,45 +2008,277 @@ mod tests {
             (
                 ClipboardFeedback::FailedRemote,
                 ClipboardDelivery::Failed,
-                "Copy failed. Try /terminal-setup or /minimal.",
+                "Copy failed. Try /doctor or /minimal.",
                 "failed_remote",
                 120,
             ),
             (
                 ClipboardFeedback::Failed,
                 ClipboardDelivery::Failed,
-                "Copy failed. Try /terminal-setup or /minimal.",
+                "Copy failed. Try /doctor or /minimal.",
                 "failed",
                 120,
             ),
         ];
         for (feedback, delivery, message, telemetry, ticks) in cases {
-            let result = feedback.to_result(delivery);
+            let result = feedback.to_result();
+            assert_eq!(feedback.delivery(), delivery);
             assert_eq!(feedback.message(), message);
             assert_eq!(Into::<&'static str>::into(feedback), telemetry);
             assert_eq!(result.message, message);
             assert_eq!(result.ticks, ticks);
             assert_eq!(result.delivery, delivery);
+            // The lead must prefix the full message so the path-bearing toast never rewords the static copy
+            assert!(
+                message.starts_with(result.message_lead),
+                "message_lead must prefix message for {feedback:?}"
+            );
         }
     }
 
     #[test]
-    fn clipboard_fallbacks_are_short_and_actionable() {
-        for feedback in [
-            ClipboardFeedback::UnverifiedOscRemote,
-            ClipboardFeedback::UnverifiedOscContainer,
-            ClipboardFeedback::FailedRemote,
-            ClipboardFeedback::Failed,
-        ] {
-            assert!(feedback.message().chars().count() + 4 < 80, "{feedback:?}");
-            assert!(!feedback.message().contains("Shift"), "{feedback:?}");
-            assert!(!feedback.message().contains("Fn"), "{feedback:?}");
-            assert!(feedback.message().contains("/minimal"), "{feedback:?}");
-        }
-        assert!(
-            ClipboardFeedback::UnverifiedOscRemote
-                .message()
-                .contains("grok wrap")
+    fn write_text_to_copy_file_creates_parent_and_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("copy.txt");
+        let written = write_text_to_copy_file("hello fallback", &path).expect("write");
+        assert_eq!(written, path);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "hello fallback"
         );
+    }
+
+    /// Copied text can be sensitive and the fallback path is predictable, so the file must be owner-only (`0600`).
+    /// That includes a pre-existing `0644` file left by an older grok.
+    #[cfg(unix)]
+    #[test]
+    fn copy_file_is_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("copy.txt");
+
+        // Fresh file: created 0600.
+        write_text_to_copy_file("secret", &path).expect("write");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "fresh copy file must be 0600");
+
+        // Pre-existing world-readable file: tightened to 0600 on rewrite.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen for test");
+        write_text_to_copy_file("secret2", &path).expect("rewrite");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "pre-existing copy file must be tightened to 0600"
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "secret2");
+    }
+
+    #[test]
+    #[serial_test::serial(grok_copy_file)]
+    fn default_copy_fallback_path_respects_grok_copy_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let custom = dir.path().join("custom-copy.txt");
+        // SAFETY: test-only env mutation; serialized on the grok_copy_file key.
+        unsafe {
+            std::env::set_var(GROK_COPY_FILE_ENV, &custom);
+        }
+        let resolved = default_copy_fallback_path();
+        unsafe {
+            std::env::remove_var(GROK_COPY_FILE_ENV);
+        }
+        assert_eq!(resolved, Some(custom));
+    }
+
+    #[test]
+    #[serial_test::serial(grok_copy_file)]
+    fn write_copy_fallback_uses_env_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let custom = dir.path().join("last.txt");
+        unsafe {
+            std::env::set_var(GROK_COPY_FILE_ENV, &custom);
+        }
+        let written = write_copy_fallback("payload").expect("fallback write");
+        unsafe {
+            std::env::remove_var(GROK_COPY_FILE_ENV);
+        }
+        assert_eq!(written, custom);
+        assert_eq!(std::fs::read_to_string(&custom).expect("read"), "payload");
+    }
+
+    /// Without `GROK_COPY_FILE`, the default is `~/.grok/last-copy.txt`
+    /// (grok home) — short and toast-friendly, unlike macOS's temp dir.
+    #[test]
+    #[serial_test::serial(grok_copy_file)]
+    fn default_copy_fallback_path_is_grok_home() {
+        unsafe {
+            std::env::remove_var(GROK_COPY_FILE_ENV);
+        }
+        let path = default_copy_fallback_path();
+        // Test envs always resolve a home (or set GROK_HOME).
+        let expected = xai_grok_config::user_grok_home()
+            .expect("home resolves in tests")
+            .join("last-copy.txt");
+        assert_eq!(path, Some(expected));
+    }
+
+    /// Toast paths collapse the home prefix to `~`.
+    /// Grok-home paths go through the shared `abbreviate_path` convention.
+    /// The `GROK_HOME`-override integration test in `xai-grok-pager` covers that further.
+    #[test]
+    fn display_copy_path_abbreviates_home() {
+        if std::env::var_os("GROK_HOME").is_none() {
+            let home = xai_dirs::home_dir().expect("home resolves in tests");
+            assert_eq!(
+                display_copy_path(&home.join(".grok").join("last-copy.txt")),
+                "~/.grok/last-copy.txt"
+            );
+        }
+        // Non-home paths pass through untouched, including multi-byte UTF-8 components (must never slice at a non-char boundary)
+        assert_eq!(
+            display_copy_path(std::path::Path::new("/tmp/grok-0/last-copy.txt")),
+            "/tmp/grok-0/last-copy.txt"
+        );
+        assert_eq!(
+            display_copy_path(std::path::Path::new("/tmp/日本語/コピー.txt")),
+            "/tmp/日本語/コピー.txt"
+        );
+    }
+
+    // -- resolve_delivery: pure clipboard × file composition matrix ----------
+
+    fn copy_result(success: bool) -> CopyResult {
+        CopyResult {
+            message: "test",
+            message_lead: "test",
+            ticks: 30,
+            delivery: if success {
+                ClipboardDelivery::Confirmed
+            } else {
+                ClipboardDelivery::Failed
+            },
+        }
+    }
+
+    #[test]
+    fn delivery_clipboard_success_carries_backup_file() {
+        let path = std::path::PathBuf::from("/tmp/grok-1/last-copy.txt");
+        match resolve_delivery(copy_result(true), Ok(path.clone())) {
+            CopyDelivery::Clipboard { result, file } => {
+                assert!(result.delivery.reported_success());
+                assert_eq!(file, Some(path));
+            }
+            other => panic!("expected Clipboard delivery, got {other:?}"),
+        }
+    }
+
+    /// A failed backup write never fails a copy whose clipboard succeeded.
+    #[test]
+    fn delivery_clipboard_success_survives_file_write_failure() {
+        let err = std::io::Error::other("disk full");
+        let delivery = resolve_delivery(copy_result(true), Err(err));
+        assert!(delivery.success());
+        match delivery {
+            CopyDelivery::Clipboard { file, .. } => assert!(file.is_none()),
+            other => panic!("expected Clipboard delivery, got {other:?}"),
+        }
+    }
+
+    /// Clipboard `Failed` still yields `File` delivery.
+    #[test]
+    fn delivery_clipboard_failure_yields_file() {
+        let path = std::path::PathBuf::from("/tmp/grok-1/last-copy.txt");
+        let delivery = resolve_delivery(copy_result(false), Ok(path.clone()));
+        assert!(delivery.success());
+        match delivery {
+            CopyDelivery::File { path: p } => assert_eq!(p, path),
+            other => panic!("expected File delivery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delivery_both_failed_is_failed() {
+        let err = std::io::Error::other("read-only fs");
+        let delivery = resolve_delivery(copy_result(false), Err(err));
+        assert!(!delivery.success());
+        assert!(matches!(delivery, CopyDelivery::Failed { .. }));
+    }
+
+    // -- CopyDelivery toast composition ---------------------------------------
+
+    #[test]
+    fn toast_message_names_backup_only_for_unverified_or_file_fallback() {
+        let path = std::path::PathBuf::from("/tmp/grok-1/last-copy.txt");
+
+        let confirmed = CopyDelivery::Clipboard {
+            result: ClipboardFeedback::Copied.to_result(),
+            file: Some(path.clone()),
+        };
+        assert_eq!(confirmed.toast_message(), "Copied!");
+        assert_eq!(confirmed.toast_ticks(), 30);
+
+        let confirmed_osc = CopyDelivery::Clipboard {
+            result: ClipboardFeedback::CopiedOscRemote.to_result(),
+            file: Some(path.clone()),
+        };
+        assert_eq!(confirmed_osc.toast_message(), "Copied via OSC 52.");
+
+        let unverified = CopyDelivery::Clipboard {
+            result: ClipboardFeedback::UnverifiedOscRemote.to_result(),
+            file: Some(path.clone()),
+        };
+        assert_eq!(
+            unverified.toast_message(),
+            "Copy sent, saved to /tmp/grok-1/last-copy.txt"
+        );
+        assert_eq!(unverified.toast_ticks(), 120);
+
+        let unverified_no_file = CopyDelivery::Clipboard {
+            result: ClipboardFeedback::UnverifiedOscRemote.to_result(),
+            file: None,
+        };
+        assert_eq!(
+            unverified_no_file.toast_message(),
+            ClipboardFeedback::UnverifiedOscRemote.message()
+        );
+
+        let file_only = CopyDelivery::File { path };
+        assert_eq!(
+            file_only.toast_message(),
+            "Clipboard unreachable: wrote /tmp/grok-1/last-copy.txt"
+        );
+        assert_eq!(file_only.toast_ticks(), 120);
+
+        let failed = CopyDelivery::Failed {
+            clipboard: ClipboardFeedback::Failed.to_result(),
+            file_error: std::io::Error::other("nope"),
+        };
+        assert_eq!(failed.toast_message(), ClipboardFeedback::Failed.message());
+        assert_eq!(failed.toast_ticks(), 120);
+    }
+
+    /// Unverified OSC still composes as clipboard delivery (not file fallback).
+    #[test]
+    fn unverified_clipboard_delivery_composes_as_clipboard() {
+        let path = std::path::PathBuf::from("/tmp/grok-1/last-copy.txt");
+        let delivery = resolve_delivery(
+            ClipboardFeedback::UnverifiedOscRemote.to_result(),
+            Ok(path.clone()),
+        );
+        match delivery {
+            CopyDelivery::Clipboard { result, file } => {
+                assert_eq!(result.delivery, ClipboardDelivery::Unverified);
+                assert_eq!(file, Some(path));
+            }
+            other => panic!("expected Clipboard delivery, got {other:?}"),
+        }
     }
 }

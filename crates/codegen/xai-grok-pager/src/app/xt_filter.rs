@@ -1,44 +1,41 @@
-//! XTVERSION DCS reply filter for the input event channel (parser-integrated
-//! model as in helix and similar TUIs). See [`XtversionFilter`].
+//! XTVERSION DCS reply filter for the input event channel (parser-integrated model as in helix and similar TUIs).
+//! See [`XtversionFilter`].
 
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use super::event_loop::is_bare_esc_press;
+use super::event_loop::{TimedInputEvent, is_bare_esc_press};
 
-/// How long the filter stays armed waiting for the reply (opentui uses a
-/// non-blocking 5s window); zero-cost after disarm.
+/// How long the filter stays armed waiting for the reply (opentui uses a non-blocking 5s window); zero-cost after disarm.
 const XT_ARM_WINDOW: Duration = Duration::from_secs(5);
 
-/// How long a held partial reply waits for its remaining fragments before
-/// being resolved (pi-mono uses 150ms).
+/// How long a held partial reply waits for its remaining fragments before being resolved (other terminal UI stacks use 150ms).
 pub(super) const XT_FRAGMENT_TIMEOUT: Duration = Duration::from_millis(150);
 
-/// Total bound on one hold, so a terminal trickling valid payload chars
-/// cannot stall the event loop beyond this.
+/// Total bound on one hold, so a terminal trickling valid payload chars cannot stall the event loop beyond this.
 pub(super) const XT_MAX_HOLD: Duration = Duration::from_secs(1);
 
 /// Payload size cap; real replies are short (`kitty 0.35.2`).
 const XT_MAX_PAYLOAD: usize = 64;
 
-/// Recognizes and swallows the XTVERSION DCS reply arriving through the
-/// input event channel. crossterm surfaces `ESC P` as Alt+Shift+P, the payload as
-/// plain Char presses, ST as Alt+\ and BEL as Ctrl+G. Unmatched events
-/// pass through; partial prefixes are held in `tentative` and resolved by
-/// the caller. Non-key events (Resize/Focus/Mouse/Paste) pass through
-/// without disturbing a hold — they can interleave with a split reply but
-/// can never be part of it.
+/// Recognizes and swallows the XTVERSION DCS reply arriving through the input event channel.
+/// crossterm surfaces `ESC P` as Alt+Shift+P, the payload as plain Char presses, ST as Alt+\ and BEL as Ctrl+G.
+/// Events behind a partial prefix are staged so surviving input retains FIFO order and timestamps.
 pub(super) struct XtversionFilter {
     armed: bool,
-    /// Set on the first `filter()` call, not at construction — a loaded
-    /// startup can take seconds before the loop processes its first
-    /// batch, and that time must not burn the arm window.
+    /// Set on the first `filter()` call, not at construction.
+    /// A loaded startup can take seconds before the loop processes its first batch, and that time must not burn the arm window.
     deadline: Option<Instant>,
     state: XtState,
-    tentative: Vec<Event>,
+    staged: Vec<StagedEvent>,
     payload: String,
     completed: Option<String>,
+}
+
+enum StagedEvent {
+    Tentative(TimedInputEvent),
+    PassThrough(TimedInputEvent),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -63,7 +60,7 @@ impl XtversionFilter {
             armed,
             deadline: None,
             state: XtState::Idle,
-            tentative: Vec::new(),
+            staged: Vec::new(),
             payload: String::new(),
             completed: None,
         }
@@ -74,7 +71,11 @@ impl XtversionFilter {
     }
 
     pub(super) fn holding(&self) -> bool {
-        self.armed && !self.tentative.is_empty()
+        self.armed
+            && self
+                .staged
+                .iter()
+                .any(|event| matches!(event, StagedEvent::Tentative(_)))
     }
 
     pub(super) fn take_completed(&mut self) -> Option<String> {
@@ -82,35 +83,46 @@ impl XtversionFilter {
     }
 
     /// Flush held events back (prefix turned out not to be a reply).
-    fn flush(&mut self) -> Vec<Event> {
+    fn flush(&mut self) -> Vec<TimedInputEvent> {
         self.state = XtState::Idle;
         self.payload.clear();
-        std::mem::take(&mut self.tentative)
+        std::mem::take(&mut self.staged)
+            .into_iter()
+            .map(|event| match event {
+                StagedEvent::Tentative(event) | StagedEvent::PassThrough(event) => event,
+            })
+            .collect()
     }
 
-    /// True once the full `ESC P > |` intro was seen — past that point the
-    /// held events are terminal output, never typing.
+    fn release_pass_through(&mut self) -> Vec<TimedInputEvent> {
+        std::mem::take(&mut self.staged)
+            .into_iter()
+            .filter_map(|event| match event {
+                StagedEvent::Tentative(_) => None,
+                StagedEvent::PassThrough(event) => Some(event),
+            })
+            .collect()
+    }
+
     fn intro_confirmed(&self) -> bool {
         matches!(self.state, XtState::Payload | XtState::PayloadEscHeld)
     }
 
-    /// Resolve a hold that won't complete: drop a confirmed reply fragment
-    /// rather than type it into the prompt (drop unsolicited replies); flush
-    /// back a short pre-intro hold (real keypresses).
-    pub(super) fn resolve_dead_hold(&mut self) -> Vec<Event> {
+    /// Flush pre-intro input; drop confirmed DCS bytes but preserve pass-through.
+    pub(super) fn resolve_dead_hold(&mut self) -> Vec<TimedInputEvent> {
         if !self.intro_confirmed() {
             return self.flush();
         }
         tracing::debug!("dropping stalled XTVERSION reply fragment");
-        self.flush();
-        Vec::new()
+        self.state = XtState::Idle;
+        self.payload.clear();
+        self.release_pass_through()
     }
 
     /// Remove a complete DCS reply from the batch; pass everything else.
-    fn filter(&mut self, events: Vec<Event>) -> Vec<Event> {
-        // Don't expire mid-hold once the intro is confirmed: the in-flight
-        // reply must resolve (Complete or dead-hold drop), or its tail
-        // would pass through as typed text.
+    fn filter(&mut self, events: Vec<TimedInputEvent>) -> Vec<TimedInputEvent> {
+        // Don't expire mid-hold once the intro is confirmed
+        // The in-flight reply must resolve (Complete or dead-hold drop), or its tail would pass through as typed text
         let deadline = *self
             .deadline
             .get_or_insert_with(|| Instant::now() + XT_ARM_WINDOW);
@@ -126,28 +138,32 @@ impl XtversionFilter {
 
         let mut result = Vec::with_capacity(events.len());
         for ev in events {
-            // Once the reply completed mid-batch the filter is done —
-            // matching further events would hold them forever.
+            // Once the reply completed mid-batch the filter is done; matching further events would hold them forever
             if !self.armed {
                 result.push(ev);
                 continue;
             }
-            match self.advance(&ev) {
-                XtAdvance::Hold => self.tentative.push(ev),
-                XtAdvance::PassThrough => result.push(ev),
+            match self.advance(&ev.event) {
+                XtAdvance::Hold => self.staged.push(StagedEvent::Tentative(ev)),
+                XtAdvance::PassThrough => {
+                    if self.holding() {
+                        self.staged.push(StagedEvent::PassThrough(ev));
+                    } else {
+                        result.push(ev);
+                    }
+                }
                 XtAdvance::Complete => {
                     self.completed = Some(std::mem::take(&mut self.payload));
-                    self.tentative.clear();
                     self.state = XtState::Idle;
                     self.armed = false;
+                    result.extend(self.release_pass_through());
                 }
-                // Dead hold: drop a confirmed reply fragment, flush back a
-                // pre-intro one; re-evaluate the rejecting event from Idle
-                // so a following reply is still caught.
+                // Dead hold: drop a confirmed reply fragment, flush back a pre-intro one
+                // Re-evaluate the rejecting event from Idle so a following reply is still caught
                 XtAdvance::Mismatch => {
                     result.append(&mut self.resolve_dead_hold());
-                    if matches!(self.advance(&ev), XtAdvance::Hold) {
-                        self.tentative.push(ev);
+                    if matches!(self.advance(&ev.event), XtAdvance::Hold) {
+                        self.staged.push(StagedEvent::Tentative(ev));
                     } else {
                         result.push(ev);
                     }
@@ -159,8 +175,6 @@ impl XtversionFilter {
 
     fn advance(&mut self, ev: &Event) -> XtAdvance {
         use XtState::*;
-        // Non-key events can't be reply bytes nor "the first typed char";
-        // surfacing them ahead of a hold is harmless.
         if !matches!(ev, Event::Key(_)) {
             return XtAdvance::PassThrough;
         }
@@ -186,9 +200,8 @@ impl XtversionFilter {
             (EscHeld, 'P') => self.state = AwaitGt,
             (AwaitGt, '>') => self.state = AwaitPipe,
             (AwaitPipe, '|') => self.state = Payload,
-            // Strict alphabet so the first typed char outside a real
-            // name+version payload (e.g. a `/slash` command after an
-            // unterminated reply) breaks the hold instead of being eaten.
+            // Strict alphabet so the first typed char outside a real `name version` payload breaks the hold instead of being eaten
+            // Example: a `/slash` command typed after an unterminated reply
             (Payload, c) if is_xt_payload_char(c) && self.payload.len() < XT_MAX_PAYLOAD => {
                 self.payload.push(c)
             }
@@ -206,16 +219,14 @@ enum XtAdvance {
     Mismatch,
 }
 
-/// Apply the filter to a batch and, while a partial reply is held, await
-/// follow-up fragments — bounded per-fragment by [`XT_FRAGMENT_TIMEOUT`]
-/// and overall by [`XT_MAX_HOLD`] so a trickling terminal can't stall the
-/// event loop. Cost: a real bare-Esc press during the arm window is
-/// delayed by up to one fragment timeout before flushing back.
+/// Apply the filter to a batch and, while a partial reply is held, await follow-up fragments.
+/// The hold is bounded per fragment by [`XT_FRAGMENT_TIMEOUT`] and overall by [`XT_MAX_HOLD`] so a trickling terminal can't stall the event loop.
+/// Cost: a real bare-Esc press during the arm window is delayed by up to one fragment timeout before flushing back.
 pub(super) async fn filter_with_fragment_wait(
     xt_filter: &mut XtversionFilter,
-    mut raw_events: Vec<Event>,
-    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
-) -> Vec<Event> {
+    mut raw_events: Vec<TimedInputEvent>,
+    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimedInputEvent>,
+) -> Vec<TimedInputEvent> {
     raw_events = xt_filter.filter(raw_events);
     let hold_deadline = Instant::now() + XT_MAX_HOLD;
     while xt_filter.holding() {
@@ -237,8 +248,7 @@ pub(super) async fn filter_with_fragment_wait(
     }
     if let Some(payload) = xt_filter.take_completed() {
         crate::terminal::xtversion::record_reply(&payload);
-        // The startup terminal_context emission raced the async reply —
-        // re-emit so the populated xtversion field reaches telemetry.
+        // The startup terminal_context emission may have missed the async reply; re-emit so the populated xtversion field reaches telemetry
         if crate::terminal::xtversion::detected().is_some() {
             tokio::task::spawn_blocking(|| {
                 let t = crate::terminal::terminal_context().telemetry_snapshot();
@@ -249,8 +259,7 @@ pub(super) async fn filter_with_fragment_wait(
     raw_events
 }
 
-/// Real XTVERSION payloads are `name version` strings like
-/// `kitty 0.35.2`, `XTerm(388)`, `tmux 3.4`.
+/// Real XTVERSION payloads are `name version` strings like `kitty 0.35.2`, `XTerm(388)`, `tmux 3.4`.
 fn is_xt_payload_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '(' | ')' | '+')
 }
@@ -293,29 +302,38 @@ fn xt_plain_char(ev: &Event) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
     use crossterm::event::{KeyEvent, KeyEventState};
 
-    fn press_mods(code: KeyCode, modifiers: KeyModifiers) -> Event {
-        Event::Key(KeyEvent {
-            code,
-            modifiers,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        })
+    fn test_instant() -> Instant {
+        static NOW: OnceLock<Instant> = OnceLock::new();
+        *NOW.get_or_init(Instant::now)
     }
 
-    fn press(code: KeyCode) -> Event {
+    fn press_mods(code: KeyCode, modifiers: KeyModifiers) -> TimedInputEvent {
+        TimedInputEvent {
+            event: Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            }),
+            arrived_at: test_instant(),
+        }
+    }
+
+    fn press(code: KeyCode) -> TimedInputEvent {
         press_mods(code, KeyModifiers::NONE)
     }
 
-    fn press_shift(code: KeyCode) -> Event {
+    fn press_shift(code: KeyCode) -> TimedInputEvent {
         press_mods(code, KeyModifiers::SHIFT)
     }
 
-    /// The reply `ESC P > | <payload> ESC \` as crossterm surfaces it in
-    /// one read: Alt+Shift+P, plain chars, Alt+\.
-    fn dcs_reply_events(payload: &str) -> Vec<Event> {
+    /// The reply `ESC P > | <payload> ESC \` as crossterm surfaces it in one read: Alt+Shift+P, plain chars, Alt+\.
+    fn dcs_reply_events(payload: &str) -> Vec<TimedInputEvent> {
         let mut evs = vec![press_mods(
             KeyCode::Char('P'),
             KeyModifiers::ALT | KeyModifiers::SHIFT,
@@ -340,6 +358,76 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(f.take_completed().as_deref(), Some("kitty 0.35.2"));
         assert!(!f.armed());
+    }
+
+    #[test]
+    fn xt_filter_dead_pre_intro_hold_preserves_fifo_and_timestamps() {
+        let start = Instant::now();
+        let resize_at = start + Duration::from_millis(4);
+        let mut filter = XtversionFilter::with_armed(true);
+        let events = vec![
+            TimedInputEvent {
+                event: press(KeyCode::Esc).event,
+                arrived_at: start,
+            },
+            TimedInputEvent {
+                event: Event::Resize(80, 24),
+                arrived_at: resize_at,
+            },
+        ];
+
+        assert!(filter.filter(events).is_empty());
+        let output = filter.resolve_dead_hold();
+
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].event, press(KeyCode::Esc).event);
+        assert_eq!(output[0].arrived_at, start);
+        assert_eq!(output[1].event, Event::Resize(80, 24));
+        assert_eq!(output[1].arrived_at, resize_at);
+    }
+
+    #[test]
+    fn xt_filter_confirmed_dead_hold_releases_interleaved_pass_through() {
+        let start = Instant::now();
+        let resize_at = start + Duration::from_millis(5);
+        let mut events = dcs_reply_events("x");
+        events.pop();
+        events.insert(
+            4,
+            TimedInputEvent {
+                event: Event::Resize(80, 24),
+                arrived_at: resize_at,
+            },
+        );
+        let mut filter = XtversionFilter::with_armed(true);
+
+        assert!(filter.filter(events).is_empty());
+        let output = filter.resolve_dead_hold();
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].event, Event::Resize(80, 24));
+        assert_eq!(output[0].arrived_at, resize_at);
+    }
+
+    #[test]
+    fn xt_filter_confirmed_reply_preserves_interleaved_pass_through_order() {
+        let start = Instant::now();
+        let mut reply = dcs_reply_events("x");
+        let tail = reply.split_off(2);
+        let mut events = reply;
+        events.push(TimedInputEvent {
+            event: Event::Resize(80, 24),
+            arrived_at: start,
+        });
+        events.extend(tail);
+        let mut filter = XtversionFilter::with_armed(true);
+
+        let output = filter.filter(events);
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].event, Event::Resize(80, 24));
+        assert_eq!(output[0].arrived_at, start);
+        assert_eq!(filter.take_completed().as_deref(), Some("x"));
     }
 
     #[test]
@@ -429,8 +517,7 @@ mod tests {
 
     #[test]
     fn xt_filter_confirmed_fragment_dropped_not_typed() {
-        // Unterminated reply followed by typing: fragment is dropped, the
-        // typed char survives.
+        // Unterminated reply followed by typing: fragment is dropped, the typed char survives
         let mut f = XtversionFilter::with_armed(true);
         let mut evs = dcs_reply_events("x");
         evs.pop();
@@ -453,8 +540,7 @@ mod tests {
 
     #[test]
     fn xt_filter_events_after_completion_pass_same_batch() {
-        // A bare Esc (or Alt+P) right after the reply in the SAME batch
-        // must come out — the disarmed filter must stop matching.
+        // A bare Esc (or Alt+P) right after the reply in the SAME batch must come out; the disarmed filter must stop matching
         let mut f = XtversionFilter::with_armed(true);
         let mut evs = dcs_reply_events("kitty 0.35.2");
         evs.push(press(KeyCode::Esc));
@@ -476,18 +562,29 @@ mod tests {
 
     #[test]
     fn xt_filter_resize_mid_hold_does_not_break_reply() {
-        // Startup Resize/Focus events interleaved with a split reply must
-        // pass through without dropping the hold.
         let mut f = XtversionFilter::with_armed(true);
         let evs = dcs_reply_events("kitty 0.35.2");
         let (a, b) = evs.split_at(6);
+        let resize_at = test_instant() + Duration::from_millis(3);
+        let focus_at = test_instant() + Duration::from_millis(4);
         let mut first = a.to_vec();
-        first.push(Event::Resize(80, 24));
-        first.push(Event::FocusGained);
-        let out = f.filter(first);
-        assert_eq!(out, vec![Event::Resize(80, 24), Event::FocusGained]);
+        first.push(TimedInputEvent {
+            event: Event::Resize(80, 24),
+            arrived_at: resize_at,
+        });
+        first.push(TimedInputEvent {
+            event: Event::FocusGained,
+            arrived_at: focus_at,
+        });
+        assert!(f.filter(first).is_empty());
         assert!(f.holding());
-        assert!(f.filter(b.to_vec()).is_empty());
+
+        let out = f.filter(b.to_vec());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].event, Event::Resize(80, 24));
+        assert_eq!(out[0].arrived_at, resize_at);
+        assert_eq!(out[1].event, Event::FocusGained);
+        assert_eq!(out[1].arrived_at, focus_at);
         assert_eq!(f.take_completed().as_deref(), Some("kitty 0.35.2"));
     }
 }

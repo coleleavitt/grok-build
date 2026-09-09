@@ -1,5 +1,3 @@
-//! ListDirToolCallBlock - lists directory contents.
-
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
@@ -10,28 +8,24 @@ use crate::scrollback::types::{
 use crate::theme::Theme;
 
 use super::TOOL_HEADER_RANGE;
+use crate::appearance::AppearanceConfig;
 
-/// List directory tool call.
 #[derive(Debug, Clone)]
 pub struct ListDirToolCallBlock {
-    /// Path to the directory.
     pub path: String,
-    /// The formatted directory listing output.
     pub output: String,
-    /// Error message if the tool call failed (None = success).
     pub error: Option<String>,
-    /// When the tool started running (Phase 2: time tracking).
+    /// When the tool started running.
     pub started_at: Option<std::time::Instant>,
-    /// Elapsed time in ms after completion (Phase 2: time tracking).
+    /// Elapsed time in ms after completion.
     pub elapsed_ms: Option<i64>,
+    /// Whether this ordinary list targets a memory v2 scope.
+    pub is_memory_activity: bool,
 }
 
 impl ListDirToolCallBlock {
-    /// Create a new list_dir block.
-    ///
-    /// Pre-completed blocks have no meaningful local timing — `started_at`
-    /// is `None`. Timing is only set for blocks that enter a running UI
-    /// state (via `set_last_running(true)` in `ScrollbackState`).
+    /// Pre-completed blocks have no meaningful local timing; `started_at` is `None`.
+    /// Timing is only set for blocks that enter a running UI state (via `set_last_running(true)` in `ScrollbackState`).
     pub fn new(path: impl Into<String>) -> Self {
         Self {
             path: path.into(),
@@ -39,27 +33,30 @@ impl ListDirToolCallBlock {
             error: None,
             started_at: None,
             elapsed_ms: None,
+            is_memory_activity: false,
         }
     }
 
-    /// Set the output.
+    pub fn with_memory_activity(mut self) -> Self {
+        self.is_memory_activity = true;
+        self
+    }
+
     pub fn with_output(mut self, output: impl Into<String>) -> Self {
         self.output = output.into();
         self
     }
 
-    /// Set error (marks as failed).
     pub fn with_error(mut self, error: impl Into<String>) -> Self {
         self.error = Some(error.into());
         self
     }
 
-    /// Check if successful (no error).
     pub fn is_success(&self) -> bool {
         self.error.is_none()
     }
 
-    /// Set error (mutable) — compute elapsed time if not already set (Phase 2).
+    /// Set error; compute elapsed time if not already set.
     pub fn set_error(&mut self, error: Option<String>) {
         if self.elapsed_ms.is_none()
             && let Some(start) = self.started_at
@@ -71,8 +68,7 @@ impl ListDirToolCallBlock {
 
     /// Finalize elapsed time from `started_at`.
     ///
-    /// Idempotent: no-op if `started_at` is `None` (pre-completed block)
-    /// or if `elapsed_ms` is already set (already finalized).
+    /// Idempotent: no-op if `started_at` is `None` (pre-completed block) or if `elapsed_ms` is already set (already finalized).
     pub fn finish(&mut self) {
         if self.elapsed_ms.is_some() {
             return;
@@ -82,7 +78,6 @@ impl ListDirToolCallBlock {
         }
     }
 
-    /// Get elapsed time in ms (Phase 2).
     pub fn elapsed_ms(&self) -> Option<i64> {
         match self.elapsed_ms {
             Some(ms) => Some(ms),
@@ -92,14 +87,10 @@ impl ListDirToolCallBlock {
         }
     }
 
-    /// Set output (mutable).
     pub fn set_output(&mut self, output: impl Into<String>) {
         self.output = output.into();
     }
 
-    /// Render collapsed line: `List path`.
-    ///
-    /// When `width` is provided, the path is fish-shortened to fit.
     fn collapsed_line(&self, theme: &Theme, muted: bool, width: Option<usize>) -> Line<'static> {
         let text_style = if muted {
             theme.muted()
@@ -114,15 +105,32 @@ impl ListDirToolCallBlock {
         };
 
         let prefix = "List ";
+        let entry_count = self.output.lines().filter(|l| !l.trim().is_empty()).count();
+        let suffix = if self.error.is_none() && entry_count > 0 {
+            let s = if entry_count == 1 { "y" } else { "ies" };
+            format!(" ({entry_count} entr{s})")
+        } else {
+            String::new()
+        };
+        let suffix_fits = width.is_none_or(|w| prefix.len() + suffix.len() < w);
+        let effective_suffix = if suffix_fits { suffix.as_str() } else { "" };
+
         let path_budget = width
-            .map(|w| w.saturating_sub(prefix.len()))
+            .map(|w| {
+                w.saturating_sub(prefix.len())
+                    .saturating_sub(effective_suffix.len())
+            })
             .unwrap_or(usize::MAX);
         let path = crate::render::tool_paths::shorten_path(&self.path, path_budget);
 
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(prefix, bold_style),
             Span::styled(path, path_style),
-        ])
+        ];
+        if !effective_suffix.is_empty() {
+            spans.push(Span::styled(effective_suffix.to_string(), theme.muted()));
+        }
+        Line::from(spans)
     }
 
     /// Header line with only the path span selectable (exclude "List " prefix).
@@ -193,7 +201,7 @@ impl BlockContent for ListDirToolCallBlock {
         }
     }
 
-    fn has_vpad(&self, _ctx: &BlockContext) -> bool {
+    fn has_vpad_for(&self, _appearance: &AppearanceConfig) -> bool {
         false
     }
 
@@ -222,5 +230,51 @@ impl BlockContent for ListDirToolCallBlock {
             DisplayMode::Collapsed => DisplayMode::Expanded,
             _ => DisplayMode::Collapsed,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scrollback::types::BlockContext;
+
+    fn ctx() -> BlockContext {
+        BlockContext {
+            width: 80,
+            mode: DisplayMode::Collapsed,
+            is_running: false,
+            raw: false,
+            max_lines: None,
+            appearance: Default::default(),
+            is_selected: false,
+            cwd: None,
+        }
+    }
+
+    fn header_text(block: &ListDirToolCallBlock) -> String {
+        block.output(&ctx()).lines[0]
+            .content
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn collapsed_header_shows_entry_count() {
+        let block = ListDirToolCallBlock::new("src").with_output("a.rs\nb.rs\nsub/\n");
+        assert_eq!(header_text(&block), "List src (3 entries)");
+
+        let single = ListDirToolCallBlock::new("src").with_output("lonely.rs\n");
+        assert_eq!(header_text(&single), "List src (1 entry)");
+    }
+
+    #[test]
+    fn collapsed_header_omits_count_when_empty_or_failed() {
+        let empty = ListDirToolCallBlock::new("src");
+        assert_eq!(header_text(&empty), "List src");
+
+        let failed = ListDirToolCallBlock::new("gone").with_error("no such directory");
+        assert_eq!(header_text(&failed), "List gone");
     }
 }

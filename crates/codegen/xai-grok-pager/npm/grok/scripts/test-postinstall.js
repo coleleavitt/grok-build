@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Tests for the versioned-binary + symlink installation logic used by
-// postinstall.js and the bin/grok trampoline.
+// postinstall.js and bin/grok-bootstrap.js.
 //
 // Run with:  node scripts/test-postinstall.js
 //
@@ -9,6 +9,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const zlib = require('zlib');
 const assert = require('assert');
 
 let passed = 0;
@@ -34,16 +35,18 @@ function cleanup(dir) {
     fs.rmSync(dir, { recursive: true, force: true });
 }
 
-// ─── Extracted logic (mirrors postinstall.js and bin/grok exactly) ─────
+// ─── Extracted logic (mirrors postinstall.js and bin/grok-bootstrap.js) ─
 
-/** Semver-aware descending sort for "grok-X.Y.Z" filenames. */
-function semverSortDescending(a, b) {
-    const pa = a.slice(5).split('.').map(Number);
-    const pb = b.slice(5).split('.').map(Number);
-    for (let i = 0; i < 3; i++) {
-        if ((pa[i] || 0) !== (pb[i] || 0)) return (pb[i] || 0) - (pa[i] || 0);
-    }
-    return 0;
+/** Comparator: sort "<prefix>X.Y.Z" filenames by version, newest first. */
+function byVersionDescending(prefix) {
+    return (a, b) => {
+        const pa = a.slice(prefix.length).split('.').map(Number);
+        const pb = b.slice(prefix.length).split('.').map(Number);
+        for (let i = 0; i < 3; i++) {
+            if ((pa[i] || 0) !== (pb[i] || 0)) return (pb[i] || 0) - (pa[i] || 0);
+        }
+        return 0;
+    };
 }
 
 /** Install a versioned binary + atomic symlink (same as postinstall.js). */
@@ -78,7 +81,7 @@ function cleanupOldVersions(canonicalDir, currentVersionedName) {
     const entries = fs.readdirSync(canonicalDir);
     const versionedBinaries = entries
         .filter(e => e.startsWith('grok-') && !e.includes('.tmp.') && !e.includes('.link.') && e !== currentVersionedName)
-        .sort(semverSortDescending);
+        .sort(byVersionDescending('grok-'));
     // Keep the most recent old version, remove anything older.
     for (const old of versionedBinaries.slice(1)) {
         try { fs.unlinkSync(path.join(canonicalDir, old)); } catch {}
@@ -86,7 +89,61 @@ function cleanupOldVersions(canonicalDir, currentVersionedName) {
     return versionedBinaries;
 }
 
-/** Bootstrap canonical from vendored (same as bin/grok trampoline). */
+/** Grok bin dir resolution (mirrors postinstall.js and bin/grok-bootstrap.js). */
+function resolveGrokBinDir(env, homedir) {
+    const grokHome = env.GROK_HOME ?? path.join(homedir, '.grok');
+    return path.join(grokHome, 'bin');
+}
+
+/** Write the shipped binary to destPath (mirrors writeVendorBinary). */
+function writeVendorBinary(brotliPath, binaryPath, destPath) {
+    const tmp = destPath + `.tmp.${process.pid}`;
+    try {
+        if (fs.existsSync(brotliPath)) {
+            fs.writeFileSync(tmp, zlib.brotliDecompressSync(fs.readFileSync(brotliPath)));
+        } else if (fs.existsSync(binaryPath)) {
+            fs.copyFileSync(binaryPath, tmp);
+        } else {
+            return false;
+        }
+        fs.chmodSync(tmp, 0o755);
+        fs.renameSync(tmp, destPath);
+        return true;
+    } catch {
+        return false;
+    } finally {
+        try { fs.unlinkSync(tmp); } catch {}
+    }
+}
+
+/** Decompress a compressed binary into the bin dir (mirrors installBinary). */
+function installBinaryFromBrotli(brotliPath, version, canonicalDir) {
+    fs.mkdirSync(canonicalDir, { recursive: true });
+    const versionedName = `grok-${version}`;
+    const versionedPath = path.join(canonicalDir, versionedName);
+    const canonicalPath = path.join(canonicalDir, 'grok');
+
+    if (!fs.existsSync(versionedPath)) {
+        const tmpPath = versionedPath + `.tmp.${process.pid}`;
+        try {
+            const decompressed = zlib.brotliDecompressSync(fs.readFileSync(brotliPath));
+            fs.writeFileSync(tmpPath, decompressed);
+            fs.chmodSync(tmpPath, 0o755);
+            fs.renameSync(tmpPath, versionedPath);
+        } finally {
+            try { fs.unlinkSync(tmpPath); } catch {}
+        }
+    }
+
+    const tmpLink = canonicalPath + `.link.${process.pid}`;
+    try { fs.unlinkSync(tmpLink); } catch {}
+    fs.symlinkSync(versionedName, tmpLink);
+    fs.renameSync(tmpLink, canonicalPath);
+
+    return { canonicalPath, versionedPath, versionedName };
+}
+
+/** Install the shipped binary into the bin dir (same as bin/grok-bootstrap.js). */
 function bootstrapCanonical(vendoredBinPath, version, canonicalDir) {
     const canonicalPath = path.join(canonicalDir, 'grok');
     try {
@@ -458,9 +515,9 @@ test('semver sort: minor version boundary (0.1.x vs 0.2.x)', () => {
     }
 });
 
-test('semverSortDescending: unit test comparator directly', () => {
+test('byVersionDescending: unit test comparator directly', () => {
     const input = ['grok-0.1.9', 'grok-0.1.10', 'grok-0.1.2', 'grok-1.0.0', 'grok-0.2.0'];
-    const sorted = [...input].sort(semverSortDescending);
+    const sorted = [...input].sort(byVersionDescending('grok-'));
     assert.deepStrictEqual(sorted, [
         'grok-1.0.0',
         'grok-0.2.0',
@@ -471,10 +528,10 @@ test('semverSortDescending: unit test comparator directly', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// Bootstrap (trampoline) Tests
+// Bootstrap Tests
 // ═══════════════════════════════════════════════════════════════════════
 
-console.log('\nbootstrap (trampoline) tests\n');
+console.log('\nbootstrap tests\n');
 
 test('bootstrapCanonical creates versioned binary from vendored', () => {
     const dir = makeTmpDir();
@@ -550,7 +607,7 @@ test('bootstrapCanonical works when canonical already exists (different version)
         fs.writeFileSync(vendored1, 'v1');
         installVersionedBinary(vendored1, '0.1.140', binDir);
 
-        // Bootstrap with v2 (simulates trampoline running a newer vendored binary)
+        // Bootstrap with v2 (simulates the launcher running a newer vendored binary)
         const vendored2 = path.join(dir, 'vendored-v2');
         fs.writeFileSync(vendored2, 'v2');
         const result = bootstrapCanonical(vendored2, '0.1.141', binDir);
@@ -674,14 +731,7 @@ function cleanupOldVersionsNamed(canonicalDir, binName, version) {
             const suffix = e.slice(prefix.length);
             return /^\d/.test(suffix);
         })
-        .sort((a, b) => {
-            const pa = a.slice(prefix.length).split('.').map(Number);
-            const pb = b.slice(prefix.length).split('.').map(Number);
-            for (let i = 0; i < 3; i++) {
-                if ((pa[i] || 0) !== (pb[i] || 0)) return (pb[i] || 0) - (pa[i] || 0);
-            }
-            return 0;
-        });
+        .sort(byVersionDescending(prefix));
     for (const old of versionedBinaries.slice(1)) {
         try { fs.unlinkSync(path.join(canonicalDir, old)); } catch {}
     }
@@ -976,6 +1026,145 @@ test('canonical pager from non-npm install is preserved on Linux', () => {
         cleanup(dir);
     }
 });
+
+console.log('\ngrok home + brotli install tests\n');
+
+test('resolveGrokBinDir honors $GROK_HOME, else falls back to <home>/.grok/bin', () => {
+    assert.strictEqual(
+        resolveGrokBinDir({ GROK_HOME: '/fast/local/.grok' }, '/home/alice'),
+        path.join('/fast/local/.grok', 'bin'),
+    );
+    assert.strictEqual(
+        resolveGrokBinDir({}, '/home/alice'),
+        path.join('/home/alice', '.grok', 'bin'),
+    );
+    assert.strictEqual(resolveGrokBinDir({ GROK_HOME: '' }, '/home/alice'), path.join('', 'bin'));
+});
+
+test('writeVendorBinary returns false (not true) when the destination cannot be written', () => {
+    const dir = makeTmpDir();
+    try {
+        const brotliPath = path.join(dir, 'grok.br');
+        fs.writeFileSync(brotliPath, zlib.brotliCompressSync(Buffer.from('binary')));
+
+        // A non-empty directory at destPath makes the final rename fail.
+        const dest = path.join(dir, 'dest');
+        fs.mkdirSync(dest);
+        fs.writeFileSync(path.join(dest, 'child'), 'x');
+
+        assert.strictEqual(writeVendorBinary(brotliPath, path.join(dir, 'raw'), dest), false);
+        assert.ok(!fs.existsSync(`${dest}.tmp.${process.pid}`), 'temp file is cleaned up on failure');
+    } finally {
+        cleanup(dir);
+    }
+});
+
+test('decompresses brotli into the canonical dir without duplicating into node_modules', () => {
+    const dir = makeTmpDir();
+    try {
+        const vendorBin = path.join(dir, 'node_modules', 'bin');
+        fs.mkdirSync(vendorBin, { recursive: true });
+        const brotliPath = path.join(vendorBin, 'grok.br');
+        fs.writeFileSync(brotliPath, zlib.brotliCompressSync(Buffer.from('native-binary-bytes')));
+
+        const binDir = path.join(dir, '.grok', 'bin');
+        const result = installBinaryFromBrotli(brotliPath, '0.1.220', binDir);
+
+        assert.ok(fs.lstatSync(result.canonicalPath).isSymbolicLink());
+        assert.strictEqual(fs.readFileSync(result.canonicalPath, 'utf8'), 'native-binary-bytes');
+        assert.ok(!fs.existsSync(path.join(vendorBin, 'grok')), 'no uncompressed binary in node_modules');
+        assert.ok(fs.existsSync(brotliPath), 'compressed .br payload is preserved');
+    } finally {
+        cleanup(dir);
+    }
+});
+
+if (process.platform !== 'win32') {
+    console.log('\nbin link tests\n');
+
+    const { spawnSync } = require('child_process');
+
+    /** Extract the native binary beside the entry and link to it (mirrors installBinLink). */
+    function installBinLink(pkgBinDir, vendorBinary) {
+        const nativePath = path.join(pkgBinDir, 'grok-native');
+        if (!writeVendorBinary(vendorBinary + '.br', vendorBinary, nativePath)) {
+            return;
+        }
+        const entryPath = path.join(pkgBinDir, 'grok');
+        const tmp = entryPath + `.link.${process.pid}`;
+        try { fs.unlinkSync(tmp); } catch {}
+        fs.symlinkSync('./grok-native', tmp);
+        fs.renameSync(tmp, entryPath);
+    }
+
+    test('bin entry links to the sibling native binary and launches with args', () => {
+        const dir = makeTmpDir();
+        try {
+            const vendorBinary = path.join(dir, 'platform', 'bin', 'grok');
+            fs.mkdirSync(path.dirname(vendorBinary), { recursive: true });
+            fs.writeFileSync(vendorBinary, '#!/bin/sh\necho "REAL|$@"\n');
+
+            // npm-style layout: the PATH entry is a symlink to the package entry.
+            const pkgBinDir = path.join(dir, 'pkg-bin');
+            const entryPath = path.join(pkgBinDir, 'grok');
+            fs.mkdirSync(pkgBinDir, { recursive: true });
+            fs.writeFileSync(entryPath, '#!/usr/bin/env node\n');
+            const pathEntry = path.join(dir, 'npm-bin', 'grok');
+            fs.mkdirSync(path.dirname(pathEntry), { recursive: true });
+            fs.symlinkSync(entryPath, pathEntry);
+
+            installBinLink(pkgBinDir, vendorBinary);
+
+            assert.ok(fs.lstatSync(entryPath).isSymbolicLink(), 'entry should be a symlink');
+            assert.strictEqual(fs.readlinkSync(entryPath), './grok-native');
+            const res = spawnSync(pathEntry, ['hello', 'a b'], { encoding: 'utf8' });
+            assert.strictEqual(res.status, 0, `launch failed: ${res.stderr}`);
+            assert.strictEqual(res.stdout.trim(), 'REAL|hello a b');
+
+            // Entry and binary share one lifetime: deleting unrelated state
+            // (the grok home) cannot dangle the entry.
+            const res2 = spawnSync(pathEntry, ['x'], { encoding: 'utf8' });
+            assert.strictEqual(res2.stdout.trim(), 'REAL|x');
+        } finally {
+            cleanup(dir);
+        }
+    });
+
+    test('replacing the entry twice leaves one valid link and no temp files', () => {
+        const dir = makeTmpDir();
+        try {
+            const vendorBinary = path.join(dir, 'vendor', 'grok');
+            fs.mkdirSync(path.dirname(vendorBinary), { recursive: true });
+            fs.writeFileSync(vendorBinary, 'binary');
+            const entryPath = path.join(dir, 'grok');
+            fs.writeFileSync(entryPath, '#!/usr/bin/env node\n');
+
+            installBinLink(dir, vendorBinary);
+            installBinLink(dir, vendorBinary);
+
+            assert.ok(fs.lstatSync(entryPath).isSymbolicLink());
+            assert.strictEqual(fs.readFileSync(entryPath, 'utf8'), 'binary');
+            assert.strictEqual(fs.readdirSync(dir).filter(e => e.includes('.link.') || e.includes('.tmp.')).length, 0, 'no temp files left');
+        } finally {
+            cleanup(dir);
+        }
+    });
+
+    test('mirrored link matches postinstall.js and the shipped entry wires the bootstrap', () => {
+        const pkgRoot = path.join(__dirname, '..');
+        const postinstall = fs.readFileSync(path.join(pkgRoot, 'bin', 'postinstall.js'), 'utf8');
+        for (const line of [
+            "if (!(process.env.npm_config_user_agent ?? '').startsWith('npm/')) return;",
+            "fs.symlinkSync('./grok-native', tmp);",
+        ]) {
+            assert.ok(postinstall.includes(line), `postinstall.js lost link line: ${line}`);
+        }
+        const launcher = fs.readFileSync(path.join(pkgRoot, 'bin', 'grok'), 'utf8');
+        assert.ok(launcher.startsWith('#!/usr/bin/env node'), 'shipped entry must stay a node script for Windows cmd shims');
+        assert.ok(launcher.includes("require('./grok-bootstrap.js')"), 'entry must run the bootstrap');
+        assert.ok(fs.existsSync(path.join(pkgRoot, 'bin', 'grok-bootstrap.js')), 'bootstrap must ship in bin/');
+    });
+}
 
 // ─── Summary ───────────────────────────────────────────────────────────
 

@@ -1,16 +1,11 @@
-//! `x.ai/memory/flush`, `x.ai/memory/rewrite`, and `x.ai/compact_conversation`
-//! extension handlers.
-//!
-//! - `compact_conversation`: trigger an on-demand compaction for a session.
-//! - `memory/flush`: trigger an on-demand memory flush for a session.
-//! - `memory/rewrite`: rewrite a raw memory note into structured markdown via
-//!   a one-shot LLM call.
+//! Extension handlers for `x.ai/compact_conversation`, `x.ai/memory/flush`, and `x.ai/memory/rewrite`.
+//! `memory/rewrite` turns a raw memory note into structured markdown with a one-shot LLM call.
 
 use agent_client_protocol as acp;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use super::{Empty, ExtResult, parse_params, to_ext_response, to_raw_response};
+use super::{ExtResult, parse_params, to_raw_response};
 use crate::agent::MvpAgent;
 use crate::session::{CompactConversationRequest, CompactConversationResponse, SessionCommand};
 
@@ -27,10 +22,8 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 async fn handle_compact(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     let req: CompactConversationRequest = parse_params(args)?;
     // send over the compact query here properly
-    let session_handle = {
-        let sessions = agent.sessions.borrow();
-        sessions.get(&req.session_id.into()).cloned()
-    };
+    let sid: acp::SessionId = req.session_id.into();
+    let session_handle = agent.resident_handle(&sid);
     let (tx, rx) = oneshot::channel();
     if let Some(session) = session_handle {
         let _ = session.cmd_tx.send(SessionCommand::CompactSession {
@@ -38,9 +31,9 @@ async fn handle_compact(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             respond_to: tx,
         });
     }
+    // Pass the session error through; rewrapping buries the detail in a Debug dump.
     rx.await
-        .map_err(|_| acp::Error::internal_error().data("session failed to respond"))?
-        .map_err(|e| acp::Error::internal_error().data(format!("Internal error: {:?}", e)))?;
+        .map_err(|_| acp::Error::internal_error().data("session failed to respond"))??;
     to_raw_response(&CompactConversationResponse {})
 }
 
@@ -52,21 +45,24 @@ async fn handle_flush(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 
     let req: MemoryFlushRequest = parse_params(args)?;
     let not_found_err = format!("session not found: {}", req.session_id);
-    let session_handle = {
-        let sessions = agent.sessions.borrow();
-        sessions.get(&req.session_id.into()).cloned()
-    };
-    let Some(session) = session_handle else {
+    let sid: acp::SessionId = req.session_id.into();
+    let Some(session) = agent.resident_handle(&sid) else {
         return Err(acp::Error::invalid_params().data(not_found_err));
     };
     let (tx, rx) = oneshot::channel();
     let _ = session
         .cmd_tx
         .send(SessionCommand::FlushMemory { respond_to: tx });
-    rx.await
+    let flushed = rx
+        .await
         .map_err(|_| acp::Error::internal_error().data("session failed to respond"))?
         .map_err(|e| acp::Error::internal_error().data(format!("{:?}", e)))?;
-    to_ext_response(Ok(Empty {}))
+    to_raw_response(&MemoryFlushResponse { flushed })
+}
+
+#[derive(Serialize)]
+struct MemoryFlushResponse {
+    flushed: bool,
 }
 
 async fn handle_rewrite(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
@@ -80,11 +76,8 @@ async fn handle_rewrite(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 
     let req: RewriteRequest = parse_params(args)?;
     let not_found_err = format!("session not found: {}", req.session_id);
-    let session_handle = {
-        let sessions = agent.sessions.borrow();
-        sessions.get(&req.session_id.into()).cloned()
-    };
-    let Some(session) = session_handle else {
+    let sid: acp::SessionId = req.session_id.into();
+    let Some(session) = agent.resident_handle(&sid) else {
         return Err(acp::Error::invalid_params().data(not_found_err));
     };
     let (tx, rx) = oneshot::channel();

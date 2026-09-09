@@ -1,7 +1,5 @@
-//! `x.ai/marketplace/*` extension handlers.
-//!
-//! Provides marketplace browsing and install endpoints for the pager modal.
-//! Delegates to `xai-grok-plugin-marketplace` crate for scanning and install logic.
+//! Marketplace browsing and install endpoints for the pager modal.
+//! Scanning and install logic live in the `xai-grok-plugin-marketplace` crate.
 
 use agent_client_protocol as acp;
 use xai_hooks_plugins_types::{
@@ -10,6 +8,8 @@ use xai_hooks_plugins_types::{
 };
 
 use crate::agent::MvpAgent;
+use crate::plugin::add_marketplace_source;
+use crate::util::config::acquire_init_lock;
 
 type ExtResult = Result<acp::ExtResponse, acp::Error>;
 
@@ -19,13 +19,13 @@ fn load_filtered_marketplace_sources() -> Vec<xai_grok_plugin_marketplace::Marke
 
 pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
-        "x.ai/marketplace/list" => handle_list(agent, args).await,
+        "x.ai/marketplace/list" => handle_list().await,
         "x.ai/marketplace/action" => handle_action(agent, args).await,
         _ => Err(acp::Error::method_not_found()),
     }
 }
 
-async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+async fn handle_list() -> ExtResult {
     let t0 = std::time::Instant::now();
     let sources = load_filtered_marketplace_sources();
     let source_names: Vec<String> = sources
@@ -83,7 +83,7 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             Some(serde_json::json!({
                 "source_index": i,
                 "source_name": sources[i].name,
-                "scan_ms": 0, // individual timing not available in parallel mode
+                "scan_ms": 0, // per-source timing is unavailable when scans run in parallel
                 "plugin_count": scan.plugins.len(),
                 "catalog_loaded": catalog_loaded,
                 "components_present": components_present,
@@ -94,15 +94,10 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         results.push(scan);
     }
 
-    // Auto-install default-skills entries that aren't already installed.
-    let t_auto = std::time::Instant::now();
-    let session_id = super::parse_session_id(args);
-    auto_install_defaults(agent, &sources, &results, session_id.as_ref(), false).await;
     xai_grok_telemetry::unified_log::info(
         "marketplace handle_list: complete",
         None,
         Some(serde_json::json!({
-            "auto_install_ms": t_auto.elapsed().as_millis() as u64,
             "total_ms": t0.elapsed().as_millis() as u64,
         })),
     );
@@ -117,53 +112,20 @@ async fn handle_action(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 
     let outcome = match req.action {
         MarketplaceAction::Refresh { source_url_or_path } => {
-            // Force re-sync git caches; local sources are re-scanned on next list.
+            // Force re-sync git caches (local sources are re-scanned on next
+            // list) on the blocking pool (LocalSet invariant: plugin/acquire.rs).
             let sources = load_filtered_marketplace_sources();
-            let mut refreshed = 0;
-            let mut errors = Vec::new();
-            for source in &sources {
-                if let Some(ref filter) = source_url_or_path {
-                    let identity = match &source.kind {
-                        xai_grok_plugin_marketplace::SourceKind::Local { path } => {
-                            path.display().to_string()
-                        }
-                        xai_grok_plugin_marketplace::SourceKind::Git { url, .. } => url.clone(),
-                    };
-                    if &identity != filter {
-                        continue;
-                    }
-                }
-                if let xai_grok_plugin_marketplace::SourceKind::Git { url, branch } = &source.kind {
-                    let cache_root = xai_grok_plugin_marketplace::git::default_cache_root();
-                    if let Err(e) = xai_grok_plugin_marketplace::git::force_sync_source_cache(
-                        url,
-                        branch.as_deref(),
-                        &cache_root,
-                    ) {
-                        errors.push(format!("{}: {e}", source.name));
-                    }
-                }
-                refreshed += 1;
-            }
-
-            // Refresh default-skills from all sources.
-            let scan_results: Vec<_> = sources.iter().map(|source| scan_source(source).0).collect();
-            auto_install_defaults(agent, &sources, &scan_results, Some(&sid), true).await;
-
-            let msg = if errors.is_empty() {
-                format!("Refreshed {refreshed} source(s).")
-            } else {
-                format!(
-                    "Refreshed {refreshed} source(s) with {} error(s): {}",
-                    errors.len(),
-                    errors.join("; ")
-                )
-            };
-            xai_hooks_plugins_types::ActionOutcome {
-                status: xai_hooks_plugins_types::OutcomeStatus::Success,
-                message: msg,
-                requires_reload: false,
-                requires_restart: false,
+            let filter = source_url_or_path;
+            match tokio::task::spawn_blocking(move || refresh_sources(&sources, filter.as_deref()))
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => xai_hooks_plugins_types::ActionOutcome {
+                    status: xai_hooks_plugins_types::OutcomeStatus::InternalError,
+                    message: format!("Refresh task failed: {e}"),
+                    requires_reload: false,
+                    requires_restart: false,
+                },
             }
         }
         MarketplaceAction::Install {
@@ -187,123 +149,87 @@ async fn handle_action(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     super::to_ext_response(Ok(outcome))
 }
 
+fn refresh_sources(
+    sources: &[xai_grok_plugin_marketplace::MarketplaceSource],
+    source_url_or_path: Option<&str>,
+) -> xai_hooks_plugins_types::ActionOutcome {
+    let mut refreshed = 0;
+    let mut errors = Vec::new();
+    for source in sources {
+        if let Some(filter) = source_url_or_path
+            && source.identity() != filter
+        {
+            continue;
+        }
+        if let xai_grok_plugin_marketplace::SourceKind::Git { url, branch } = &source.kind {
+            let cache_root = xai_grok_plugin_marketplace::git::default_cache_root();
+            if let Err(e) = xai_grok_plugin_marketplace::git::force_sync_source_cache(
+                url,
+                branch.as_deref(),
+                &cache_root,
+            ) {
+                errors.push(format!("{}: {e}", source.name));
+            }
+        }
+        refreshed += 1;
+    }
+
+    let msg = if errors.is_empty() {
+        format!("Refreshed {refreshed} source(s).")
+    } else {
+        format!(
+            "Refreshed {refreshed} source(s) with {} error(s): {}",
+            errors.len(),
+            errors.join("; ")
+        )
+    };
+    xai_hooks_plugins_types::ActionOutcome {
+        status: xai_hooks_plugins_types::OutcomeStatus::Success,
+        message: msg,
+        requires_reload: false,
+        requires_restart: false,
+    }
+}
+
+/// Auto-enable a freshly installed/updated repo's plugins, logging warnings; `post_install_plugin`
+/// polls the config-init flock, so blocking pool only, never the LocalSet.
+async fn run_post_install(repo_key: &str) {
+    let repo_key = repo_key.to_string();
+    let post_warnings =
+        tokio::task::spawn_blocking(move || crate::config::post_install_plugin(&repo_key).1)
+            .await
+            .unwrap_or_else(|e| vec![format!("post-install task failed: {e}")]);
+    for w in &post_warnings {
+        tracing::warn!("{w}");
+    }
+}
+
 async fn handle_update(
     agent: &MvpAgent,
     sid: &acp::SessionId,
     source_url_or_path: &str,
     plugin_relative_path: &str,
 ) -> xai_hooks_plugins_types::ActionOutcome {
-    use xai_grok_plugin_marketplace::installer;
+    use crate::plugin::acquire;
     use xai_hooks_plugins_types::{ActionOutcome, OutcomeStatus};
 
-    let sources = load_filtered_marketplace_sources();
+    // Session-start auto-update fires this once per outdated plugin; acquire::run_marketplace_update
+    // owns the blocking-pool hop (LocalSet invariant: plugin/acquire.rs).
+    let updated = acquire::run_marketplace_update(
+        xai_grok_agent::plugins::install_registry::MarketplaceProvenance {
+            source_url_or_path: source_url_or_path.to_string(),
+            // Refreshed from the resolved source (the wire request carries no
+            // display name).
+            source_display_name: String::new(),
+            plugin_subdir: plugin_relative_path.to_string(),
+        },
+        true,
+    )
+    .await;
 
-    let source_identity = |s: &xai_grok_plugin_marketplace::MarketplaceSource| -> String {
-        match &s.kind {
-            xai_grok_plugin_marketplace::SourceKind::Local { path } => path.display().to_string(),
-            xai_grok_plugin_marketplace::SourceKind::Git { url, .. } => url.clone(),
-        }
-    };
-
-    let source = match sources
-        .iter()
-        .find(|s| source_identity(s) == source_url_or_path)
-    {
-        Some(s) => s,
-        None => {
-            return ActionOutcome {
-                status: OutcomeStatus::NotFound,
-                message: format!("Marketplace source not found: {source_url_or_path}"),
-                requires_reload: false,
-                requires_restart: false,
-            };
-        }
-    };
-
-    let plugin_path =
-        match xai_grok_plugin_marketplace::MarketplaceRelativePath::parse(plugin_relative_path) {
-            Ok(path) => path,
-            Err(e) => {
-                return ActionOutcome {
-                    status: OutcomeStatus::ValidationError,
-                    message: format!("Invalid plugin path: {e}"),
-                    requires_reload: false,
-                    requires_restart: false,
-                };
-            }
-        };
-    let plugin_relative_path = plugin_path.as_str();
-
-    let marketplace_lease;
-    let marketplace_root = match &source.kind {
-        xai_grok_plugin_marketplace::SourceKind::Local { path } => {
-            marketplace_lease = None;
-            path.clone()
-        }
-        xai_grok_plugin_marketplace::SourceKind::Git { url, branch } => {
-            let cache_root = xai_grok_plugin_marketplace::git::default_cache_root();
-            match xai_grok_plugin_marketplace::git::sync_source_cache_with_mode(
-                url,
-                branch.as_deref(),
-                &cache_root,
-                xai_grok_plugin_marketplace::git::SyncMode::Force,
-            ) {
-                Ok(lease) => {
-                    let path = lease.path.clone();
-                    marketplace_lease = Some(lease);
-                    path
-                }
-                Err(e) => {
-                    return ActionOutcome {
-                        status: OutcomeStatus::InternalError,
-                        message: format!("Git sync failed: {e}"),
-                        requires_reload: false,
-                        requires_restart: false,
-                    };
-                }
-            }
-        }
-    };
-
-    let scan = xai_grok_plugin_marketplace::scan_marketplace(&marketplace_root);
-    let entry = match scan
-        .entries
-        .into_iter()
-        .find(|entry| entry.relative_path == plugin_relative_path)
-    {
-        Some(entry) => entry,
-        None => {
-            return ActionOutcome {
-                status: OutcomeStatus::NotFound,
-                message: format!("Marketplace plugin not found: {plugin_relative_path}"),
-                requires_reload: false,
-                requires_restart: false,
-            };
-        }
-    };
-
-    let provenance = xai_grok_agent::plugins::install_registry::MarketplaceProvenance {
-        source_url_or_path: source_url_or_path.to_string(),
-        source_display_name: source.name.clone(),
-        plugin_subdir: plugin_relative_path.to_string(),
-    };
-    let mut registry = xai_grok_agent::plugins::install_registry::InstallRegistry::load();
-    let require_sha = crate::plugin::marketplace_require_sha();
-    let update_result = installer::update_from_marketplace_entry_transactional(
-        &marketplace_root,
-        &entry,
-        provenance,
-        &mut registry,
-        require_sha,
-    );
-    drop(marketplace_lease);
-
-    match update_result {
+    match updated {
         Ok(result) => {
-            let (_, post_warnings) = crate::config::post_install_plugin(&result.repo_key);
-            for w in &post_warnings {
-                tracing::warn!("{w}");
-            }
+            run_post_install(&result.repo_key).await;
             let reload_outcome = agent
                 .execute_plugins_action(sid, xai_hooks_plugins_types::PluginsAction::Reload)
                 .await;
@@ -323,248 +249,163 @@ async fn handle_update(
                 requires_restart: false,
             }
         }
-        Err(xai_grok_agent::plugins::install_registry::InstallError::PluginNotFound { .. }) => {
-            ActionOutcome {
-                status: OutcomeStatus::NotFound,
-                message: format!(
-                    "Plugin not installed from this marketplace source: {plugin_relative_path}"
-                ),
-                requires_reload: false,
-                requires_restart: false,
-            }
-        }
-        Err(e) => ActionOutcome {
-            status: OutcomeStatus::InternalError,
-            message: format!("Update failed: {e}"),
-            requires_reload: false,
-            requires_restart: false,
-        },
+        Err(e) => update_error_outcome(e),
     }
 }
+
+/// Map an Update acquisition failure to its user-facing [`ActionOutcome`].
+fn update_error_outcome(
+    e: crate::plugin::acquire::RunError<crate::plugin::acquire::UpdateAcquireError>,
+) -> xai_hooks_plugins_types::ActionOutcome {
+    use crate::plugin::acquire::{RunError, UpdateAcquireError};
+    use xai_grok_agent::plugins::install_registry::InstallError;
+    use xai_hooks_plugins_types::OutcomeStatus;
+
+    match e {
+        RunError::Op(e) => match e {
+            UpdateAcquireError::Blocked { reason } => {
+                action_outcome(OutcomeStatus::ValidationError, reason)
+            }
+            UpdateAcquireError::NotConfigured { message } => {
+                action_outcome(OutcomeStatus::NotFound, message)
+            }
+            UpdateAcquireError::EntryNotFound {
+                plugin_relative_path,
+            } => action_outcome(
+                OutcomeStatus::NotFound,
+                format!("Marketplace plugin not found: {plugin_relative_path}"),
+            ),
+            UpdateAcquireError::InvalidPluginPath { detail } => action_outcome(
+                OutcomeStatus::ValidationError,
+                format!("Invalid plugin path: {detail}"),
+            ),
+            UpdateAcquireError::Sync { detail } => action_outcome(
+                OutcomeStatus::InternalError,
+                format!("Git sync failed: {detail}"),
+            ),
+            UpdateAcquireError::Install(InstallError::PluginNotFound { name }) => action_outcome(
+                OutcomeStatus::NotFound,
+                format!("Plugin not installed from this marketplace source: {name}"),
+            ),
+            UpdateAcquireError::Install(e) => {
+                action_outcome(OutcomeStatus::InternalError, format!("Update failed: {e}"))
+            }
+        },
+        RunError::RegistryLock { detail } => action_outcome(
+            OutcomeStatus::InternalError,
+            format!("Another plugin operation is in progress: {detail}"),
+        ),
+        RunError::TaskJoin(e) => action_outcome(
+            OutcomeStatus::InternalError,
+            format!("Update task failed: {e}"),
+        ),
+    }
+}
+
 async fn handle_install(
     agent: &MvpAgent,
     sid: &acp::SessionId,
     source_url_or_path: &str,
     plugin_relative_path: &str,
 ) -> xai_hooks_plugins_types::ActionOutcome {
-    use xai_grok_plugin_marketplace::installer;
+    use crate::plugin::acquire;
     use xai_hooks_plugins_types::{ActionOutcome, OutcomeStatus};
 
-    let sources = load_filtered_marketplace_sources();
+    // acquire::run_marketplace_install owns the blocking-pool hop (LocalSet
+    // invariant: plugin/acquire.rs).
+    let installed = acquire::run_marketplace_install(
+        source_url_or_path.to_string(),
+        plugin_relative_path.to_string(),
+    )
+    .await;
 
-    // Helper: get canonical URL/path for a source.
-    let source_identity = |s: &xai_grok_plugin_marketplace::MarketplaceSource| -> String {
-        match &s.kind {
-            xai_grok_plugin_marketplace::SourceKind::Local { path } => path.display().to_string(),
-            xai_grok_plugin_marketplace::SourceKind::Git { url, .. } => url.clone(),
-        }
-    };
-
-    let source = match sources
-        .iter()
-        .find(|s| source_identity(s) == source_url_or_path)
-    {
-        Some(s) => s,
-        None => {
-            return ActionOutcome {
-                status: OutcomeStatus::NotFound,
-                message: format!("Marketplace source not found: {source_url_or_path}"),
+    match installed {
+        Ok(acquire::Installed {
+            repo_key,
+            source_name,
+            plugin_relative_path,
+        }) => {
+            // Auto-enable installed plugin so it's active after reload.
+            run_post_install(&repo_key).await;
+            let reload_outcome = agent
+                .execute_plugins_action(sid, xai_hooks_plugins_types::PluginsAction::Reload)
+                .await;
+            let mut msg =
+                format!("Installed from {source_name}: {plugin_relative_path} (key: {repo_key})");
+            if reload_outcome.is_none() {
+                msg.push_str("\nRestart or run /plugins reload to activate the plugin.");
+            }
+            ActionOutcome {
+                status: OutcomeStatus::Success,
+                message: msg,
                 requires_reload: false,
                 requires_restart: false,
-            };
+            }
         }
-    };
+        Err(e) => install_error_outcome(e),
+    }
+}
 
-    // Check if this is a URL-sourced plugin by scanning the marketplace index.
-    let (scan, _) = scan_source(source);
-    let remote_entry = scan
-        .plugins
-        .iter()
-        .find(|p| p.relative_path == plugin_relative_path)
-        .and_then(|p| {
-            p.remote_url.as_ref().map(|url| {
-                (
-                    url.clone(),
-                    p.remote_ref.clone(),
-                    p.remote_sha.clone(),
-                    p.remote_subdir.clone(),
+/// Map an Install acquisition failure to its user-facing [`ActionOutcome`].
+fn install_error_outcome(
+    e: crate::plugin::acquire::RunError<crate::plugin::acquire::InstallAcquireError>,
+) -> xai_hooks_plugins_types::ActionOutcome {
+    use crate::plugin::acquire::{EntryInstallError, InstallAcquireError, RunError};
+    use xai_hooks_plugins_types::OutcomeStatus;
+
+    match e {
+        RunError::Op(e) => match e {
+            InstallAcquireError::Blocked { reason } => {
+                action_outcome(OutcomeStatus::ValidationError, reason)
+            }
+            InstallAcquireError::SourceNotFound { source } => action_outcome(
+                OutcomeStatus::NotFound,
+                format!("Marketplace source not found: {source}"),
+            ),
+            InstallAcquireError::AlreadyInstalled { repo_key } => action_outcome(
+                OutcomeStatus::ValidationError,
+                format!("Already installed (key: {repo_key}). Use Update to reinstall."),
+            ),
+            InstallAcquireError::Sync { detail } => action_outcome(
+                OutcomeStatus::InternalError,
+                format!("Git sync failed: {detail}"),
+            ),
+            InstallAcquireError::Entry(EntryInstallError::InvalidPluginPath { detail }) => {
+                action_outcome(
+                    OutcomeStatus::ValidationError,
+                    format!("Invalid plugin path: {detail}"),
                 )
-            })
-        });
+            }
+            InstallAcquireError::Entry(EntryInstallError::PluginDirNotFound { dir }) => {
+                action_outcome(
+                    OutcomeStatus::NotFound,
+                    format!("Plugin directory not found: {}", dir.display()),
+                )
+            }
+            InstallAcquireError::Entry(EntryInstallError::Install(e)) => {
+                action_outcome(OutcomeStatus::InternalError, format!("Install failed: {e}"))
+            }
+        },
+        RunError::RegistryLock { detail } => action_outcome(
+            OutcomeStatus::InternalError,
+            format!("Another plugin operation is in progress: {detail}"),
+        ),
+        RunError::TaskJoin(e) => action_outcome(
+            OutcomeStatus::InternalError,
+            format!("Install task failed: {e}"),
+        ),
+    }
+}
 
-    if let Some((remote_url, remote_ref, remote_sha, remote_subdir)) = remote_entry {
-        // URL-sourced plugin: clone from remote git URL.
-        let provenance = xai_grok_agent::plugins::install_registry::MarketplaceProvenance {
-            source_url_or_path: source_url_or_path.to_string(),
-            source_display_name: source.name.clone(),
-            plugin_subdir: plugin_relative_path.to_string(),
-        };
-        let mut registry = xai_grok_agent::plugins::install_registry::InstallRegistry::load();
-        let require_sha = crate::plugin::marketplace_require_sha();
-        match installer::install_from_remote_url(
-            &remote_url,
-            remote_ref.as_deref(),
-            remote_sha.as_deref(),
-            remote_subdir.as_deref(),
-            plugin_relative_path,
-            provenance,
-            &mut registry,
-            require_sha,
-        ) {
-            Ok(installer::MarketplaceInstallResult::Installed { repo_key }) => {
-                // Auto-enable installed plugin so it's active after reload.
-                let (_, post_warnings) = crate::config::post_install_plugin(&repo_key);
-                for w in &post_warnings {
-                    tracing::warn!("{w}");
-                }
-                let _ = agent
-                    .execute_plugins_action(sid, xai_hooks_plugins_types::PluginsAction::Reload)
-                    .await;
-                ActionOutcome {
-                    status: OutcomeStatus::Success,
-                    message: format!(
-                        "Installed from {}: {plugin_relative_path} (key: {repo_key})",
-                        source.name,
-                    ),
-                    requires_reload: false,
-                    requires_restart: false,
-                }
-            }
-            Ok(installer::MarketplaceInstallResult::AlreadyInstalled { repo_key }) => {
-                ActionOutcome {
-                    status: OutcomeStatus::ValidationError,
-                    message: format!(
-                        "Already installed (key: {repo_key}). Use Update to reinstall."
-                    ),
-                    requires_reload: false,
-                    requires_restart: false,
-                }
-            }
-            Err(e) => ActionOutcome {
-                status: OutcomeStatus::InternalError,
-                message: format!("Install failed: {e}"),
-                requires_reload: false,
-                requires_restart: false,
-            },
-        }
-    } else {
-        // Local-sourced plugin: resolve from marketplace directory.
-        let marketplace_lease;
-        let marketplace_root = match &source.kind {
-            xai_grok_plugin_marketplace::SourceKind::Local { path } => {
-                marketplace_lease = None;
-                path.clone()
-            }
-            xai_grok_plugin_marketplace::SourceKind::Git { url, branch } => {
-                let cache_root = xai_grok_plugin_marketplace::git::default_cache_root();
-                match xai_grok_plugin_marketplace::git::sync_source_cache_with_mode(
-                    url,
-                    branch.as_deref(),
-                    &cache_root,
-                    xai_grok_plugin_marketplace::git::SyncMode::UseTtl,
-                ) {
-                    Ok(lease) => {
-                        let cached_path = lease.path.clone();
-                        marketplace_lease = Some(lease);
-                        cached_path
-                    }
-                    Err(e) => {
-                        return ActionOutcome {
-                            status: OutcomeStatus::InternalError,
-                            message: format!("Git sync failed: {e}"),
-                            requires_reload: false,
-                            requires_restart: false,
-                        };
-                    }
-                }
-            }
-        };
-
-        let plugin_path =
-            match xai_grok_plugin_marketplace::MarketplaceRelativePath::parse(plugin_relative_path)
-            {
-                Ok(path) => path,
-                Err(e) => {
-                    return ActionOutcome {
-                        status: OutcomeStatus::ValidationError,
-                        message: format!("Invalid plugin path: {e}"),
-                        requires_reload: false,
-                        requires_restart: false,
-                    };
-                }
-            };
-        let plugin_dir = match plugin_path.join_under(&marketplace_root) {
-            Ok(path) => path,
-            Err(e) => {
-                return ActionOutcome {
-                    status: OutcomeStatus::ValidationError,
-                    message: format!("Invalid plugin path: {e}"),
-                    requires_reload: false,
-                    requires_restart: false,
-                };
-            }
-        };
-        if !plugin_dir.is_dir() {
-            return ActionOutcome {
-                status: OutcomeStatus::NotFound,
-                message: format!("Plugin directory not found: {}", plugin_dir.display()),
-                requires_reload: false,
-                requires_restart: false,
-            };
-        };
-        let plugin_relative_path = plugin_path.as_str();
-
-        let provenance = xai_grok_agent::plugins::install_registry::MarketplaceProvenance {
-            source_url_or_path: source_url_or_path.to_string(),
-            source_display_name: source.name.clone(),
-            plugin_subdir: plugin_relative_path.to_string(),
-        };
-
-        let mut registry = xai_grok_agent::plugins::install_registry::InstallRegistry::load();
-        let install_result = installer::install_from_marketplace(
-            &marketplace_root,
-            plugin_relative_path,
-            provenance,
-            &mut registry,
-        );
-        drop(marketplace_lease);
-        match install_result {
-            Ok(installer::MarketplaceInstallResult::Installed { repo_key }) => {
-                // Auto-enable installed plugin so it's active after reload.
-                let (_, post_warnings) = crate::config::post_install_plugin(&repo_key);
-                for w in &post_warnings {
-                    tracing::warn!("{w}");
-                }
-                let _ = agent
-                    .execute_plugins_action(sid, xai_hooks_plugins_types::PluginsAction::Reload)
-                    .await;
-                ActionOutcome {
-                    status: OutcomeStatus::Success,
-                    message: format!(
-                        "Installed from {}: {plugin_relative_path} (key: {repo_key})",
-                        source.name,
-                    ),
-                    requires_reload: false,
-                    requires_restart: false,
-                }
-            }
-            Ok(installer::MarketplaceInstallResult::AlreadyInstalled { repo_key }) => {
-                ActionOutcome {
-                    status: OutcomeStatus::ValidationError,
-                    message: format!(
-                        "Already installed (key: {repo_key}). Use Update to reinstall."
-                    ),
-                    requires_reload: false,
-                    requires_restart: false,
-                }
-            }
-            Err(e) => ActionOutcome {
-                status: OutcomeStatus::InternalError,
-                message: format!("Install failed: {e}"),
-                requires_reload: false,
-                requires_restart: false,
-            },
-        }
+fn action_outcome(
+    status: xai_hooks_plugins_types::OutcomeStatus,
+    message: String,
+) -> xai_hooks_plugins_types::ActionOutcome {
+    xai_hooks_plugins_types::ActionOutcome {
+        status,
+        message,
+        requires_reload: false,
+        requires_restart: false,
     }
 }
 
@@ -574,9 +415,52 @@ async fn handle_uninstall(
     source_url_or_path: &str,
     plugin_relative_path: &str,
 ) -> xai_hooks_plugins_types::ActionOutcome {
+    use xai_hooks_plugins_types::OutcomeStatus;
+
+    // Registry + fs work on the blocking pool under the registry flock
+    // (never block the LocalSet on fs or the flock poll).
+    let source = source_url_or_path.to_string();
+    let path = plugin_relative_path.to_string();
+    let outcome = match tokio::task::spawn_blocking(move || uninstall_locked(&source, &path)).await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            return action_outcome(
+                OutcomeStatus::InternalError,
+                format!("Uninstall task failed: {e}"),
+            );
+        }
+    };
+    if outcome.status != OutcomeStatus::Success {
+        return outcome;
+    }
+
+    // Trigger plugin reload so the removed plugin disappears from the session.
+    let _ = agent
+        .execute_plugins_action(sid, xai_hooks_plugins_types::PluginsAction::Reload)
+        .await;
+
+    outcome
+}
+
+/// Blocking core of [`handle_uninstall`], whole window under the registry
+/// flock; save failures surface (an unpersisted deregister is not success).
+fn uninstall_locked(
+    source_url_or_path: &str,
+    plugin_relative_path: &str,
+) -> xai_hooks_plugins_types::ActionOutcome {
     use xai_grok_plugin_marketplace::installer;
     use xai_hooks_plugins_types::{ActionOutcome, OutcomeStatus};
 
+    let _registry_lock = match crate::plugin::acquire::lock_install_registry() {
+        Ok(lock) => lock,
+        Err(detail) => {
+            return action_outcome(
+                OutcomeStatus::InternalError,
+                format!("Another plugin operation is in progress: {detail}"),
+            );
+        }
+    };
     let mut registry = xai_grok_agent::plugins::install_registry::InstallRegistry::load();
 
     // Find the installed entry by marketplace provenance.
@@ -622,125 +506,11 @@ async fn handle_uninstall(
         };
     }
 
-    // Trigger plugin reload so the removed plugin disappears from the session.
-    let _ = agent
-        .execute_plugins_action(sid, xai_hooks_plugins_types::PluginsAction::Reload)
-        .await;
-
     ActionOutcome {
         status: OutcomeStatus::Success,
         message: format!("Uninstalled {plugin_relative_path} (key: {repo_key})"),
         requires_reload: false,
         requires_restart: false,
-    }
-}
-
-/// Auto-install or refresh `default-skills` entries from marketplace sources.
-///
-/// When `force_refresh` is false, only installs if not already present.
-/// When `force_refresh` is true, removes and re-copies from source.
-async fn auto_install_defaults(
-    agent: &MvpAgent,
-    sources: &[xai_grok_plugin_marketplace::MarketplaceSource],
-    results: &[MarketplaceScanResult],
-    session_id: Option<&acp::SessionId>,
-    force_refresh: bool,
-) {
-    use xai_grok_plugin_marketplace::installer;
-
-    let mut any_changed = false;
-
-    for (source, scan) in sources.iter().zip(results.iter()) {
-        // Find the default-skills entry.
-        let default_entry = scan
-            .plugins
-            .iter()
-            .find(|p| p.relative_path == "default-skills");
-        let Some(entry) = default_entry else {
-            continue;
-        };
-        // Skip if no components.
-        if entry.skill_count == 0 && !entry.has_hooks && !entry.has_agents && !entry.has_mcp {
-            continue;
-        }
-
-        // Resolve marketplace root.
-        let marketplace_lease;
-        let marketplace_root = match &source.kind {
-            xai_grok_plugin_marketplace::SourceKind::Local { path } => {
-                marketplace_lease = None;
-                path.clone()
-            }
-            xai_grok_plugin_marketplace::SourceKind::Git { url, branch } => {
-                let cache_root = xai_grok_plugin_marketplace::git::default_cache_root();
-                match xai_grok_plugin_marketplace::git::sync_source_cache_with_mode(
-                    url,
-                    branch.as_deref(),
-                    &cache_root,
-                    if force_refresh {
-                        xai_grok_plugin_marketplace::git::SyncMode::Force
-                    } else {
-                        xai_grok_plugin_marketplace::git::SyncMode::UseTtl
-                    },
-                ) {
-                    Ok(lease) => {
-                        let cached_path = lease.path.clone();
-                        marketplace_lease = Some(lease);
-                        cached_path
-                    }
-                    Err(_) => continue,
-                }
-            }
-        };
-
-        // Check if already installed.
-        let mut reg = xai_grok_agent::plugins::install_registry::InstallRegistry::load();
-        let existing = installer::find_installed_marketplace_plugin(
-            &reg,
-            &scan.source_url_or_path,
-            "default-skills",
-        );
-        if existing.is_some() && !force_refresh {
-            // Already installed and not forcing refresh — skip.
-            continue;
-        }
-        // Remove old copy if present (refresh or reinstall).
-        if let Some((existing_key, _)) = existing {
-            let old_dir = reg.install_dir().join(&existing_key);
-            let _ = std::fs::remove_dir_all(&old_dir);
-            reg.remove(&existing_key);
-            let _ = reg.save();
-            reg = xai_grok_agent::plugins::install_registry::InstallRegistry::load();
-        }
-
-        let provenance = xai_grok_agent::plugins::install_registry::MarketplaceProvenance {
-            source_url_or_path: scan.source_url_or_path.clone(),
-            source_display_name: source.name.clone(),
-            plugin_subdir: "default-skills".to_string(),
-        };
-
-        let install_result = installer::install_from_marketplace(
-            &marketplace_root,
-            "default-skills",
-            provenance,
-            &mut reg,
-        );
-        drop(marketplace_lease);
-        if let Ok(installer::MarketplaceInstallResult::Installed { repo_key }) = install_result {
-            tracing::info!(
-                source = %source.name,
-                repo_key = %repo_key,
-                "auto-installed/refreshed default-skills from marketplace"
-            );
-            any_changed = true;
-        }
-    }
-
-    // Trigger plugin reload if we auto-installed anything.
-    if any_changed && let Some(sid) = session_id {
-        let _ = agent
-            .execute_plugins_action(sid, xai_hooks_plugins_types::PluginsAction::Reload)
-            .await;
     }
 }
 
@@ -904,8 +674,7 @@ async fn handle_add_source(url: &str) -> xai_hooks_plugins_types::ActionOutcome 
     let cwd = std::env::current_dir().unwrap_or_default();
     let input = plugin::classify_marketplace_add_input(url, &cwd);
 
-    // Fail fast on missing local paths: without this, a path input would be
-    // stored as a git URL and only error after network clone attempts.
+    // Fail fast on a missing local path: stored as a git URL, it would only error after network clone attempts
     if let MarketplaceAddInput::LocalPath(path) = &input
         && !path.is_dir()
     {
@@ -925,29 +694,27 @@ async fn handle_add_source(url: &str) -> xai_hooks_plugins_types::ActionOutcome 
         MarketplaceAddInput::LocalPath(p) => p.display().to_string(),
     };
 
-    // Local paths never match the git-URL allowlist, so a restricted
-    // strictKnownMarketplaces policy blocks them — intentionally fail-closed.
     let allowlist =
         &xai_grok_workspace::permission::resolution::managed_settings().marketplace_allowlist;
-    if allowlist.is_restricted() && !allowlist.is_url_allowed(&identity) {
+    if let Some(reason) = allowlist.add_block_reason(&identity) {
         return ActionOutcome {
             status: OutcomeStatus::ValidationError,
-            message: format!("Marketplace source blocked: {}", allowlist.block_reason()),
+            message: format!("Marketplace source blocked: {reason}"),
             requires_reload: false,
             requires_restart: false,
         };
     }
 
-    let config = crate::config::load_effective_config()
-        .ok()
-        .unwrap_or(toml::Value::Table(toml::map::Map::new()));
-    let existing = xai_grok_plugin_marketplace::load_sources(&config);
+    // Dedupe against the FULL unfiltered source list (config + settings
+    // extras + managed pins) by canonical git-URL identity.
+    let existing = crate::plugin::load_marketplace_sources();
     let already_configured = match &input {
         MarketplaceAddInput::GitUrl(git_url) => {
-            let normalized = git_url.trim_end_matches(".git");
+            use xai_grok_workspace::permission::resolution::normalize_git_url;
+            let normalized = normalize_git_url(git_url);
             existing.iter().any(|s| {
                 matches!(&s.kind, xai_grok_plugin_marketplace::SourceKind::Git { url: u, .. }
-                    if u.trim_end_matches(".git") == normalized)
+                    if normalize_git_url(u) == normalized)
             })
         }
         MarketplaceAddInput::LocalPath(path) => existing.iter().any(|s| {
@@ -964,6 +731,38 @@ async fn handle_add_source(url: &str) -> xai_hooks_plugins_types::ActionOutcome 
         };
     }
 
+    // Reject URLs that aren't reachable git repos (e.g. MCP endpoints pasted into the wrong tab) before persisting.
+    // The probe blocks on a git subprocess, so run it off the LocalSet
+    if let MarketplaceAddInput::GitUrl(git_url) = &input {
+        let probe_url = git_url.clone();
+        let probe = tokio::task::spawn_blocking(move || {
+            xai_grok_plugin_marketplace::git::probe_git_remote(&probe_url)
+        })
+        .await;
+        match probe {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return ActionOutcome {
+                    status: OutcomeStatus::ValidationError,
+                    message: format!(
+                        "{e}. Not a reachable git repository — to add it anyway (e.g. a \
+                         VPN-gated host), run: grok plugin marketplace add {url} --force"
+                    ),
+                    requires_reload: false,
+                    requires_restart: false,
+                };
+            }
+            Err(e) => {
+                return ActionOutcome {
+                    status: OutcomeStatus::InternalError,
+                    message: format!("Probe task failed: {e}"),
+                    requires_reload: false,
+                    requires_restart: false,
+                };
+            }
+        }
+    }
+
     let is_official = matches!(&input, MarketplaceAddInput::GitUrl(u)
         if xai_grok_plugin_marketplace::is_official_source_url(u));
     let name = if is_official {
@@ -975,14 +774,23 @@ async fn handle_add_source(url: &str) -> xai_hooks_plugins_types::ActionOutcome 
         }
     };
 
-    // Run the write under SAVE_LOCK + flock, off the reactor.
+    // Run the write under the config write guard (SAVE_LOCK + init flock), off the reactor; an
+    // unguarded add is exactly the read-modify-write race the guard prevents.
     let config_path = xai_grok_config::grok_home().join("config.toml");
-    let grok_home = xai_grok_config::grok_home();
-    let _save_guard = crate::util::config::lock_config_writes().await;
+    let _save_guard = match crate::util::config::lock_config_writes().await {
+        Ok(guard) => guard,
+        Err(e) => {
+            return ActionOutcome {
+                status: OutcomeStatus::InternalError,
+                message: format!("Another config write is in progress: {e}"),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
+    };
     let write = {
         let name = name.clone();
         tokio::task::spawn_blocking(move || {
-            let _flock = acquire_init_lock(&grok_home).ok();
             add_marketplace_source(&config_path, &name, &input, is_official)
         })
         .await
@@ -1015,95 +823,23 @@ async fn handle_add_source(url: &str) -> xai_hooks_plugins_types::ActionOutcome 
     }
 }
 
-/// Append a `[[marketplace.sources]]` entry (and optionally set the official
-/// flag) in one atomic `toml_edit` write, so a crash can't leave a source
-/// without its flag. Idempotent on normalized git URL / local path; preserves
-/// comments.
-fn add_marketplace_source(
-    config_path: &std::path::Path,
-    name: &str,
-    source: &crate::plugin::MarketplaceAddInput,
-    set_official_flag: bool,
-) -> std::io::Result<()> {
-    if let Some(parent) = config_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let existing = crate::util::config::read_to_string_or_empty(config_path)?;
-    let mut doc = existing.parse::<toml_edit::DocumentMut>().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid TOML: {e}"),
-        )
-    })?;
-
-    let marketplace_item = doc
-        .entry("marketplace")
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-    let marketplace = marketplace_item.as_table_mut().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "[marketplace] is not a table",
-        )
-    })?;
-
-    let sources_item = marketplace
-        .entry("sources")
-        .or_insert_with(|| toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
-    let sources = sources_item.as_array_of_tables_mut().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "[[marketplace.sources]] is not an array of tables",
-        )
-    })?;
-
-    // Skip if the normalized URL / path already exists: the pre-lock dup check
-    // in handle_add_source can let two serialized adds reach here.
-    use crate::plugin::MarketplaceAddInput;
-    let already_present = match source {
-        MarketplaceAddInput::GitUrl(git_url) => {
-            let normalized = git_url.trim_end_matches(".git");
-            sources.iter().any(|t| {
-                t.get("git")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|u| u.trim_end_matches(".git") == normalized)
-            })
-        }
-        MarketplaceAddInput::LocalPath(path) => {
-            let path_str = path.display().to_string();
-            sources.iter().any(|t| {
-                t.get("path")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|p| p == path_str)
-            })
-        }
-    };
-    if !already_present {
-        let mut entry = toml_edit::Table::new();
-        entry["name"] = toml_edit::value(name.to_string());
-        match source {
-            MarketplaceAddInput::GitUrl(git_url) => {
-                entry["git"] = toml_edit::value(git_url.to_string());
-            }
-            MarketplaceAddInput::LocalPath(path) => {
-                entry["path"] = toml_edit::value(path.display().to_string());
-            }
-        }
-        sources.push(entry);
-    }
-
-    if set_official_flag {
-        marketplace["official_marketplace_auto_installed"] = toml_edit::value(true);
-    }
-
-    crate::util::config::atomic_write_string(config_path, &doc.to_string())
-}
-
 /// Remove a marketplace source from `~/.grok/config.toml` and uninstall all
 /// plugins that were installed from it.
 async fn handle_remove_source(source_url_or_path: &str) -> xai_hooks_plugins_types::ActionOutcome {
     let src = source_url_or_path.to_string();
-    // Lock + run the blocking FS work off the reactor.
-    let _save_guard = crate::util::config::lock_config_writes().await;
+    // Guard (SAVE_LOCK + init flock) held across the whole blocking read-modify-write so a
+    // concurrent auto-register can't re-add the source mid-removal.
+    let _save_guard = match crate::util::config::lock_config_writes().await {
+        Ok(guard) => guard,
+        Err(e) => {
+            return xai_hooks_plugins_types::ActionOutcome {
+                status: xai_hooks_plugins_types::OutcomeStatus::InternalError,
+                message: format!("Another config write is in progress: {e}"),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
+    };
     match tokio::task::spawn_blocking(move || remove_source_locked(&src)).await {
         Ok(outcome) => outcome,
         Err(e) => xai_hooks_plugins_types::ActionOutcome {
@@ -1115,81 +851,47 @@ async fn handle_remove_source(source_url_or_path: &str) -> xai_hooks_plugins_typ
     }
 }
 
-/// Sync body of [`handle_remove_source`], run on a blocking thread under the
-/// flock for the whole read-modify-write so a concurrent auto-register can't
-/// re-add the source mid-removal.
+/// Sync body of [`handle_remove_source`]; the caller holds the config write
+/// guard across this whole read-modify-write.
 fn remove_source_locked(source_url_or_path: &str) -> xai_hooks_plugins_types::ActionOutcome {
     use crate::plugin;
     use xai_hooks_plugins_types::{ActionOutcome, OutcomeStatus};
 
     let grok_home = xai_grok_config::grok_home();
-    let _flock = acquire_init_lock(&grok_home).ok();
 
-    let uninstalled = plugin::uninstall_marketplace_source_plugins(source_url_or_path);
-
-    // Remove the source and (if official) set the flag in ONE atomic write so a
-    // crash can't drop the flag and re-add the source next startup.
-    let config_path = grok_home.join("config.toml");
-    let is_official = xai_grok_plugin_marketplace::is_official_source_url(source_url_or_path);
-    let mut removed_from_config = false;
-    let content = match crate::util::config::read_to_string_or_empty(&config_path) {
-        Ok(c) => c,
+    // Fail closed before touching config: removing the source while its
+    // installs can't be deregistered would orphan them.
+    let uninstalled = match plugin::uninstall_marketplace_source_plugins(source_url_or_path) {
+        Ok(keys) => keys,
         Err(e) => {
             return ActionOutcome {
                 status: OutcomeStatus::InternalError,
-                message: format!("Failed to read config: {e}"),
+                message: e.to_string(),
                 requires_reload: false,
                 requires_restart: false,
             };
         }
     };
-    if let Some(removed) = plugin::remove_toml_marketplace_block(&content, source_url_or_path) {
-        let final_content = if is_official {
-            match set_official_flag_in_toml(&removed) {
-                Ok(c) => c,
-                Err(e) => {
-                    return ActionOutcome {
-                        status: OutcomeStatus::InternalError,
-                        message: format!("Failed to update config: {e}"),
-                        requires_reload: false,
-                        requires_restart: false,
-                    };
-                }
-            }
-        } else {
-            removed
-        };
-        if let Err(e) = crate::util::config::atomic_write_string(&config_path, &final_content) {
+
+    let config_path = grok_home.join("config.toml");
+    match plugin::remove_marketplace_source_from_stores(&config_path, source_url_or_path) {
+        Ok(plugin::MarketplaceSourceRemoval::NotFound) => {
             return ActionOutcome {
-                status: OutcomeStatus::InternalError,
-                message: format!("Failed to write config: {e}"),
+                status: OutcomeStatus::NotFound,
+                message: format!("Source not found in config: {source_url_or_path}"),
                 requires_reload: false,
                 requires_restart: false,
             };
         }
-        removed_from_config = true;
-    }
-
-    if !removed_from_config && !plugin::try_remove_source_from_json_files(source_url_or_path) {
-        return ActionOutcome {
-            status: OutcomeStatus::NotFound,
-            message: format!("Source not found in config: {source_url_or_path}"),
-            requires_reload: false,
-            requires_restart: false,
-        };
-    }
-
-    // JSON-store-only removal: set the flag separately (the config.toml path
-    // already set it atomically above).
-    if is_official
-        && !removed_from_config
-        && let Err(e) = set_official_marketplace_auto_installed(&config_path)
-    {
-        tracing::warn!(
-            error = %e,
-            path = %config_path.display(),
-            "failed to set official_marketplace_auto_installed flag",
-        );
+        Ok(_) => {}
+        Err(e) => {
+            return ActionOutcome {
+                status: OutcomeStatus::InternalError,
+                message: format!("Failed to update config: {e}"),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
     }
 
     let msg = if uninstalled.is_empty() {
@@ -1209,43 +911,11 @@ fn remove_source_locked(source_url_or_path: &str) -> xai_hooks_plugins_types::Ac
     }
 }
 
-/// Set the official auto-installed flag on a TOML document string (pure, no I/O)
-/// so callers can fold it into a single atomic write. Preserves formatting.
-fn set_official_flag_in_toml(content: &str) -> std::io::Result<String> {
-    let mut doc = content.parse::<toml_edit::DocumentMut>().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid TOML: {e}"),
-        )
-    })?;
+use crate::plugin::{
+    OFFICIAL_MARKETPLACE_FLAG, set_marketplace_bool_flag, set_official_marketplace_auto_installed,
+};
 
-    let marketplace = doc
-        .entry("marketplace")
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "[marketplace] is not a table",
-            )
-        })?;
-    marketplace["official_marketplace_auto_installed"] = toml_edit::value(true);
-
-    Ok(doc.to_string())
-}
-
-/// Set the official auto-installed flag in `config.toml` (atomic write).
-fn set_official_marketplace_auto_installed(config_path: &std::path::Path) -> std::io::Result<()> {
-    if let Some(parent) = config_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let existing = crate::util::config::read_to_string_or_empty(config_path)?;
-    let updated = set_official_flag_in_toml(&existing)?;
-    crate::util::config::atomic_write_string(config_path, &updated)
-}
-
-/// Read the `official_marketplace_auto_installed` flag; `false` on any failure.
-fn read_official_marketplace_auto_installed(config_path: &std::path::Path) -> bool {
+fn read_marketplace_bool_flag(config_path: &std::path::Path, key: &str) -> bool {
     let raw = match std::fs::read_to_string(config_path) {
         Ok(s) => s,
         Err(_) => return false,
@@ -1256,51 +926,201 @@ fn read_official_marketplace_auto_installed(config_path: &std::path::Path) -> bo
     };
     parsed
         .get("marketplace")
-        .and_then(|m| m.get("official_marketplace_auto_installed"))
+        .and_then(|m| m.get(key))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
 }
 
-/// Acquire an advisory exclusive `flock` on `<grok_home>/.config-init.lock`,
-/// retrying briefly under contention, to serialize first-run auto-register
-/// across processes. Only `WouldBlock` retries; other I/O errors return early.
-/// The lock file is intentionally never removed (flock releases on exit).
-fn acquire_init_lock(grok_home: &std::path::Path) -> std::io::Result<std::fs::File> {
-    use fs2::FileExt;
-    let _ = std::fs::create_dir_all(grok_home);
-    let lock_path = grok_home.join(".config-init.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        // Contents are irrelevant; truncate(false) silences clippy::suspicious_open_options.
-        .truncate(false)
-        .open(&lock_path)?;
-    for _ in 0..50 {
-        match file.try_lock_exclusive() {
-            Ok(()) => return Ok(file),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::WouldBlock,
-        format!("timed out waiting for {} after 1s", lock_path.display()),
-    ))
+fn read_official_marketplace_auto_installed(config_path: &std::path::Path) -> bool {
+    read_marketplace_bool_flag(config_path, OFFICIAL_MARKETPLACE_FLAG)
 }
 
-/// Auto-register the official xAI marketplace source on first run.
-///
-/// Gated by the caller (`init_process`); see
-/// `Config::resolve_official_marketplace_auto_register`. No-op once
-/// `official_marketplace_auto_installed` is set. Under a process-wide flock it
-/// adds the source (or just sets the flag if it's already present in config.toml
-/// or a JSON store). Best-effort: errors are logged and never block startup.
-pub fn ensure_official_marketplace_source(grok_home: &std::path::Path) {
+fn is_default_skills_plugin_subdir(plugin_subdir: &str) -> bool {
+    plugin_subdir == "default-skills"
+}
+
+fn default_skills_repo_keys<'a>(
+    repos: impl IntoIterator<
+        Item = (
+            &'a str,
+            &'a xai_grok_agent::plugins::install_registry::InstalledRepo,
+        ),
+    >,
+) -> Vec<&'a str> {
+    repos
+        .into_iter()
+        .filter_map(|(key, repo)| {
+            repo.marketplace
+                .as_ref()
+                .filter(|mp| is_default_skills_plugin_subdir(&mp.plugin_subdir))
+                .map(|_| key)
+        })
+        .collect()
+}
+
+fn set_default_skills_installs_purged(config_path: &std::path::Path) -> std::io::Result<()> {
+    set_marketplace_bool_flag(config_path, "default_skills_installs_purged")
+}
+
+fn read_default_skills_installs_purged(config_path: &std::path::Path) -> bool {
+    read_marketplace_bool_flag(config_path, "default_skills_installs_purged")
+}
+
+/// One-shot purge of legacy marketplace `default-skills` installs.
+/// Gated by the sticky `default_skills_installs_purged` flag in config.toml.
+/// Best-effort: errors are logged and never block startup.
+pub(crate) fn purge_default_skills_installs(grok_home: &std::path::Path) {
+    let install_dir =
+        xai_grok_agent::plugins::install_registry::InstallRegistry::resolve_install_dir();
+    purge_default_skills_installs_impl(grok_home, &install_dir, || {
+        xai_grok_agent::plugins::install_registry::InstallRegistry::try_load_from(
+            install_dir.clone(),
+        )
+    });
+}
+
+/// Short registry-lock wait for the startup purge: contention means another
+/// plugin operation is live, and the unset sticky flag retries next startup.
+const PURGE_REGISTRY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn purge_default_skills_installs_impl(
+    grok_home: &std::path::Path,
+    install_dir: &std::path::Path,
+    load_registry: impl FnOnce() -> Result<
+        xai_grok_agent::plugins::install_registry::InstallRegistry,
+        xai_grok_agent::plugins::install_registry::InstallError,
+    >,
+) {
+    let config_path = grok_home.join("config.toml");
+
+    if read_default_skills_installs_purged(&config_path) {
+        return;
+    }
+
+    let _lock = match acquire_init_lock(grok_home) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %grok_home.join(".config-init.lock").display(),
+                "skipping default-skills purge: failed to acquire init lock"
+            );
+            return;
+        }
+    };
+
+    if read_default_skills_installs_purged(&config_path) {
+        return;
+    }
+
+    // Registry flock across load→mutate→save like every other writer
+    // (init ⊃ registry lock order); a timeout skips and retries next startup.
+    let _registry_lock = match crate::plugin::acquire::lock_install_registry_in(
+        install_dir,
+        PURGE_REGISTRY_LOCK_TIMEOUT,
+    ) {
+        Ok(lock) => lock,
+        Err(detail) => {
+            tracing::warn!(
+                %detail,
+                "skipping default-skills purge: failed to acquire registry lock"
+            );
+            return;
+        }
+    };
+
+    let mut registry = match load_registry() {
+        Ok(reg) => reg,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "skipping default-skills purge: failed to load install registry"
+            );
+            return;
+        }
+    };
+    let keys: Vec<String> = default_skills_repo_keys(registry.list())
+        .into_iter()
+        .map(|k| k.to_string())
+        .collect();
+
+    for key in &keys {
+        let path = registry
+            .get_repo(key)
+            .map(|r| r.path.clone())
+            .unwrap_or_else(|| registry.install_dir().join(key));
+        if path.exists()
+            && let Err(e) = std::fs::remove_dir_all(&path)
+        {
+            let _ = std::fs::remove_file(&path);
+            if path.exists() {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    repo_key = %key,
+                    "failed to remove default-skills install dir"
+                );
+            }
+        }
+        registry.remove(key);
+    }
+
+    if !keys.is_empty() {
+        if let Err(e) = registry.save() {
+            tracing::warn!(error = %e, "failed to save registry after default-skills purge");
+            return;
+        }
+        tracing::info!(
+            count = keys.len(),
+            "purged legacy default-skills marketplace installs"
+        );
+    }
+
+    if let Err(e) = set_default_skills_installs_purged(&config_path) {
+        tracing::warn!(
+            error = %e,
+            path = %config_path.display(),
+            "failed to set default_skills_installs_purged flag"
+        );
+    }
+}
+
+/// Auto-register the official xAI marketplace source on first run. Gated by the caller (`init_process`); see `Config::resolve_official_marketplace_auto_register`. No-op once `official_marketplace_auto_installed` is set.
+/// Under a process-wide flock it adds the source (or just sets the flag if it's already present in config.toml or a JSON store). Best-effort: errors are logged and never block startup.
+pub(crate) fn ensure_official_marketplace_source(grok_home: &std::path::Path) {
+    ensure_official_marketplace_source_with(
+        grok_home,
+        &xai_grok_workspace::permission::resolution::managed_settings().marketplace_allowlist,
+    );
+}
+
+/// [`ensure_official_marketplace_source`] with the marketplace policy injected — the OnceLock
+/// seam, so tests can pin the blocked-skip behavior.
+fn ensure_official_marketplace_source_with(
+    grok_home: &std::path::Path,
+    policy: &xai_grok_workspace::permission::resolution::MarketplacePolicy,
+) {
     let config_path = grok_home.join("config.toml");
 
     if read_official_marketplace_auto_installed(&config_path) {
+        return;
+    }
+
+    // Auto-register is a `marketplace add` on the user's behalf: it fails closed against every
+    // strict list; the flag stays unset so the register retries if the policy lifts.
+    if policy
+        .add_block_reason(xai_grok_plugin_marketplace::OFFICIAL_SOURCE_GIT_URL)
+        .is_some()
+    {
+        // Log the full-path reason (the add gate's refusal reduces the
+        // policy file to its name for users).
+        tracing::info!(
+            reason = %policy.block_reason(
+                xai_grok_plugin_marketplace::OFFICIAL_SOURCE_GIT_URL,
+                xai_grok_workspace::permission::resolution::PolicySubjectOrigin::Foreign,
+            ),
+            "skipping official marketplace auto-register: blocked by marketplace policy"
+        );
         return;
     }
 
@@ -1336,10 +1156,9 @@ pub fn ensure_official_marketplace_source(grok_home: &std::path::Path) {
         }
     };
 
-    // "Already present" = official URL in config.toml sources OR a JSON store
-    // (settings.json / known_marketplaces.json) under grok_home. Scoped to
-    // grok_home only (not ~/.claude) to keep tests hermetic; a user with the URL
-    // solely in ~/.claude gets one duplicate entry that the UI dedupes by URL.
+    // "Already present" means the official URL is in the config.toml sources or in a JSON store (settings.json, known_marketplaces.json) under grok_home
+    // The scan is scoped to grok_home only (not ~/.claude) to keep tests hermetic
+    // A user with the URL solely in ~/.claude gets one duplicate entry that the UI dedupes by URL
     let toml_sources = xai_grok_plugin_marketplace::load_sources(&parsed);
     let json_sources = xai_grok_plugin_marketplace::load_extra_sources_from_settings_in(
         &toml_sources,
@@ -1405,7 +1224,7 @@ mod official_source_tests {
     #[test]
     fn set_official_flag_in_toml_preserves_other_content() {
         let content = "[ui]\ntheme = \"dark\"\n";
-        let out = set_official_flag_in_toml(content).unwrap();
+        let out = crate::plugin::set_official_flag_in_toml(content).unwrap();
         assert!(out.contains("theme = \"dark\""), "{out}");
         assert!(
             out.contains("official_marketplace_auto_installed = true"),
@@ -1437,10 +1256,37 @@ mod official_source_tests {
         assert!(!raw.contains("git ="), "{raw}");
     }
 
+    /// Pins add-source dedup: a respelled URL (`.git`, host case) of a
+    /// configured source must not write a duplicate entry.
+    #[test]
+    fn add_marketplace_source_dedupes_respelled_git_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let original = crate::plugin::MarketplaceAddInput::GitUrl(
+            "https://github.com/org/repo.git".to_string(),
+        );
+        add_marketplace_source(&config_path, "org", &original, false).unwrap();
+        let respelled =
+            crate::plugin::MarketplaceAddInput::GitUrl("https://GitHub.com/org/repo".to_string());
+        add_marketplace_source(&config_path, "org-respelled", &respelled, false).unwrap();
+
+        let sources = read_sources(&config_path);
+        assert_eq!(
+            sources.len(),
+            1,
+            "respelled URL must dedupe, got {sources:?}"
+        );
+        assert!(matches!(
+            &sources[0].kind,
+            xai_grok_plugin_marketplace::SourceKind::Git { url, .. }
+                if url == "https://github.com/org/repo.git"
+        ));
+    }
+
     #[test]
     fn removing_last_nonofficial_source_preserves_flag_and_blocks_readd() {
-        // Regression: removing the last (non-official) source must not wipe the
-        // sticky flag, or a gated startup would re-add the removed official source.
+        // Regression: removing the last (non-official) source must not wipe the sticky flag, or a gated startup would re-add the removed official source
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         let config_path = home.join("config.toml");
@@ -1496,6 +1342,38 @@ mod official_source_tests {
             xai_grok_plugin_marketplace::SourceKind::Git { url, .. }
                 if url == xai_grok_plugin_marketplace::OFFICIAL_SOURCE_GIT_URL
         ));
+        assert!(read_flag(&config_path));
+    }
+
+    /// A marketplace policy blocking the official URL skips the auto-register AND leaves the sticky flag unset.
+    #[test]
+    fn policy_blocked_first_run_skips_register_and_retries_after_lift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let config_path = home.join("config.toml");
+
+        let blocked = crate::plugin::test_fixtures::marketplace_allowlist(&[
+            "https://github.com/corp/approved.git",
+        ]);
+        ensure_official_marketplace_source_with(home, &blocked);
+        assert!(
+            read_sources(&config_path).is_empty(),
+            "blocked policy must skip the register"
+        );
+        assert!(
+            !read_flag(&config_path),
+            "flag must stay unset so a lifted policy retries"
+        );
+
+        ensure_official_marketplace_source_with(
+            home,
+            &xai_grok_workspace::permission::resolution::MarketplacePolicy::default(),
+        );
+        assert_eq!(
+            read_sources(&config_path).len(),
+            1,
+            "lifted policy registers"
+        );
         assert!(read_flag(&config_path));
     }
 
@@ -1668,6 +1546,231 @@ mod official_source_tests {
         let sources = read_sources(&config_path);
         assert_eq!(sources.len(), 2);
         assert!(read_flag(&config_path));
+    }
+}
+
+#[cfg(test)]
+mod default_skills_purge_tests {
+    use super::*;
+    use xai_grok_agent::plugins::install_registry::{
+        InstallKind, InstallRegistry, InstalledRepo, MarketplaceProvenance, RepoPlugin,
+    };
+
+    fn repo_at(path: &std::path::Path, plugin_subdir: Option<&str>) -> InstalledRepo {
+        InstalledRepo {
+            kind: InstallKind::Local {
+                source_path: path.to_path_buf(),
+                subdir: None,
+            },
+            installed_at: String::new(),
+            updated_at: String::new(),
+            path: path.to_path_buf(),
+            plugins: std::collections::HashMap::from([(
+                "p".into(),
+                RepoPlugin {
+                    subdir: None,
+                    version: None,
+                },
+            )]),
+            marketplace: plugin_subdir.map(|subdir| MarketplaceProvenance {
+                source_url_or_path: "https://example.com/market.git".into(),
+                source_display_name: "Test".into(),
+                plugin_subdir: subdir.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn match_is_exact_plugin_subdir_only() {
+        assert!(is_default_skills_plugin_subdir("default-skills"));
+        assert!(!is_default_skills_plugin_subdir("plugins/default-skills"));
+        assert!(!is_default_skills_plugin_subdir("default-skills/extra"));
+        assert!(!is_default_skills_plugin_subdir("defaults-skills"));
+        assert!(!is_default_skills_plugin_subdir(""));
+    }
+
+    #[test]
+    fn collects_only_default_skills_repo_keys() {
+        let default_skills = repo_at(std::path::Path::new("/tmp/ds"), Some("default-skills"));
+        let other = repo_at(std::path::Path::new("/tmp/office"), Some("plugins/office"));
+        let no_marketplace = repo_at(std::path::Path::new("/tmp/local"), None);
+
+        let keys = default_skills_repo_keys([
+            ("ds-aaaa", &default_skills),
+            ("office-bbbb", &other),
+            ("local-cccc", &no_marketplace),
+        ]);
+        assert_eq!(keys, vec!["ds-aaaa"]);
+    }
+
+    #[test]
+    fn purged_flag_toml_preserves_other_content() {
+        let content =
+            "[ui]\ntheme = \"dark\"\n[marketplace]\nofficial_marketplace_auto_installed = true\n";
+        let out = crate::plugin::set_marketplace_bool_flag_in_toml(
+            content,
+            "default_skills_installs_purged",
+        )
+        .unwrap();
+        assert!(out.contains("theme = \"dark\""), "{out}");
+        assert!(
+            out.contains("official_marketplace_auto_installed = true"),
+            "{out}"
+        );
+        assert!(
+            out.contains("default_skills_installs_purged = true"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn read_purged_flag_false_when_missing_or_wrong_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        assert!(!read_default_skills_installs_purged(&path));
+
+        std::fs::write(
+            &path,
+            "[marketplace]\ndefault_skills_installs_purged = \"yes\"\n",
+        )
+        .unwrap();
+        assert!(!read_default_skills_installs_purged(&path));
+
+        std::fs::write(
+            &path,
+            "[marketplace]\ndefault_skills_installs_purged = true\n",
+        )
+        .unwrap();
+        assert!(read_default_skills_installs_purged(&path));
+    }
+
+    #[test]
+    fn purge_sets_flag_when_nothing_to_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let install_dir = home.join("installed-plugins");
+        purge_default_skills_installs_impl(home, &install_dir, || {
+            Ok(InstallRegistry::empty(install_dir.clone()))
+        });
+        let config_path = home.join("config.toml");
+        assert!(read_default_skills_installs_purged(&config_path));
+
+        let after_first = std::fs::read_to_string(&config_path).unwrap();
+        purge_default_skills_installs_impl(home, &install_dir, || {
+            Ok(InstallRegistry::empty(install_dir.clone()))
+        });
+        let after_second = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(after_first, after_second);
+    }
+
+    #[test]
+    fn purge_skips_flag_when_registry_load_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let install_dir = home.join("installed-plugins");
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::write(install_dir.join("registry.json"), "{not-json").unwrap();
+
+        purge_default_skills_installs_impl(home, &install_dir, || {
+            InstallRegistry::try_load_from(install_dir.clone())
+        });
+
+        assert!(!read_default_skills_installs_purged(
+            &home.join("config.toml")
+        ));
+    }
+
+    /// While another writer holds the registry flock the purge must skip; the sticky flag stays unset so it retries.
+    #[test]
+    fn purge_skips_while_registry_flock_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let install_dir = home.join("installed-plugins");
+        std::fs::create_dir_all(&install_dir).unwrap();
+
+        let ds_path = install_dir.join("ds-aaaa");
+        std::fs::create_dir_all(&ds_path).unwrap();
+        let mut registry = InstallRegistry::empty(install_dir.clone());
+        registry.insert("ds-aaaa".into(), repo_at(&ds_path, Some("default-skills")));
+        registry.save().unwrap();
+
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(install_dir.join("registry.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock_file).unwrap();
+
+        let install_dir_for_load = install_dir.clone();
+        purge_default_skills_installs_impl(home, &install_dir, move || {
+            InstallRegistry::try_load_from(install_dir_for_load)
+        });
+
+        assert!(
+            ds_path.exists(),
+            "purge must not delete installs while the registry flock is held"
+        );
+        let reloaded = InstallRegistry::load_from(install_dir);
+        assert!(
+            reloaded.get_repo("ds-aaaa").is_some(),
+            "purge must not save an unlocked registry while the flock is held"
+        );
+        assert!(
+            !read_default_skills_installs_purged(&home.join("config.toml")),
+            "a skipped purge must not set the sticky flag"
+        );
+    }
+
+    #[test]
+    fn purge_removes_default_skills_retains_others_and_sets_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let install_dir = home.join("installed-plugins");
+        std::fs::create_dir_all(&install_dir).unwrap();
+
+        let ds_path = install_dir.join("ds-aaaa");
+        std::fs::create_dir_all(&ds_path).unwrap();
+        std::fs::write(ds_path.join("marker"), "ds").unwrap();
+
+        let other_path = install_dir.join("office-bbbb");
+        std::fs::create_dir_all(&other_path).unwrap();
+        std::fs::write(other_path.join("marker"), "office").unwrap();
+
+        let mut registry = InstallRegistry::empty(install_dir.clone());
+        registry.insert("ds-aaaa".into(), repo_at(&ds_path, Some("default-skills")));
+        registry.insert(
+            "office-bbbb".into(),
+            repo_at(&other_path, Some("plugins/office")),
+        );
+        registry.save().unwrap();
+
+        let install_dir_for_load = install_dir.clone();
+        purge_default_skills_installs_impl(home, &install_dir, move || {
+            InstallRegistry::try_load_from(install_dir_for_load)
+        });
+
+        assert!(
+            !ds_path.exists(),
+            "default-skills install dir must be removed"
+        );
+        assert!(other_path.exists(), "non-matching install must be retained");
+
+        let reloaded = InstallRegistry::load_from(install_dir.clone());
+        assert!(reloaded.get_repo("ds-aaaa").is_none());
+        assert!(reloaded.get_repo("office-bbbb").is_some());
+
+        let config_path = home.join("config.toml");
+        assert!(read_default_skills_installs_purged(&config_path));
+
+        let after_first = std::fs::read_to_string(&config_path).unwrap();
+        let install_dir_for_reload = install_dir.clone();
+        purge_default_skills_installs_impl(home, &install_dir, move || {
+            InstallRegistry::try_load_from(install_dir_for_reload)
+        });
+        let after_second = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(after_first, after_second);
+        assert!(other_path.exists());
     }
 }
 

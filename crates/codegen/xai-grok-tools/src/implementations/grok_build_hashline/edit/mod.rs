@@ -22,7 +22,7 @@ use crate::types::tool::{ToolKind, ToolNamespace};
 use crate::types::resources::resolve_model_path;
 use crate::util::format_not_found_error;
 
-const DESCRIPTION: &str = r#"Edit a file using anchors from ${{ tools.by_kind.read }} or ${{ tools.by_kind.search }}.
+const DESCRIPTION: &str = r#"Edit a file using anchors${%- if tools.by_kind.read and tools.by_kind.search %} from ${{ tools.by_kind.read }} or ${{ tools.by_kind.search }}${%- elif tools.by_kind.read %} from ${{ tools.by_kind.read }}${%- elif tools.by_kind.search %} from ${{ tools.by_kind.search }}${%- endif %}.
 
 Operations (use the "op" field):
 
@@ -47,7 +47,7 @@ Operations (use the "op" field):
   "write" — Replace entire file content (no anchors needed).
     { "op": "write", "content": "full file content here" }
 
-Batch edits: pass multiple operations in "edits". They are validated against the
+Batch edits: pass multiple operations in "${{ params.edit.edits }}". They are validated against the
 pre-edit snapshot and applied atomically bottom-up — if any anchor fails
 validation, ALL edits in the batch are rejected (none are applied).
 Overlapping ranges are also rejected.
@@ -65,7 +65,7 @@ Follow-up edits:
   (e.g. "{example_anchor}"). Always include the line number. Do NOT include → or
   the line content after it.
 - Never fabricate or modify anchors — only use exact anchors as returned by
-  previous read, grep, or edit calls."#;
+  previous tool outputs."#;
 
 /// `hashline_edit` tool — edits files using anchor references.
 #[derive(Debug, Default)]
@@ -264,7 +264,7 @@ impl xai_tool_runtime::Tool for HashlineEditTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "hashline_edit",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -317,6 +317,9 @@ impl xai_tool_runtime::Tool for HashlineEditTool {
 
         let display_dcwd = display_cwd_or_cwd(&cwd, display_cwd.as_deref());
         let joined_path = resolve_model_path(&cwd, display_cwd.as_deref(), &input.file_path);
+        // Memory v2 classifies the logical path (as search_replace does), not
+        // the canonicalized one, so aliases resolve inside the policy.
+        let policy_path = joined_path.clone();
         // Error-preserving variant: the Err arm drives new-file creation.
         let path = match crate::util::fs::try_canonicalize(&joined_path).await {
             Ok(p) => p,
@@ -331,7 +334,24 @@ impl xai_tool_runtime::Tool for HashlineEditTool {
                     if input.edits.len() == 1
                         && let HashlineOp::Write { ref content } = input.edits[0]
                     {
-                        if let Err(e) = fs.write_file(&joined_path, content.as_bytes()).await {
+                        let is_memory_write = match crate::types::memory_v2::write_memory_v2_file(
+                            &resources,
+                            &policy_path,
+                            content.as_bytes(),
+                        )
+                        .await
+                        {
+                            Ok(crate::types::memory_v2::MemoryV2Write::Written { .. }) => true,
+                            Ok(crate::types::memory_v2::MemoryV2Write::Outside) => false,
+                            Err(error) => {
+                                return Ok(
+                                    crate::types::output::SearchReplaceOutput::InvalidInput(error),
+                                );
+                            }
+                        };
+                        if !is_memory_write
+                            && let Err(e) = fs.write_file(&joined_path, content.as_bytes()).await
+                        {
                             let display_path = display_dcwd.join(&input.file_path);
                             return Ok(match e.io_error_kind() {
                                 Some(std::io::ErrorKind::NotFound) => {
@@ -400,7 +420,29 @@ impl xai_tool_runtime::Tool for HashlineEditTool {
 
         let apply_result = apply::apply_edits(&old_content, &input.edits, &path, &*scheme);
 
-        if let Some(ref new_content) = apply_result.new_content
+        let is_memory_write = match apply_result.new_content {
+            Some(ref new_content) => {
+                match crate::types::memory_v2::write_memory_v2_file(
+                    &resources,
+                    &policy_path,
+                    new_content.as_bytes(),
+                )
+                .await
+                {
+                    Ok(crate::types::memory_v2::MemoryV2Write::Written { .. }) => true,
+                    Ok(crate::types::memory_v2::MemoryV2Write::Outside) => false,
+                    Err(error) => {
+                        return Ok(crate::types::output::SearchReplaceOutput::InvalidInput(
+                            error,
+                        ));
+                    }
+                }
+            }
+            None => false,
+        };
+
+        if !is_memory_write
+            && let Some(ref new_content) = apply_result.new_content
             && let Err(e) = fs.write_file(&path, new_content.as_bytes()).await
         {
             let err_output = HashlineEditOutput::Error(types::HashlineEditError {
@@ -459,6 +501,238 @@ mod tests {
         resources.insert(NotificationHandle(ToolNotificationHandle::noop()));
         resources.insert(PathNotFoundHints(hints_enabled));
         resources
+    }
+
+    /// Resources with a memory v2 scope rooted at `<cwd>/memory`.
+    fn memory_test_resources(
+        cwd: &std::path::Path,
+    ) -> (
+        Resources,
+        Arc<
+            crate::implementations::grok_build_hashline::memory_v2_test_support::FakeMemoryV2Access,
+        >,
+    ) {
+        use crate::implementations::grok_build_hashline::memory_v2_test_support::FakeMemoryV2Access;
+        use crate::types::memory_v2::MemoryV2AccessResource;
+
+        let access = Arc::new(FakeMemoryV2Access::new(&cwd.join("memory")));
+        let mut resources = test_resources(cwd);
+        resources.insert(MemoryV2AccessResource(access.clone()));
+        (resources, access)
+    }
+
+    async fn run_edit(
+        resources: Resources,
+        file_path: &str,
+        edits: Vec<HashlineOp>,
+    ) -> SearchReplaceOutput {
+        let input = HashlineEditInput {
+            file_path: file_path.to_string(),
+            edits,
+        };
+        xai_tool_runtime::Tool::run(&HashlineEditTool, test_ctx(resources.into_shared()), input)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn memory_v2_rejects_manifest_write() {
+        let tmp = TempDir::new().unwrap();
+        let (resources, access) = memory_test_resources(tmp.path());
+        let manifest = tmp.path().join("memory/MEMORY.md");
+        let before = std::fs::read_to_string(&manifest).unwrap();
+
+        let result = run_edit(
+            resources,
+            "memory/MEMORY.md",
+            vec![HashlineOp::Write {
+                content: "# Overwritten\n".to_owned(),
+            }],
+        )
+        .await;
+
+        match result {
+            SearchReplaceOutput::InvalidInput(msg) => {
+                assert!(msg.contains("protected"), "msg: {msg}");
+            }
+            other => panic!("Expected InvalidInput, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), before);
+        assert!(access.policy_writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_v2_rejects_new_file_outside_writable_roots() {
+        let tmp = TempDir::new().unwrap();
+        let (resources, _access) = memory_test_resources(tmp.path());
+
+        let result = run_edit(
+            resources,
+            "memory/notes.md",
+            vec![HashlineOp::Write {
+                content: "stray\n".to_owned(),
+            }],
+        )
+        .await;
+
+        assert!(
+            matches!(result, SearchReplaceOutput::InvalidInput(_)),
+            "expected InvalidInput, got {result:?}"
+        );
+        assert!(!tmp.path().join("memory/notes.md").exists());
+    }
+
+    #[tokio::test]
+    async fn memory_v2_topic_write_goes_through_policy_and_refreshes_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let (resources, access) = memory_test_resources(tmp.path());
+        let topic = tmp.path().join("memory/topics/style.md");
+
+        let result = run_edit(
+            resources,
+            "memory/topics/style.md",
+            vec![HashlineOp::Write {
+                content: "# Style\n\nUse Rust.\n".to_owned(),
+            }],
+        )
+        .await;
+
+        assert!(
+            matches!(result, SearchReplaceOutput::EditsApplied(_)),
+            "expected EditsApplied, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&topic).unwrap(),
+            "# Style\n\nUse Rust.\n"
+        );
+        assert_eq!(access.policy_writes(), vec![topic]);
+        assert!(
+            std::fs::read_to_string(tmp.path().join("memory/MEMORY.md"))
+                .unwrap()
+                .contains("topics/style.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_v2_edit_without_prior_read_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let (resources, access) = memory_test_resources(tmp.path());
+        let topic = tmp.path().join("memory/topics/facts.md");
+        let original = "one\ntwo\nthree\n";
+        std::fs::write(&topic, original).unwrap();
+        let anchors = anchors_for(original);
+
+        let result = run_edit(
+            resources,
+            "memory/topics/facts.md",
+            vec![HashlineOp::Replace {
+                anchor: anchors[1].clone(),
+                end_anchor: None,
+                content: "TWO".to_owned(),
+            }],
+        )
+        .await;
+
+        match result {
+            SearchReplaceOutput::InvalidInput(msg) => {
+                assert!(msg.contains("read"), "msg: {msg}");
+            }
+            other => panic!("Expected InvalidInput, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&topic).unwrap(), original);
+        assert!(access.policy_writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_v2_edit_after_hashline_read_succeeds() {
+        use crate::implementations::grok_build::read_file::ReadFileInput;
+        use crate::implementations::grok_build_hashline::HashlineReadTool;
+
+        let tmp = TempDir::new().unwrap();
+        let (resources, access) = memory_test_resources(tmp.path());
+        let shared = resources.into_shared();
+        let topic = tmp.path().join("memory/topics/facts.md");
+        let original = "one\ntwo\nthree\n";
+        std::fs::write(&topic, original).unwrap();
+        let anchors = anchors_for(original);
+
+        let read = xai_tool_runtime::Tool::run(
+            &HashlineReadTool,
+            test_ctx(shared.clone()),
+            ReadFileInput {
+                path: "memory/topics/facts.md".to_string(),
+                offset: None,
+                limit: None,
+                pages: None,
+                format: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(read, crate::types::output::ReadFileOutput::FileContent(_)),
+            "expected FileContent, got {read:?}"
+        );
+        assert_eq!(access.recorded_reads(), vec![topic.clone()]);
+
+        let result = xai_tool_runtime::Tool::run(
+            &HashlineEditTool,
+            test_ctx(shared),
+            HashlineEditInput {
+                file_path: "memory/topics/facts.md".to_string(),
+                edits: vec![HashlineOp::Replace {
+                    anchor: anchors[1].clone(),
+                    end_anchor: None,
+                    content: "TWO".to_owned(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result, SearchReplaceOutput::EditsApplied(_)),
+            "expected EditsApplied, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&topic).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+        assert_eq!(access.policy_writes(), vec![topic]);
+        assert!(
+            std::fs::read_to_string(tmp.path().join("memory/MEMORY.md"))
+                .unwrap()
+                .contains("topics/facts.md")
+        );
+    }
+
+    #[test]
+    fn description_template_tracks_renamed_edits() {
+        use crate::types::template_renderer::TemplateRenderer;
+        use crate::types::tool::ToolKind;
+        use crate::types::tool_metadata::ToolMetadata;
+        use std::collections::HashMap;
+
+        let tools = HashMap::from([
+            (ToolKind::Edit, "hashline_edit".to_string()),
+            (ToolKind::Read, "hashline_read".to_string()),
+            (ToolKind::Search, "hashline_grep".to_string()),
+        ]);
+        let params = HashMap::from([(
+            ToolKind::Edit,
+            HashMap::from([("edits".to_string(), "changes".to_string())]),
+        )]);
+        let rendered = TemplateRenderer::new(tools, params)
+            .render(ToolMetadata::description_template(&HashlineEditTool))
+            .unwrap();
+        assert!(
+            rendered.contains("\"changes\""),
+            "renamed edits param must appear:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("\"edits\""),
+            "canonical edits must not remain after rename:\n{rendered}"
+        );
     }
 
     fn anchors_for(content: &str) -> Vec<String> {

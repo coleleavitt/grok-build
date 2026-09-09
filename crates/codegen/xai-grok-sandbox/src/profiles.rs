@@ -1,7 +1,6 @@
 //! Sandbox profiles. Built-in: `workspace`, `devbox`, `read-only`, `strict`,
 //! `off`. Custom profiles via `~/.grok/sandbox.toml` or `.grok/sandbox.toml`.
-//! A custom profile's `deny` list is kernel-enforced (read + write/rename) on
-//! both platforms.
+//! A custom profile's `deny` list is kernel-enforced (read and write/rename) on both platforms.
 
 #[cfg(all(feature = "enforce", unix))]
 use nono::{AccessMode, CapabilitySet};
@@ -9,15 +8,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::allow_path::normalize_allow_path;
 #[cfg(all(feature = "enforce", unix))]
 use crate::deny::{
-    apply_deny_globs_to_capability_set, apply_deny_paths_to_capability_set, effective_deny_paths,
-    partition_deny_entries,
+    apply_deny_globs_to_capability_set, apply_deny_paths_to_capability_set,
+    apply_write_deny_paths_to_capability_set, effective_deny_paths, partition_deny_entries,
 };
+use crate::hook_write_deny::profile_hook_write_deny;
 use crate::paths::grok_home;
 #[cfg(all(feature = "enforce", unix))]
 use crate::paths::{DEVICE_DIRS, DEVICE_FILES};
-use crate::paths::{essential_writable_paths, essential_writable_paths_minimal};
+use crate::paths::{
+    essential_writable_paths, essential_writable_paths_minimal, essential_writable_paths_strict,
+};
+use xai_grok_config::{GlobalHookSource, SANDBOX_CONFIG_FILENAME};
 
 /// A resolved sandbox profile ready to be converted to a `CapabilitySet`.
 #[derive(Debug, Clone)]
@@ -30,10 +34,16 @@ pub struct SandboxProfile {
     pub read_write: Vec<PathBuf>,
     /// Paths denied entirely (overrides read_only/read_write)
     pub deny: Vec<PathBuf>,
+    /// Typed direct global hook sources (write-denied, still readable).
+    pub write_deny: Vec<GlobalHookSource>,
     /// Whether to grant read access to the entire filesystem by default
     pub default_read: bool,
     /// Whether child processes should have network blocked
     pub restrict_network: bool,
+}
+
+fn resolve_write_deny(profile: &ProfileName) -> anyhow::Result<Vec<GlobalHookSource>> {
+    profile_hook_write_deny(profile)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -95,30 +105,26 @@ impl std::str::FromStr for ProfileName {
             "read-only" | "readonly" => Ok(Self::ReadOnly),
             "strict" => Ok(Self::Strict),
             "off" | "none" => Ok(Self::Off),
-            // Anything else is treated as a custom profile name.
             // Validation happens when we try to load it from config.
             other => Ok(Self::Custom(other.to_string())),
         }
     }
 }
 
-/// Load sandbox config from `~/.grok/sandbox.toml` and `.grok/sandbox.toml`.
-///
-/// Project config may **add** new profile names only. It cannot redefine a
-/// name already present in the global config — last-write-wins would let a
-/// malicious workspace hollow out a user/enterprise custom profile (e.g.
-/// empty `deny` / broad `read_write`) while keeping the trusted name.
+/// Load sandbox config from `~/.grok/sandbox.toml` and `.grok/sandbox.toml`. Project config may add new profile names
+/// only. It cannot redefine a name already present in the global config. Last-write-wins would let a malicious workspace
+/// hollow out a user/enterprise custom profile while keeping the trusted name.
 pub fn load_sandbox_config(workspace: &Path) -> SandboxConfig {
     let mut config = SandboxConfig::default();
 
     // Global config: ~/.grok/sandbox.toml
-    let global_path = grok_home().join("sandbox.toml");
+    let global_path = grok_home().join(SANDBOX_CONFIG_FILENAME);
     if let Some(global) = load_config_file(&global_path) {
         config = global;
     }
 
     // Project config: <workspace>/.grok/sandbox.toml (additive only)
-    let project_path = workspace.join(".grok").join("sandbox.toml");
+    let project_path = workspace.join(".grok").join(SANDBOX_CONFIG_FILENAME);
     if let Some(project) = load_config_file(&project_path) {
         merge_project_profiles(&mut config, project);
     }
@@ -127,9 +133,9 @@ pub fn load_sandbox_config(workspace: &Path) -> SandboxConfig {
 }
 
 pub fn sandbox_profile_conflicts(workspace: &Path) -> Vec<String> {
-    let global = load_config_file(&grok_home().join("sandbox.toml")).unwrap_or_default();
-    let project =
-        load_config_file(&workspace.join(".grok").join("sandbox.toml")).unwrap_or_default();
+    let global = load_config_file(&grok_home().join(SANDBOX_CONFIG_FILENAME)).unwrap_or_default();
+    let project = load_config_file(&workspace.join(".grok").join(SANDBOX_CONFIG_FILENAME))
+        .unwrap_or_default();
     mismatched_profile_names(&global, &project)
 }
 
@@ -150,8 +156,7 @@ fn mismatched_profile_names(global: &SandboxConfig, project: &SandboxConfig) -> 
     names
 }
 
-/// Merge project profiles into `config`. Names already defined globally are
-/// ignored so a workspace cannot replace a global custom profile's policy.
+/// Names already defined globally are ignored so a workspace cannot replace a global custom profile's policy.
 fn merge_project_profiles(config: &mut SandboxConfig, project: SandboxConfig) {
     for (name, profile) in project.profiles {
         config.profiles.entry(name).or_insert(profile);
@@ -160,12 +165,31 @@ fn merge_project_profiles(config: &mut SandboxConfig, project: SandboxConfig) {
 
 fn load_config_file(path: &Path) -> Option<SandboxConfig> {
     let content = std::fs::read_to_string(path).ok()?;
+    if content.trim().is_empty() {
+        return Some(SandboxConfig::default());
+    }
     match toml::from_str(&content) {
         Ok(config) => Some(config),
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "Failed to parse sandbox config");
             None
         }
+    }
+}
+
+/// `/dev/tty` always exists, but without a controlling terminal `open()` returns ENXIO and nono's apply aborts the entire
+/// ruleset. Other open errors (notably EISDIR on directory nodes) must not drop the path: directories are granted via
+/// [`DEVICE_DIRS`] / `allow_path`. A plain `File::open` EISDIR does not mean Landlock would reject the grant.
+#[cfg(all(feature = "enforce", unix))]
+fn device_file_openable(path: &Path) -> bool {
+    match std::fs::File::open(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        // ENXIO/ENODEV: e.g. /dev/tty with no controlling terminal; PathFd materialization would abort the whole Landlock ruleset.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENXIO) | Some(libc::ENODEV)) => false,
+        // EISDIR, EACCES, etc.: still attempt the grant path
+        // allow_file may reject ExpectedFile; that only skips this entry, not the whole apply
+        Err(_) => true,
     }
 }
 
@@ -179,8 +203,7 @@ impl ProfileName {
 
     /// Convert using an already-loaded config (avoids re-reading disk).
     ///
-    /// A custom profile's own `deny` list is kernel-enforced (read + write/rename)
-    /// on top of the base profile.
+    /// A custom profile's own `deny` list is kernel-enforced (read and write/rename) on top of the base profile.
     #[cfg(all(feature = "enforce", unix))]
     pub fn to_capability_set_with_config(
         &self,
@@ -196,6 +219,40 @@ impl ProfileName {
     }
 
     #[cfg(all(feature = "enforce", unix))]
+    fn read_write_grant_path(path: &Path, home: &Path) -> Option<PathBuf> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if !(path != home && path.starts_with(home)) {
+                    return Some(path.to_path_buf());
+                }
+                let real = dunce::canonicalize(path).ok()?;
+                if !real.is_dir() {
+                    return None;
+                }
+                if real == home.join(path.file_name()?) {
+                    return Some(real);
+                }
+                let default_sessions =
+                    xai_dirs::home_dir().map(|user_home| user_home.join(".grok").join("sessions"));
+                if path.file_name() == Some(std::ffi::OsStr::new("sessions"))
+                    && default_sessions.as_ref() == Some(&real)
+                {
+                    return Some(real);
+                }
+                None
+            }
+            Ok(_) => Some(path.to_path_buf()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::create_dir_all(path).is_err() {
+                    return None;
+                }
+                Some(path.to_path_buf())
+            }
+            Err(_) => None,
+        }
+    }
+
+    #[cfg(all(feature = "enforce", unix))]
     pub(crate) fn capability_set_from_profile(
         workspace: &Path,
         profile: &SandboxProfile,
@@ -207,7 +264,7 @@ impl ProfileName {
             caps = caps.allow_path("/", AccessMode::Read)?;
         }
 
-        // Explicit read-only paths — skip non-existent (nothing to read)
+        // Explicit read-only paths; skip non-existent (nothing to read)
         for path in &profile.read_only {
             if !path.exists() {
                 continue;
@@ -219,17 +276,21 @@ impl ProfileName {
             caps = caps.allow_path(path_str, AccessMode::Read)?;
         }
 
-        // Read-write paths. nono/Landlock need the directory to exist at
-        // apply time (it opens an O_PATH fd), but new files within it can
-        // be created freely after the sandbox is applied. Pre-create
-        // directories like ~/.grok/ that may not exist on first run.
+        // Read-write paths. nono/Landlock need the path to exist at apply time (it opens an O_PATH fd), but new files within a
+        // granted directory can be created freely after the sandbox is applied. Symlink children of grok_home fail closed unless
+        // the canonical dir is this home's same-named child or default ~/.grok/sessions.
+        let home = grok_home();
         for path in &profile.read_write {
-            if !path.exists() && std::fs::create_dir_all(path).is_err() {
-                tracing::warn!(path = ?path, "read_write path does not exist and could not be created, skipping");
+            let Some(grant) = Self::read_write_grant_path(path, &home) else {
+                tracing::warn!(path = ?path, "skipping read_write grant");
+                continue;
+            };
+            if !grant.exists() && std::fs::create_dir_all(&grant).is_err() {
+                tracing::warn!(path = ?grant, "read_write path does not exist and could not be created, skipping");
                 continue;
             }
-            let Some(path_str) = path.to_str() else {
-                tracing::warn!(path = ?path, "Skipping non-UTF8 read_write path");
+            let Some(path_str) = grant.to_str() else {
+                tracing::warn!(path = ?grant, "Skipping non-UTF8 read_write path");
                 continue;
             };
             caps = caps.allow_path(path_str, AccessMode::ReadWrite)?;
@@ -238,7 +299,9 @@ impl ProfileName {
         // Device special files (character devices like /dev/null, /dev/tty, etc.).
         for dev in DEVICE_FILES {
             let p = Path::new(dev);
-            if !p.exists() {
+            // nono opens each entry read-only at apply time
+            // A node that exists but cannot be opened would abort the whole ruleset, not just itself
+            if !device_file_openable(p) {
                 continue;
             }
             if let Err(e) = caps.allow_file_mut(p, AccessMode::ReadWrite) {
@@ -253,15 +316,30 @@ impl ProfileName {
             }
         }
 
-        // Kernel deny (read+write): macOS Seatbelt rules; Linux via bwrap bind-over.
-        // The effective deny set is the profile's own `deny` (custom profiles only;
-        // built-ins carry an empty `deny`). An empty set means there is nothing to
-        // enforce. Keying on emptiness rather than profile type avoids enforcing
-        // unintentional denies.
-        //
-        // Split exact paths from globs: exact paths keep the literal/subpath flow;
-        // globs become anchored Seatbelt regexes on macOS (a no-op here on Linux,
-        // where they are expanded and bound over at bwrap re-exec).
+        // Direct global-hook write-deny (macOS Seatbelt; Linux via bwrap).
+        if !profile.write_deny.is_empty() {
+            let mut pairs: Vec<(PathBuf, bool)> = profile
+                .write_deny
+                .iter()
+                .map(|s| (s.path.clone(), s.is_dir()))
+                .collect();
+            #[cfg(unix)]
+            {
+                let files =
+                    xai_grok_config::validated_hook_json_files_for_sources(&profile.write_deny)
+                        .map_err(|e| anyhow::anyhow!("hook JSON alias validation failed: {e}"))?;
+                for f in files {
+                    if !pairs.iter().any(|(p, _)| p == &f) {
+                        pairs.push((f, false));
+                    }
+                }
+            }
+            apply_write_deny_paths_to_capability_set(&mut caps, &pairs, &profile.read_write)?;
+        }
+
+        // Kernel deny (read and write): macOS Seatbelt rules; Linux via bwrap bind-over Key on an empty deny set, not profile
+        // type, so nothing unintentional is enforced. Globs become anchored Seatbelt regexes on macOS (a no-op here on Linux,
+        // where they are expanded and bound over at bwrap re-exec)
         let (exact_deny, glob_deny) = partition_deny_entries(&profile.deny);
         let all_denied = effective_deny_paths(workspace, &exact_deny);
         if !all_denied.is_empty() {
@@ -280,14 +358,32 @@ impl ProfileName {
         workspace: &Path,
         config: &SandboxConfig,
     ) -> anyhow::Result<SandboxProfile> {
-        self.resolve(workspace, config)
+        let (profile, _) = self.resolve_profile_with_runtime_sockets(workspace, config)?;
+        Ok(profile)
+    }
+
+    /// Resolve the profile plus provenance for automatic runtime-socket entries.
+    pub(crate) fn resolve_profile_with_runtime_sockets(
+        &self,
+        workspace: &Path,
+        config: &SandboxConfig,
+    ) -> anyhow::Result<(SandboxProfile, Vec<PathBuf>)> {
+        let mut profile = self.resolve(workspace, config)?;
+        let mut runtime_socket_denies = Vec::new();
+        if profile.restrict_network {
+            crate::runtime_sockets::append_runtime_socket_denies(
+                &mut profile.deny,
+                &mut runtime_socket_denies,
+            )
+            .map_err(|error| anyhow::anyhow!("runtime-socket deny resolution failed: {error}"))?;
+        }
+        Ok((profile, runtime_socket_denies))
     }
 
     fn resolve(&self, workspace: &Path, config: &SandboxConfig) -> anyhow::Result<SandboxProfile> {
         match self {
-            // Selected `off` is handled before resolve (empty CapabilitySet /
-            // early return in apply). Reaching here is almost always a custom
-            // profile with `extends = "off"` / `"none"` — return Err, never panic.
+            // Selected `off` is handled before resolve (empty CapabilitySet / early return in apply)
+            // Reaching here is almost always a custom profile with `extends = "off"` / `"none"`; return Err, never panic
             Self::Off => anyhow::bail!(
                 "sandbox profile 'off' cannot be resolved as a base profile; \
                  choose a built-in base (workspace, devbox, read-only, strict)"
@@ -298,22 +394,15 @@ impl ProfileName {
                 read_only: vec![],
                 read_write: essential_writable_paths(workspace),
                 deny: vec![],
+                write_deny: resolve_write_deny(self)?,
                 default_read: true,
                 restrict_network: false,
             }),
 
             Self::Devbox => {
-                // Everything writable except /data. Enumerate top-level
-                // dirs and skip the exclusion list. Can't grant "/" because
-                // Landlock has no deny_path — sub-path exceptions are
-                // only possible by not granting the parent.
-                //
-                // /data is excluded from read_write here (so it is not writable)
-                // but is deliberately NOT a kernel-deny: it stays readable via
-                // default_read, and its Linux write-deny comes from the
-                // bwrap_reexec_command(&["/data"]) re-exec, not from profile.deny.
-                // Keeping deny empty stops a custom profile that extends devbox
-                // from inheriting /data into the enforced kernel-deny set.
+                // Everything writable except /data Can't grant "/" because Landlock has no deny_path; sub-path exceptions are only
+                // possible by not granting the parent. /data is excluded from read_write here (so it is not writable) but is
+                // deliberately NOT a kernel-deny. It stays readable via default_read.
                 let exclude = [PathBuf::from("/data")];
                 let mut read_write = vec![workspace.to_path_buf()];
                 if let Ok(entries) = std::fs::read_dir("/") {
@@ -336,6 +425,7 @@ impl ProfileName {
                     read_only: vec![],
                     read_write,
                     deny: vec![],
+                    write_deny: vec![],
                     default_read: true,
                     restrict_network: false,
                 })
@@ -346,12 +436,13 @@ impl ProfileName {
                 read_only: vec![],
                 read_write: essential_writable_paths_minimal(),
                 deny: vec![],
+                write_deny: resolve_write_deny(self)?,
                 default_read: true,
                 restrict_network: true,
             }),
 
             Self::Strict => {
-                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/root"));
+                let home = xai_dirs::home_dir().unwrap_or_else(|| PathBuf::from("/root"));
                 let system_read: Vec<PathBuf> = [
                     "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/dev", "/proc", "/sys",
                     "/tmp",
@@ -371,13 +462,18 @@ impl ProfileName {
                 .chain(std::iter::once(home.join("Library")))
                 .filter(|p| p.exists())
                 .chain(std::iter::once(workspace.to_path_buf()))
+                // Read-only: AuthManager/config/hooks need the parent
+                // Landlock cannot carve children out of a write grant, so grok_home itself stays off read_write
+                // Only sessions/ is writable; events JSONL lives there
+                .chain(std::iter::once(grok_home()))
                 .collect();
 
                 Ok(SandboxProfile {
                     name: "strict".to_string(),
                     read_only: system_read,
-                    read_write: essential_writable_paths(workspace),
+                    read_write: essential_writable_paths_strict(workspace),
                     deny: vec![],
+                    write_deny: resolve_write_deny(self)?,
                     default_read: false,
                     restrict_network: true,
                 })
@@ -395,7 +491,7 @@ impl ProfileName {
                 })?;
 
                 // Start from the base profile if `extends` is set
-                let mut profile = if let Some(base_name) = &profile_config.extends {
+                let (base, mut profile) = if let Some(base_name) = &profile_config.extends {
                     let base: ProfileName = base_name.parse().map_err(|e: String| {
                         anyhow::anyhow!("Profile '{name}' extends invalid base: {e}")
                     })?;
@@ -411,10 +507,10 @@ impl ProfileName {
                              cannot extend other custom profiles (only built-ins)"
                         );
                     }
-                    base.resolve(workspace, config)?
+                    let resolved = base.resolve(workspace, config)?;
+                    (base, resolved)
                 } else {
-                    // Default: start from workspace
-                    Self::Workspace.resolve(workspace, config)?
+                    (Self::Workspace, Self::Workspace.resolve(workspace, config)?)
                 };
 
                 profile.name = name.clone();
@@ -424,19 +520,24 @@ impl ProfileName {
                     profile.restrict_network = restrict_net;
                 }
 
-                // Add custom read-only paths
                 for path_str in &profile_config.read_only {
-                    profile.read_only.push(PathBuf::from(path_str));
+                    if let Some(path) = normalize_allow_path(path_str) {
+                        profile.read_only.push(path);
+                    }
                 }
-
-                // Add custom read-write paths
                 for path_str in &profile_config.read_write {
-                    profile.read_write.push(PathBuf::from(path_str));
+                    if let Some(path) = normalize_allow_path(path_str) {
+                        profile.read_write.push(path);
+                    }
                 }
 
-                // Add custom deny paths
+                // Deny entries stay raw: globs there are partitioned and enforced as patterns, not directory grants
                 for path_str in &profile_config.deny {
                     profile.deny.push(PathBuf::from(path_str));
+                }
+
+                if matches!(base, Self::Devbox) {
+                    profile.write_deny.clear();
                 }
 
                 Ok(profile)
@@ -448,6 +549,7 @@ impl ProfileName {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{network_inheritance_config, skip_if_host_hook_write_deny_unresolvable};
 
     #[test]
     fn parse_profile_names() {
@@ -473,7 +575,6 @@ mod tests {
         );
         assert_eq!("off".parse::<ProfileName>().unwrap(), ProfileName::Off);
         assert_eq!("none".parse::<ProfileName>().unwrap(), ProfileName::Off);
-        // Unknown names become Custom profiles
         assert_eq!(
             "my-custom-profile".parse::<ProfileName>().unwrap(),
             ProfileName::Custom("my-custom-profile".to_string())
@@ -503,6 +604,9 @@ mod tests {
 
     #[test]
     fn built_in_network_restriction_values() {
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
         let workspace = std::env::current_dir().unwrap();
         let config = SandboxConfig::default();
 
@@ -517,55 +621,11 @@ mod tests {
         }
     }
 
-    fn network_inheritance_config() -> SandboxConfig {
-        SandboxConfig {
-            profiles: HashMap::from([
-                (
-                    "strict-inherited".to_string(),
-                    ProfileConfig {
-                        extends: Some("strict".to_string()),
-                        restrict_network: None,
-                        read_only: vec![],
-                        read_write: vec![],
-                        deny: vec![],
-                    },
-                ),
-                (
-                    "read-only-inherited".to_string(),
-                    ProfileConfig {
-                        extends: Some("read-only".to_string()),
-                        restrict_network: None,
-                        read_only: vec![],
-                        read_write: vec![],
-                        deny: vec![],
-                    },
-                ),
-                (
-                    "strict-unrestricted".to_string(),
-                    ProfileConfig {
-                        extends: Some("strict".to_string()),
-                        restrict_network: Some(false),
-                        read_only: vec![],
-                        read_write: vec![],
-                        deny: vec![],
-                    },
-                ),
-                (
-                    "workspace-restricted".to_string(),
-                    ProfileConfig {
-                        extends: Some("workspace".to_string()),
-                        restrict_network: Some(true),
-                        read_only: vec![],
-                        read_write: vec![],
-                        deny: vec![],
-                    },
-                ),
-            ]),
-        }
-    }
-
     #[test]
     fn custom_network_restriction_inherits_and_overrides_base() {
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
         let workspace = std::env::current_dir().unwrap();
         let config = network_inheritance_config();
 
@@ -584,7 +644,10 @@ mod tests {
     #[test]
     #[cfg(all(feature = "enforce", unix))]
     fn strict_allowlist_includes_run_and_var_when_present() {
-        // Regression: /run (resolv realpath) + /var (NSS/SSSD) when present.
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
+        // Regression: /run (resolv realpath) and /var (NSS/SSSD) when present
         let workspace = std::env::temp_dir();
         let profile = ProfileName::Strict
             .resolve_profile(&workspace, &SandboxConfig::default())
@@ -607,9 +670,93 @@ mod tests {
     }
 
     #[test]
+    fn strict_reads_grok_home_but_only_sessions_writable() {
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
+        let workspace = std::env::temp_dir();
+        let home = grok_home();
+        let sessions = home.join("sessions");
+
+        let cases = [
+            (
+                "strict",
+                ProfileName::Strict.resolve_profile(&workspace, &SandboxConfig::default()),
+            ),
+            (
+                "strict-inherited",
+                ProfileName::Custom("strict-inherited".to_string())
+                    .resolve_profile(&workspace, &network_inheritance_config()),
+            ),
+        ];
+        for (label, resolved) in cases {
+            let profile = resolved.unwrap_or_else(|e| panic!("{label} resolves: {e}"));
+            assert!(
+                profile.read_only.iter().any(|p| p == &home),
+                "{label} read_only must include grok_home: {:?}",
+                profile.read_only
+            );
+            // Post-apply hook write-deny opens hooks-paths and lists hooks at startup.
+            for required in [home.join("hooks"), home.join("hooks-paths")] {
+                assert!(
+                    profile
+                        .read_only
+                        .iter()
+                        .any(|p| p == &required || required.starts_with(p)),
+                    "{label} read_only must cover {required:?}: {:?}",
+                    profile.read_only
+                );
+            }
+            assert!(
+                !profile.read_write.iter().any(|p| p == &home),
+                "{label} read_write must not include grok_home itself: {:?}",
+                profile.read_write
+            );
+            let events = crate::paths::sandbox_events_log_path();
+            assert!(events.starts_with(&sessions));
+            for p in &profile.read_write {
+                if !p.starts_with(&home) {
+                    continue;
+                }
+                assert!(
+                    p.starts_with(&sessions),
+                    "{label} read_write path under grok_home must be under sessions/: {p:?}"
+                );
+            }
+            assert!(
+                profile.read_write.iter().any(|p| p == &sessions),
+                "{label} read_write must include sessions/: {:?}",
+                profile.read_write
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_and_read_only_still_include_grok_home() {
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
+        let workspace = std::env::temp_dir();
+        let config = SandboxConfig::default();
+        let home = grok_home();
+        for name in [ProfileName::Workspace, ProfileName::ReadOnly] {
+            let profile = name
+                .resolve_profile(&workspace, &config)
+                .unwrap_or_else(|e| panic!("{name} resolves: {e}"));
+            assert!(
+                profile.read_write.iter().any(|p| p == &home),
+                "{name} read_write must include grok_home: {:?}",
+                profile.read_write
+            );
+        }
+    }
+
+    #[test]
     #[cfg(all(feature = "enforce", unix))]
     fn base_profile_capability_set_builds() {
-        // A base profile with no `deny` builds a CapabilitySet without erroring.
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
         let workspace = std::env::current_dir().unwrap();
         let config = SandboxConfig::default();
         let result = ProfileName::Workspace.to_capability_set_with_config(&workspace, &config);
@@ -619,6 +766,9 @@ mod tests {
     #[test]
     #[cfg(all(feature = "enforce", unix))]
     fn custom_profile_from_config() {
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
         let workspace = std::env::current_dir().unwrap();
         let config = SandboxConfig {
             profiles: HashMap::from([(
@@ -641,9 +791,8 @@ mod tests {
     #[test]
     #[cfg(all(feature = "enforce", unix))]
     fn custom_extends_devbox_has_no_data_in_deny() {
-        // Regression: devbox excludes /data via a local list, not profile.deny, so
-        // a custom profile extending devbox must not inherit /data into the kernel
-        // deny set (which would wrongly read-deny /data and force fail-closed).
+        // Regression: devbox excludes /data via a local list, not profile.deny
+        // Inheriting it into the kernel deny set would wrongly read-deny /data and force fail-closed
         let workspace = std::env::current_dir().unwrap();
         let config = SandboxConfig {
             profiles: HashMap::from([(
@@ -725,6 +874,97 @@ read_write = ["/tmp/ci-artifacts"]
         assert!(config.profiles.contains_key("ci"));
         assert_eq!(config.profiles["devbox"].read_only, vec!["/data"]);
         assert_eq!(config.profiles["devbox"].deny, vec!["/data/private"]);
+    }
+
+    /// Custom-profile resolve: allow entries are normalized, deny entries are not.
+    #[test]
+    fn custom_profile_strips_allow_globs_keeps_deny_globs() {
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
+        let workspace = std::env::current_dir().unwrap();
+        let config = SandboxConfig {
+            profiles: HashMap::from([(
+                "cargo".to_string(),
+                ProfileConfig {
+                    extends: Some("workspace".to_string()),
+                    restrict_network: None,
+                    read_only: vec!["/opt/tooling/**".to_string()],
+                    read_write: vec![
+                        "/home/user/.cargo/registry/cache/**".to_string(),
+                        "/home/user/.cargo/registry/index".to_string(),
+                    ],
+                    deny: vec!["**/.env".to_string(), "/secrets/**".to_string()],
+                },
+            )]),
+        };
+        let resolved = ProfileName::Custom("cargo".to_string())
+            .resolve_profile(&workspace, &config)
+            .expect("cargo profile resolves");
+
+        // Custom entries are appended after the base profile's own paths.
+        assert_eq!(
+            resolved.read_write[resolved.read_write.len() - 2..],
+            [
+                PathBuf::from("/home/user/.cargo/registry/cache"),
+                PathBuf::from("/home/user/.cargo/registry/index"),
+            ]
+        );
+        assert_eq!(resolved.read_only, [PathBuf::from("/opt/tooling")]);
+        assert_eq!(
+            resolved.deny,
+            [PathBuf::from("**/.env"), PathBuf::from("/secrets/**")]
+        );
+    }
+
+    /// Building the capability set pre-creates missing `read_write` dirs.
+    /// A trailing-`/**` entry must create/grant the parent, never a literal `**` dir.
+    #[test]
+    #[cfg(all(feature = "enforce", unix))]
+    fn capability_set_trailing_glob_does_not_create_starstar_dir() {
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "grok-sandbox-starstar-capset-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = root.join("cache");
+        std::fs::create_dir_all(cache.join("registry-a1b2")).unwrap();
+        let allow_glob = format!(
+            "{}/**",
+            dunce::canonicalize(&cache)
+                .unwrap_or_else(|_| cache.clone())
+                .display()
+        );
+
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config = SandboxConfig {
+            profiles: HashMap::from([(
+                "cargo".to_string(),
+                ProfileConfig {
+                    extends: Some("workspace".to_string()),
+                    restrict_network: None,
+                    read_only: vec![],
+                    read_write: vec![allow_glob],
+                    deny: vec![],
+                },
+            )]),
+        };
+
+        ProfileName::Custom("cargo".to_string())
+            .to_capability_set_with_config(&workspace, &config)
+            .expect("capability set builds");
+
+        let starstar = cache.join("**");
+        assert!(
+            !starstar.exists(),
+            "normalized allow path must not create a literal '**' directory at {starstar:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -819,5 +1059,96 @@ read_write = ["/tmp/ci-artifacts"]
             .resolve_profile(&workspace, &SandboxConfig::default())
             .expect_err("Off.resolve must Err");
         assert!(err.to_string().contains("off"), "unexpected error: {err}");
+    }
+
+    #[test]
+    #[cfg(all(feature = "enforce", unix))]
+    fn enxio_device_file_is_skipped_but_directory_is_not() {
+        assert!(
+            device_file_openable(Path::new("/dev/null")),
+            "openable device must still be allow-listed"
+        );
+
+        // /dev/tty without a controlling terminal returns ENXIO (the apply-abort case)
+        // Skip the assertion when a ctty is present (open succeeds).
+        match std::fs::File::open("/dev/tty") {
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                assert!(
+                    !device_file_openable(Path::new("/dev/tty")),
+                    "ENXIO /dev/tty must be skipped so Landlock apply cannot abort"
+                );
+            }
+            Ok(_) | Err(_) => {}
+        }
+
+        // Directories must stay grantable
+        // On Linux, File::open returns EISDIR; on macOS it often succeeds
+        // Either way the probe must return true so directory devices (e.g. /dev/fd via DEVICE_DIRS) are not dropped.
+        let dir = std::env::temp_dir().join(format!("grok-sbx-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        match std::fs::File::open(&dir) {
+            Err(e) => {
+                assert_eq!(
+                    e.raw_os_error(),
+                    Some(libc::EISDIR),
+                    "unexpected directory open error: {e}"
+                );
+                assert!(
+                    device_file_openable(&dir),
+                    "EISDIR must not drop a path from grant consideration"
+                );
+            }
+            Ok(_) => {
+                assert!(
+                    device_file_openable(&dir),
+                    "openable directory must remain grantable"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Building the strict CapabilitySet must succeed even when /dev/tty cannot be opened (no controlling terminal).
+    /// Regression for the silent Landlock apply-abort under setsid/CI/headless.
+    #[test]
+    #[cfg(all(feature = "enforce", unix))]
+    fn strict_capability_set_builds_without_openable_dev_tty() {
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
+        let workspace = std::env::current_dir().unwrap();
+        let result = ProfileName::Strict.to_capability_set(&workspace);
+        assert!(
+            result.is_ok(),
+            "strict CapabilitySet must build even if /dev/tty is unopenable: {:?}",
+            result.err()
+        );
+    }
+
+    /// `/dev/fd` is a directory (a symlink to `/proc/self/fd` on Linux).
+    /// It must be granted via DEVICE_DIRS/`allow_path`, not dropped by a file-open EISDIR probe.
+    #[test]
+    #[cfg(all(feature = "enforce", unix))]
+    fn dev_fd_is_granted_as_device_dir_not_skipped_as_file() {
+        assert!(
+            !DEVICE_FILES.contains(&"/dev/fd"),
+            "/dev/fd must not sit in DEVICE_FILES (File::open → EISDIR)"
+        );
+        assert!(
+            DEVICE_DIRS.contains(&"/dev/fd"),
+            "/dev/fd must be in DEVICE_DIRS so allow_path can grant it"
+        );
+        let dev_fd = Path::new("/dev/fd");
+        if dev_fd.exists() {
+            // Directory open fails with EISDIR for plain File::open; the probe must still report grantable so we don't regress directory devices
+            assert!(
+                device_file_openable(dev_fd),
+                "/dev/fd must not be filtered out by the ENXIO-only open probe"
+            );
+            assert!(
+                dev_fd.is_dir(),
+                "expected /dev/fd to be a directory on this platform"
+            );
+        }
     }
 }

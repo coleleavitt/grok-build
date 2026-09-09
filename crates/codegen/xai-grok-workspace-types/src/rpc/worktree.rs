@@ -1,18 +1,15 @@
-//! Worktree lifecycle methods (`workspace.create_worktree`,
-//! `workspace.remove_worktree`, `workspace.apply_worktree`,
-//! `workspace.worktree_*`).
-use super::WorkspaceRpc;
+//! Worktree methods (`workspace.create_worktree`, `workspace.remove_worktree`, `workspace.apply_worktree`, `workspace.worktree_*`).
 use super::git::{ChangeType, GitFileChange};
+use super::{RpcActivityClass, WorkspaceRpc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 /// Worktree creation strategy.
 ///
-/// Mirrors `xai_fast_worktree::CreationMode` but uses config-friendly naming
-/// (lowercase strings in TOML / JSON).
+/// Mirrors `xai_fast_worktree::CreationMode` but uses config-friendly naming (lowercase strings in TOML / JSON).
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WorktreeType {
-    /// Linked worktree via `git worktree add --no-checkout` + parallel CoW copy.
+    /// Linked worktree via `git worktree add --no-checkout` and a parallel CoW copy.
     #[default]
     Linked,
     /// Standalone repository copy with independent `.git/` directory.
@@ -52,11 +49,97 @@ pub struct CopiedChangesSummary {
     pub deletions_applied: u32,
     pub warnings: Vec<String>,
 }
-/// Copy mode for worktree creation
+/// What was asked for vs what ran. Reused on create, fork, resume, clone, and show.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StrategyReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_capability_class: Option<String>,
+}
+impl StrategyReport {
+    /// [`Self::summary`] when the report carries news — Grove was requested, or
+    /// something fell back — and `None` for an ordinary copy worktree, whose
+    /// summary would only restate the default the user already expects.
+    #[must_use]
+    pub fn notice(&self) -> Option<String> {
+        let asked_for_grove = self
+            .requested_strategy
+            .as_deref()
+            .is_some_and(|r| r.eq_ignore_ascii_case("grove"));
+        (asked_for_grove || self.fallback_reason.is_some()).then(|| self.summary())
+    }
+    /// One-line notice matching existing CLI tone.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let requested = self.requested_strategy.as_deref().unwrap_or("copy");
+        let resolved = self.resolved_strategy.as_deref().unwrap_or("copy");
+        if let Some(reason) = self.fallback_reason.as_deref()
+            && (reason.contains("still in flight") || reason.contains("not falling back"))
+        {
+            return reason.to_owned();
+        }
+        if !requested.eq_ignore_ascii_case("grove") {
+            return match self.fallback_reason.as_deref() {
+                Some(reason) => format!("Using {resolved} because {reason}."),
+                None => format!("Using {resolved}."),
+            };
+        }
+        if is_grove_resolved(resolved) {
+            let objects = match self.source_mode.as_deref() {
+                Some("local") => " (local objects)",
+                Some("remote") => " (remote objects)",
+                _ => "",
+            };
+            return format!("Requested Grove; using `{resolved}`{objects}.");
+        }
+        match self.fallback_reason.as_deref() {
+            Some("remote Grove is off") => {
+                format!("Requested Grove; using {resolved} because remote Grove is off.")
+            }
+            Some(reason) => {
+                format!("Requested Grove; using {resolved} because {reason}.")
+            }
+            None => format!("Requested Grove; using {resolved}."),
+        }
+    }
+}
+#[must_use]
+pub fn is_grove_resolved(strategy: &str) -> bool {
+    matches!(strategy, "grove-fuse" | "grove-nfs" | "nfs")
+}
+/// Transport label for a resolved strategy. Linux FUSE is never `nfs`.
+#[must_use]
+pub fn transport_for_resolved(
+    resolved: &str,
+    grove_transport: Option<&str>,
+) -> Option<&'static str> {
+    if let Some(t) = grove_transport {
+        return Some(if t.eq_ignore_ascii_case("fuse") {
+            "fuse"
+        } else {
+            "nfs"
+        });
+    }
+    match resolved {
+        "grove-fuse" => Some("fuse"),
+        "grove-nfs" | "nfs" => Some("nfs"),
+        _ => None,
+    }
+}
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WorktreeCopyMode {
-    /// Only committed files at HEAD (original behavior)
+    /// Only committed files at HEAD
     Clean,
     /// Copy dirty files, skip large untracked dirs (recommended)
     #[default]
@@ -89,9 +172,17 @@ pub struct CreateWorktreeRequest {
     /// When absent, an automatic `YYYY-MM-DD-<uuid>` label is generated.
     #[serde(default)]
     pub label: Option<String>,
+    /// When `Some(true)`, enable the grove worktree arm on the builder; absent or false means copy.
+    /// `nfsWorktree` / `nfs_worktree` are deserialize aliases.
+    #[serde(default, alias = "nfsWorktree", alias = "nfs_worktree")]
+    pub grove_worktree: Option<bool>,
+    /// Gate source from `gate_grove_worktree_layers` (`request` / `env` / `local` / `remote` / `remote_kill` / `remote_unavailable` / `default`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grove_gate_source: Option<String>,
 }
 impl WorkspaceRpc for CreateWorktreeRequest {
     const METHOD: &'static str = "workspace.create_worktree";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Mutation;
     type Response = Value;
 }
 fn default_copy_mode() -> WorktreeCopyMode {
@@ -107,8 +198,7 @@ pub enum CreateWorktreeResponse {
         #[serde(rename = "worktreePath")]
         worktree_path: String,
         /// Working directory root of the source repo/worktree (via `workdir()`).
-        /// Clients strip this prefix from `source_path` to compute the
-        /// subdirectory offset inside the new worktree.
+        /// Clients strip this prefix from `source_path` to compute the subdirectory offset inside the new worktree.
         #[serde(rename = "sourceGitRoot", skip_serializing_if = "Option::is_none")]
         source_git_root: Option<String>,
     },
@@ -120,19 +210,18 @@ pub enum CreateWorktreeResponse {
         worktree_path: String,
         commit: String,
         /// Working directory root of the source repo/worktree (via `workdir()`).
-        /// Clients strip this prefix from `source_path` to compute the
-        /// subdirectory offset inside the new worktree.
+        /// Clients strip this prefix from `source_path` to compute the subdirectory offset inside the new worktree.
         #[serde(rename = "sourceGitRoot", skip_serializing_if = "Option::is_none")]
         source_git_root: Option<String>,
     },
 }
-/// `workspace.worktree_create_sync` — synchronous worktree creation; the
-/// params are a [`CreateWorktreeRequest`] (transparent).
+/// `workspace.worktree_create_sync`: synchronous worktree creation; the params are a [`CreateWorktreeRequest`] (transparent).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct WorktreeCreateSyncReq(pub CreateWorktreeRequest);
 impl WorkspaceRpc for WorktreeCreateSyncReq {
     const METHOD: &'static str = "workspace.worktree_create_sync";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Mutation;
     type Response = Value;
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,6 +240,7 @@ pub struct RemoveWorktreeRequest {
 }
 impl WorkspaceRpc for RemoveWorktreeRequest {
     const METHOD: &'static str = "workspace.remove_worktree";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Mutation;
     type Response = Value;
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -160,7 +250,6 @@ pub struct RemoveWorktreeResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_path: Option<String>,
 }
-/// Response from creating a worktree from another worktree.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorktreeFromWorktreeResponse {
@@ -172,18 +261,14 @@ pub struct CreateWorktreeFromWorktreeResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub copied_changes: Option<CopiedChangesSummary>,
     /// Working directory root of the source repo/worktree (via `workdir()`).
-    /// Clients strip this prefix from `source_worktree_path` to compute the
-    /// subdirectory offset inside the new worktree.
+    /// Clients strip this prefix from `source_worktree_path` to compute the subdirectory offset inside the new worktree.
     #[serde(rename = "sourceGitRoot", skip_serializing_if = "Option::is_none")]
     pub source_git_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<StrategyReport>,
 }
-/// Wire mirror of the heavy crate's `CreateWorktreeFromWorktreeRequest`.
-///
-/// Drops the two `#[serde(skip)]` runtime-only fields
-/// (`cancellation_token: tokio_util::sync::CancellationToken` and
-/// `resolved_dest_path`) so this lean crate avoids a `tokio_util` dependency.
-/// Those fields are already absent from the wire, so the serde shape is
-/// byte-identical; the server re-adds them as `None` when converting back.
+/// Wire mirror of `CreateWorktreeFromWorktreeRequest`, dropping runtime-only fields so this crate avoids a `tokio_util` dependency.
+/// Those fields are already absent from the wire; the server re-adds them as `None`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorktreeFromWorktreeRequestWire {
@@ -197,17 +282,21 @@ pub struct CreateWorktreeFromWorktreeRequestWire {
     pub worktree_type: Option<WorktreeType>,
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default, alias = "nfsWorktree", alias = "nfs_worktree")]
+    pub grove_worktree: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grove_gate_source: Option<String>,
 }
-/// `workspace.worktree_create_from_worktree_sync` — synchronous worktree fork.
+/// `workspace.worktree_create_from_worktree_sync`: synchronous worktree fork.
 ///
-/// Unlike [`WorktreeCreateSyncReq`] this is **not** `#[serde(transparent)]`, so
-/// the wire form keeps the `{ "inner": { … } }` wrapper.
+/// Unlike [`WorktreeCreateSyncReq`] this is **not** `#[serde(transparent)]`, so the wire form keeps the `{ "inner": { … } }` wrapper.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateWorktreeFromWorktreeSyncReq {
     pub inner: CreateWorktreeFromWorktreeRequestWire,
 }
 impl WorkspaceRpc for CreateWorktreeFromWorktreeSyncReq {
     const METHOD: &'static str = "workspace.worktree_create_from_worktree_sync";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Mutation;
     type Response = CreateWorktreeFromWorktreeResponse;
 }
 /// Serializable version of `PrepareWorktreeResult` for wire transport.
@@ -235,6 +324,7 @@ pub struct ApplyWorktreeRequest {
 }
 impl WorkspaceRpc for ApplyWorktreeRequest {
     const METHOD: &'static str = "workspace.apply_worktree";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Mutation;
     type Response = Value;
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -268,6 +358,7 @@ pub struct WorktreeShowReq {
 }
 impl WorkspaceRpc for WorktreeShowReq {
     const METHOD: &'static str = "workspace.worktree_show";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = Value;
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +371,7 @@ pub struct WorktreeGcReq {
 }
 impl WorkspaceRpc for WorktreeGcReq {
     const METHOD: &'static str = "workspace.worktree_gc";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = Value;
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -292,18 +384,21 @@ pub struct WorktreeListReq {
 }
 impl WorkspaceRpc for WorktreeListReq {
     const METHOD: &'static str = "workspace.worktree_list";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = Value;
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeDbRebuildReq {}
 impl WorkspaceRpc for WorktreeDbRebuildReq {
     const METHOD: &'static str = "workspace.worktree_db_rebuild";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = Value;
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeDbPathReq {}
 impl WorkspaceRpc for WorktreeDbPathReq {
     const METHOD: &'static str = "workspace.worktree_db_path";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = WorktreeDbPathResponse;
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +409,40 @@ pub struct WorktreeDbPathResponse {
 pub struct WorktreeDbStatsReq {}
 impl WorkspaceRpc for WorktreeDbStatsReq {
     const METHOD: &'static str = "workspace.worktree_db_stats";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
+    type Response = Value;
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeDetachReq {
+    pub id_or_path: String,
+    #[serde(default)]
+    pub allow_copy: bool,
+}
+impl WorkspaceRpc for WorktreeDetachReq {
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Mutation;
+    const METHOD: &'static str = "workspace.worktree_detach";
+    type Response = Value;
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeSalvageReq {
+    pub id_or_path: String,
+    pub out: String,
+}
+impl WorkspaceRpc for WorktreeSalvageReq {
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Mutation;
+    const METHOD: &'static str = "workspace.worktree_salvage";
+    type Response = Value;
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeCleanArtifactsReq {
+    pub id_or_path: String,
+}
+impl WorkspaceRpc for WorktreeCleanArtifactsReq {
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Mutation;
+    const METHOD: &'static str = "workspace.worktree_clean_artifacts";
     type Response = Value;
 }
 #[cfg(test)]
@@ -352,6 +481,8 @@ mod tests {
                 git_ref: None,
                 worktree_type: None,
                 label: None,
+                grove_worktree: None,
+                grove_gate_source: None,
             },
         };
         let json = serde_json::to_value(&req).unwrap();
@@ -373,6 +504,8 @@ mod tests {
             ignored_skip_patterns: vec![],
             worktree_type: None,
             label: None,
+            grove_worktree: None,
+            grove_gate_source: None,
         });
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["sessionId"], "s1");
@@ -402,5 +535,98 @@ mod tests {
         assert_eq!(json["sessionId"], "s1");
         assert_eq!(json["worktreePath"], "/wt");
         assert!(json.get("sourceGitRoot").is_none());
+    }
+    #[test]
+    fn strategy_report_summary_grove_success_and_copy_fallback() {
+        let grove = StrategyReport {
+            requested_strategy: Some("grove".into()),
+            resolved_strategy: Some("grove-fuse".into()),
+            transport: Some("fuse".into()),
+            source_mode: Some("local".into()),
+            fallback_reason: None,
+            daemon_capability_class: Some("current".into()),
+        };
+        assert_eq!(
+            grove.summary(),
+            "Requested Grove; using `grove-fuse` (local objects)."
+        );
+        let copy = StrategyReport {
+            requested_strategy: Some("grove".into()),
+            resolved_strategy: Some("copy".into()),
+            transport: None,
+            source_mode: Some("local".into()),
+            fallback_reason: Some("remote Grove is off".into()),
+            daemon_capability_class: Some("unknown".into()),
+        };
+        assert_eq!(
+            copy.summary(),
+            "Requested Grove; using copy because remote Grove is off."
+        );
+        let overlay = StrategyReport {
+            requested_strategy: Some("grove".into()),
+            resolved_strategy: Some("overlay".into()),
+            transport: None,
+            source_mode: Some("local".into()),
+            fallback_reason: None,
+            daemon_capability_class: Some("old".into()),
+        };
+        assert_eq!(overlay.summary(), "Requested Grove; using overlay.");
+        let skip_wins = StrategyReport {
+            requested_strategy: Some("grove".into()),
+            resolved_strategy: Some("copy".into()),
+            transport: None,
+            source_mode: Some("local".into()),
+            fallback_reason: Some("grove-fuse: /dev/fuse or fusermount missing".into()),
+            daemon_capability_class: Some("old".into()),
+        };
+        assert_eq!(
+            skip_wins.summary(),
+            "Requested Grove; using copy because grove-fuse: /dev/fuse or fusermount missing."
+        );
+    }
+    #[test]
+    fn strategy_report_notice_skips_the_uninformative_default() {
+        let plain = StrategyReport {
+            requested_strategy: Some("linked".into()),
+            resolved_strategy: Some("copy".into()),
+            ..Default::default()
+        };
+        assert_eq!(plain.summary(), "Using copy.");
+        assert_eq!(plain.notice(), None);
+        let fell_back = StrategyReport {
+            fallback_reason: Some("remote Grove is off".into()),
+            ..plain.clone()
+        };
+        assert_eq!(
+            fell_back.notice().as_deref(),
+            Some("Using copy because remote Grove is off.")
+        );
+        let grove = StrategyReport {
+            requested_strategy: Some("grove".into()),
+            ..plain
+        };
+        assert_eq!(
+            grove.notice().as_deref(),
+            Some("Requested Grove; using copy.")
+        );
+    }
+    #[test]
+    fn strategy_report_omits_empty_fields() {
+        let json = serde_json::to_value(StrategyReport::default()).unwrap();
+        assert_eq!(json, serde_json::json!({}));
+    }
+    #[test]
+    fn transport_for_resolved_never_labels_fuse_as_nfs() {
+        assert_eq!(
+            transport_for_resolved("grove-fuse", Some("fuse")),
+            Some("fuse")
+        );
+        assert_eq!(transport_for_resolved("grove-fuse", None), Some("fuse"));
+        assert_eq!(
+            transport_for_resolved("grove-nfs", Some("nfs")),
+            Some("nfs")
+        );
+        assert_eq!(transport_for_resolved("nfs", None), Some("nfs"));
+        assert_eq!(transport_for_resolved("copy", None), None);
     }
 }

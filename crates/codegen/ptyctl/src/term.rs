@@ -15,11 +15,7 @@ use alacritty_terminal::vte::ansi;
 use crate::styled::{self, StyledLine};
 
 /// Event listener that captures `PtyWrite` events for forwarding back to PTY.
-///
-/// When the terminal emulator needs to respond to device status queries (DSR),
-/// color queries, etc., it emits `Event::PtyWrite`. These MUST be forwarded
-/// back to the PTY, otherwise programs like vim/tmux will hang waiting for
-/// a response.
+/// Device-status replies MUST be forwarded, otherwise vim/tmux hang waiting for a response.
 #[derive(Clone)]
 pub struct SessionListener {
     pty_write_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
@@ -274,8 +270,8 @@ impl Terminal {
 
                 // Replace cursor position if requested.
                 let is_cursor = cursor.row == line_idx + 1 && cursor.col == col_idx + 1;
-                if is_cursor && opts.cursor_char.is_some() {
-                    text.push(opts.cursor_char.unwrap());
+                if is_cursor && let Some(cursor_char) = opts.cursor_char {
+                    text.push(cursor_char);
                 } else {
                     text.push(cell.c);
                     if let Some(zw) = cell.zerowidth() {

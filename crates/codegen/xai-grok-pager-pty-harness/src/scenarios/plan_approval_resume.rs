@@ -1,14 +1,11 @@
-//! Plan-approval chrome restored by the shell after quit + resume.
+//! Plan-approval chrome restored by the shell after quit and resume.
 //!
-//! When `exit_plan_mode` is parked and the user quits, the shell persists
-//! `awaiting_plan_approval = true` in `plan_mode.json`. On `--continue` the
-//! shell re-issues the `x.ai/exit_plan_mode` reverse-request — a real live ACP
-//! waiter — so the pager re-shows approval chrome through its normal path with
-//! no pager-side disk logic. Approving then leaves plan mode and starts the
-//! implement turn.
+//! When `exit_plan_mode` is parked and the user quits, the shell persists `awaiting_plan_approval = true` in `plan_mode.json`.
+//! On `--continue` the shell re-issues the `x.ai/exit_plan_mode` reverse-request, a real live ACP waiter.
+//! The pager then re-shows approval chrome through its normal path with no pager-side disk logic.
+//! Approving then leaves plan mode and starts the implement turn.
 //!
-//! This FAILS without the shell re-park (PR2 product change): no reverse-request
-//! reaches the resumed pager, so no approval chrome appears.
+//! This FAILS without the shell re-park: no reverse-request reaches the resumed pager, so no approval chrome appears.
 
 use std::path::Path;
 use std::time::Duration;
@@ -21,8 +18,7 @@ use crate::{ContentController, PtyHarness, pager_binary};
 const DEFAULT_ROWS: u16 = 50;
 const DEFAULT_COLS: u16 = 120;
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(20);
-/// Distinct per-turn sentinels: turn 1 seeds the session before quit; turn 2 is
-/// the implement turn the shell injects after the resumed approval is approved.
+/// Turn 1 seeds the session before quit; turn 2 is the implement turn the shell injects after the resumed approval is approved.
 const SETUP_SENTINEL: &str = "GBT3703SETUP";
 const IMPLEMENT_SENTINEL: &str = "GBT3703IMPLEMENTED";
 
@@ -35,19 +31,19 @@ const PLAN_BODY: &str = "\
 3. Resume and expect restored approval chrome
 ";
 
-/// Regression: the shell re-parks `exit_plan_mode` on resume; pressing
-/// approve leaves plan mode and starts the implement turn.
+/// Regression: the shell re-parks `exit_plan_mode` on resume; pressing approve leaves plan mode and starts the implement turn.
 pub async fn assert_plan_approval_restored_after_resume() -> Result<()> {
     let content = ContentController::start()
         .await
         .context("start ContentController")?;
-    // One response per agent turn (FIFO, 2+-tool requests only — aux requests
-    // never steal one). Turn 1 is consumed by the first pager; turn 2 by the
-    // implement turn the shell starts after approval.
-    content.set_turns([
+    let mut setup_turn = content.expect_agent_turn(
+        "initial plan-drafting turn",
         format!("{SETUP_SENTINEL}: drafted a plan for the user to review."),
+    );
+    let mut implement_turn = content.expect_agent_turn(
+        "implementation after approval",
         format!("{IMPLEMENT_SENTINEL}: implementing the approved plan."),
-    ]);
+    );
 
     let project = tempfile::tempdir().context("project dir")?;
     std::fs::create_dir_all(project.path().join(".git")).context("create .git")?;
@@ -69,9 +65,11 @@ pub async fn assert_plan_approval_restored_after_resume() -> Result<()> {
     first
         .wait_for_text(SETUP_SENTINEL, Duration::from_secs(30))
         .context("setup turn rendered")?;
+    tokio::time::timeout(Duration::from_secs(10), setup_turn.wait_satisfied())
+        .await
+        .context("setup turn expectation timeout")?;
 
-    // Quit and reap BEFORE seeding so the still-live shell cannot re-persist
-    // and clobber the seeded state.
+    // Quit and reap BEFORE seeding so the still-live shell cannot re-persist and clobber the seeded state
     first.inject_keys(b"\x11").context("ctrl-q once")?;
     first.update(Duration::from_millis(200));
     first.inject_keys(b"\x11").context("ctrl-q confirm")?;
@@ -90,9 +88,8 @@ pub async fn assert_plan_approval_restored_after_resume() -> Result<()> {
     )
     .context("spawn resumed pager")?;
 
-    // The shell re-parks `exit_plan_mode` on resume, so approval chrome can open
-    // immediately and cover chat history. Prefer the chrome markers (product
-    // signal) over SETUP_SENTINEL, which may not be visible under the plan viewer.
+    // The shell re-parks `exit_plan_mode` on resume, so approval chrome can open immediately and cover chat history
+    // Prefer the chrome markers (product signal) over SETUP_SENTINEL, which may not be visible under the plan viewer
     // Without the shell re-park this times out.
     resumed
         .wait_for_text("request changes", WELCOME_TIMEOUT)
@@ -104,8 +101,7 @@ pub async fn assert_plan_approval_restored_after_resume() -> Result<()> {
     if !screen.contains("approve") {
         bail!("expected approval primary action after resume\n{screen}");
     }
-    // History was seeded before quit; plan body from disk is a stronger signal
-    // that the session was restored when chrome already covers the transcript.
+    // History was seeded before quit; plan body from disk is a stronger signal that the session was restored when chrome already covers the transcript
     if !screen.contains("GBT3703Repro")
         && !screen.contains(SETUP_SENTINEL)
         && !screen.contains("Seed plan file on disk")
@@ -121,14 +117,15 @@ pub async fn assert_plan_approval_restored_after_resume() -> Result<()> {
     resumed
         .wait_for_text(IMPLEMENT_SENTINEL, Duration::from_secs(30))
         .context("approve must leave plan mode and start the implement turn")?;
+    tokio::time::timeout(Duration::from_secs(10), implement_turn.wait_satisfied())
+        .await
+        .context("implement turn expectation timeout")?;
 
     resumed.quit().context("quit resumed pager")?;
     Ok(())
 }
 
-/// Mark the persisted session as having a parked plan approval: write `plan.md`
-/// and flip `awaiting_plan_approval` to `true` in `plan_mode.json` for every
-/// session dir under the sandbox home.
+/// For every session dir under the sandbox home, write `plan.md` and flip `awaiting_plan_approval` to `true` in `plan_mode.json`.
 fn seed_parked_approval(home: &Path) -> Result<usize> {
     let sessions_root = home.join(".grok").join("sessions");
     if !sessions_root.is_dir() {
@@ -163,12 +160,7 @@ fn seed_parked_approval(home: &Path) -> Result<usize> {
     Ok(seeded)
 }
 
-/// Round-trip the shell-written `plan_mode.json` and flip `awaiting_plan_approval`
-/// to `true`, preserving every other field. Falls back to a fresh Active
-/// snapshot if the shell wrote nothing. The shape mirrors
-/// `xai_grok_shell::session::plan_mode::PlanModeSnapshot`; we only touch the one
-/// field (robust to schema growth) rather than depend on the heavy shell crate
-/// from this test-only harness.
+/// Flip one field and preserve the rest, so schema growth does not require the shell crate. Fresh Active snapshot if the shell wrote nothing.
 fn write_awaiting_plan_mode(path: &Path) -> Result<()> {
     let mut value: serde_json::Value = std::fs::read_to_string(path)
         .ok()

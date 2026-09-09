@@ -51,6 +51,7 @@ async fn tool_bridge_routes_writes_through_injected_fs() {
         session_env: std::sync::Arc::new(std::collections::HashMap::new()),
         notification_handle: ToolNotificationHandle::noop(),
         owner_session_id: None,
+        subagent: None,
         parent_scheduler_handle: None,
         skills: vec![],
         state_path: std::env::temp_dir().join("grok-test-fs/tool_state.json"),
@@ -70,7 +71,7 @@ async fn tool_bridge_routes_writes_through_injected_fs() {
         .await
         .expect("finalize_builder should succeed");
 
-    // Create a new file via search_replace (old_string="" = new file).
+    // Create a new file via search_replace (an empty old_string means a new file)
     let result = bridge
         .call(
             "search_replace",

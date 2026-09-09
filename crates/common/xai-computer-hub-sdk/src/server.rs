@@ -45,7 +45,7 @@ use crate::auth::{AuthCredential, AuthProvider};
 use crate::cancel::CancelRegistry;
 use crate::connection::{
     ConnectCallback, ConnectionTuning, DisconnectCallback, HubConnection, ReconnectCallback,
-    ReconnectEvent,
+    ReconnectEvent, TerminalCloseCallback,
 };
 use crate::connection_borrow::ConnectionBorrow;
 use crate::demux::InboundFrame;
@@ -221,6 +221,7 @@ pub struct ToolServerBuilder {
     /// precede server session re-serve.
     on_reconnect_settled: Option<Arc<ReconnectSettledCallback>>,
     on_disconnect: Option<Arc<DisconnectCallback>>,
+    on_terminal_close: Option<Arc<TerminalCloseCallback>>,
     on_connect: Option<Arc<ConnectCallback>>,
     metadata: Option<serde_json::Value>,
     server_id: Option<xai_tool_protocol::ServerId>,
@@ -234,8 +235,23 @@ pub struct ToolServerBuilder {
     ws_ping_interval: Option<std::time::Duration>,
     ws_liveness_deadline: Option<std::time::Duration>,
     reconnect_backoff: Option<Arc<[std::time::Duration]>>,
+    reconnect_after_terminal_close_codes: Vec<u16>,
+    initial_connect_attempt_timeout: Option<std::time::Duration>,
     session_handler_resolver: Option<SessionHandlerResolver>,
+    on_session_unbound: Option<Arc<SessionUnboundCallback>>,
     binary_version: Option<String>,
+    image_capabilities: Vec<String>,
+}
+
+/// Embedder callback for hub-initiated session unbinds (see
+/// [`ToolServerBuilder::on_session_unbound`]).
+pub type SessionUnboundCallback = dyn Fn(&SessionId) + Send + Sync;
+
+/// One dynamic tool registration: the handler plus the embedder "life"
+/// generation that made it (see [`ToolServer::register_tool_dynamic`]).
+struct DynamicRegistration {
+    generation: u64,
+    handler: Arc<dyn ToolServerHandler>,
 }
 
 impl ToolServerBuilder {
@@ -294,18 +310,15 @@ impl ToolServerBuilder {
     }
 
     /// Override the inbound-liveness deadline on a freshly-opened
-    /// connection: if no inbound WebSocket frame of any kind arrives within
-    /// this window, the connection is declared dead and reconnected. This
-    /// catches silently dead transports (e.g. a VM snapshot restore or
-    /// NAT/LB flow expiry) that a send-only keepalive never notices.
+    /// connection: if no RTT proof (WS/app pong) arrives within this
+    /// window, the connection is declared dead and reconnected.
+    /// Hub→client pings and one-way data do not re-arm.
     ///
-    /// Default (also used for a zero value): 2.5× the effective ping
-    /// interval — 75s at the default 30s ping — which guarantees at least
-    /// two keepalive pings fit in every window, so a healthy-but-idle
-    /// connection (one pong per ping) can never trip it. Explicit values
-    /// are honored verbatim; keep them comfortably above the ping interval
-    /// for the same reason (a value at or below the ping interval churns
-    /// healthy idle connections and is logged as a warning at connect).
+    /// Default (also used for a zero value): `min(4× ping, 120s)` — 120s
+    /// at the default 30s ping, still under the hub's ~150s idle. Explicit
+    /// values are honored verbatim; keep them comfortably above the ping
+    /// interval (a value at or below the ping interval churns healthy idle
+    /// connections and is logged as a warning at connect).
     pub fn with_ws_liveness_deadline(mut self, deadline: std::time::Duration) -> Self {
         self.ws_liveness_deadline = Some(deadline);
         self
@@ -313,12 +326,51 @@ impl ToolServerBuilder {
 
     /// Override the reconnect backoff schedule on a freshly-opened
     /// connection (default: the built-in exponential table capped at 10s).
-    /// Each attempt uses the next slot, clamping at the last; an empty
-    /// schedule falls back to the default. Not setting it preserves the
-    /// default.
+    /// Each wait is `Uniform(0, min(last_slot, max(slot, 1s)))`, not the
+    /// literal slot — a single-element `[25ms]` table is jittered in
+    /// `[0, 25ms)`. An empty schedule falls back to the default.
     pub fn with_reconnect_backoff(mut self, schedule: Vec<std::time::Duration>) -> Self {
         self.reconnect_backoff = Some(schedule.into());
         self
+    }
+
+    /// Allowlist specific 4100–4199 terminal close codes to reconnect after.
+    /// Empty (default) keeps the protocol contract: the actor stops on every
+    /// terminal close. Only restorable-session codes (e.g.
+    /// [`crate::connection::CLOSE_CODE_SANDBOX_TERMINATED`]) belong here.
+    pub fn reconnect_after_terminal_close_codes(
+        mut self,
+        codes: impl IntoIterator<Item = u16>,
+    ) -> Self {
+        let mut codes: Vec<u16> = codes.into_iter().collect();
+        codes.sort_unstable();
+        codes.dedup();
+        self.reconnect_after_terminal_close_codes = codes;
+        self
+    }
+
+    /// Per-attempt budget for the initial connect (WebSocket upgrade +
+    /// hello/hello_ack). Default (also used for a zero value): 10s. A peer
+    /// that accepts the socket but never answers would otherwise hang the
+    /// caller indefinitely; the SDK retries transient failures a bounded
+    /// number of times with jittered backoff before surfacing the error.
+    pub fn with_initial_connect_attempt_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.initial_connect_attempt_timeout = Some(timeout);
+        self
+    }
+
+    /// Connection knobs handed to [`HubConnection::connect`].
+    /// `reconnect_attempt_reset_after` is left `None` so the SDK applies
+    /// the 10 s production dwell — not zero, not "never".
+    pub(crate) fn connection_tuning(&self) -> ConnectionTuning {
+        ConnectionTuning {
+            ws_ping_interval: self.ws_ping_interval,
+            ws_liveness_deadline: self.ws_liveness_deadline,
+            reconnect_backoff: self.reconnect_backoff.clone(),
+            reconnect_attempt_reset_after: None,
+            reconnect_after_terminal_close_codes: self.reconnect_after_terminal_close_codes.clone(),
+            initial_connect_attempt_timeout: self.initial_connect_attempt_timeout,
+        }
     }
 
     /// Connection pool to attach to. Required.
@@ -378,9 +430,10 @@ impl ToolServerBuilder {
     /// "server-ready" means registered **and** session tools re-served.
     ///
     /// It only fires when **every** session re-served successfully **and** no
-    /// disconnect raced the (async) replay; otherwise it is skipped and the
-    /// next reconnect's replay settles instead. This keeps a readiness marker
-    /// from being resurrected while the socket is already down again.
+    /// disconnect or terminal close raced the (async) replay; otherwise it is
+    /// skipped and the next reconnect's replay settles instead. This keeps a
+    /// readiness marker from being resurrected while the socket is already down
+    /// again.
     pub fn on_reconnect_settled<F>(mut self, cb: F) -> Self
     where
         F: Fn() + Send + Sync + 'static,
@@ -398,8 +451,24 @@ impl ToolServerBuilder {
         self
     }
 
-    /// Optional callback fired once on the initial successful connect, before
-    /// the actor starts (so it happens-before any disconnect/reconnect).
+    /// Optional callback fired with the close code when the server sends a
+    /// terminal close (4100–4199). Invoked before [`Self::on_disconnect`].
+    /// Advances the same disconnect epoch as [`Self::on_disconnect`] so a
+    /// reconnect settle that still holds the pre-close generation cannot fire
+    /// [`Self::on_reconnect_settled`] after this callback. The actor still
+    /// stops afterwards unless the code is allowlisted via
+    /// [`Self::reconnect_after_terminal_close_codes`].
+    pub fn on_terminal_close<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(u16) + Send + Sync + 'static,
+    {
+        self.on_terminal_close = Some(Arc::new(Box::new(cb) as TerminalCloseCallback));
+        self
+    }
+
+    /// Optional callback fired once on the initial successful connect, after
+    /// the writer task enters its loop and before the reader actor starts.
+    /// The first keepalive may still be in flight.
     pub fn on_connect<F>(mut self, cb: F) -> Self
     where
         F: Fn() + Send + Sync + 'static,
@@ -434,10 +503,35 @@ impl ToolServerBuilder {
         self
     }
 
+    /// Notify the embedder after the HUB unbinds a session (`session.unbind`
+    /// frame): the hub sends it on `session.close`, on the agent's explicit
+    /// `session_unbind_server`, and when the last harness connection is
+    /// cleaned up after a disconnect. The SDK has already removed the
+    /// session's handlers when this fires; the embedder uses it to tear down
+    /// whatever it runs per session (e.g. MCP server child processes), which
+    /// would otherwise outlive the session. Called from an async task —
+    /// spawn, don't block. Embedder-initiated
+    /// [`ToolServer::unbind_session`] calls do NOT fire it.
+    pub fn on_session_unbound<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(&SessionId) + Send + Sync + 'static,
+    {
+        self.on_session_unbound = Some(Arc::new(cb));
+        self
+    }
+
     /// Version of the embedding binary, echoed as
     /// [`xai_tool_protocol::SessionBindResult::binary_version`].
     pub fn binary_version(mut self, version: impl Into<String>) -> Self {
         self.binary_version = Some(version.into());
+        self
+    }
+
+    /// Image capability tokens echoed on every bind as
+    /// [`xai_tool_protocol::SessionBindResult::image_capabilities`]. The
+    /// caller validates and sorts them; the SDK forwards them verbatim.
+    pub fn image_capabilities(mut self, tokens: Vec<String>) -> Self {
+        self.image_capabilities = tokens;
         self
     }
 
@@ -450,6 +544,7 @@ impl ToolServerBuilder {
     /// every successfully-bound session before returning the original
     /// error, so a failed `build()` does not leak server-side state.
     pub async fn build(self) -> Result<ToolServer, ClientError> {
+        let tuning = self.connection_tuning();
         let pool = self
             .pool
             .ok_or_else(|| ClientError::InvalidConfig("missing pool".to_owned()))?;
@@ -495,11 +590,18 @@ impl ToolServerBuilder {
             }
         }));
 
-        let tuning = ConnectionTuning {
-            ws_ping_interval: self.ws_ping_interval,
-            ws_liveness_deadline: self.ws_liveness_deadline,
-            reconnect_backoff: self.reconnect_backoff,
-        };
+        // Terminal close runs before on_disconnect. Bump the same epoch so a
+        // reconnect settle that still holds the pre-close generation cannot
+        // fire on_reconnect_settled after last_close_code is latched.
+        let user_on_terminal_close = self.on_terminal_close;
+        let epoch_for_terminal_close = Arc::clone(&disconnect_epoch);
+        let combined_terminal_close: Arc<TerminalCloseCallback> = Arc::new(Box::new(move |code| {
+            epoch_for_terminal_close.fetch_add(1, Ordering::Release);
+            if let Some(ref cb) = user_on_terminal_close {
+                cb(code);
+            }
+        }));
+
         let borrow = ConnectionBorrow::acquire(
             pool,
             url,
@@ -508,6 +610,7 @@ impl ToolServerBuilder {
             Some(combined_reconnect),
             Some(combined_disconnect),
             self.on_connect,
+            Some(combined_terminal_close),
             self.server_id,
             self.server_description,
             self.metadata,
@@ -536,10 +639,13 @@ impl ToolServerBuilder {
             initial_handlers: self.handlers,
             initial_sessions: self.sessions,
             session_handler_resolver: self.session_handler_resolver,
+            on_session_unbound: self.on_session_unbound,
             session_handlers: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            dynamic_handlers: parking_lot::RwLock::new(HashMap::new()),
             session_unserved: parking_lot::RwLock::new(HashMap::new()),
             session_resolve_errors: parking_lot::RwLock::new(HashMap::new()),
             binary_version: self.binary_version,
+            image_capabilities: self.image_capabilities,
             notification_fwd: Arc::new(parking_lot::Mutex::new(None)),
             parsed_notif_tx: Arc::new(parking_lot::Mutex::new(None)),
             session_handles: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -566,6 +672,25 @@ pub struct ToolServer {
     inner: Option<Arc<ToolServerInner>>,
 }
 
+/// The handler set a resolver install actually publishes: the resolver's
+/// handlers plus the session's surviving dynamic registrations, with the
+/// resolver winning tool-id collisions. Pure so the soft-rebind survival
+/// contract is unit-testable without a live hub connection.
+fn merge_resolved_with_dynamic(
+    resolved: Vec<Arc<dyn ToolServerHandler>>,
+    dynamic: Vec<Arc<dyn ToolServerHandler>>,
+) -> Vec<Arc<dyn ToolServerHandler>> {
+    let resolved_ids: std::collections::HashSet<ToolId> =
+        resolved.iter().map(|h| h.tool_id()).collect();
+    let mut merged = resolved;
+    merged.extend(
+        dynamic
+            .into_iter()
+            .filter(|handler| !resolved_ids.contains(&handler.tool_id())),
+    );
+    merged
+}
+
 /// Non-owning handle to a [`ToolServer`]; [`Self::upgrade`] per use.
 #[derive(Clone, Default)]
 pub struct WeakToolServer {
@@ -589,8 +714,23 @@ struct ToolServerInner {
     /// created before the dispatch loop starts.
     initial_sessions: Vec<SessionId>,
     session_handler_resolver: Option<SessionHandlerResolver>,
+    /// Fired after a HUB-initiated `session.unbind` finishes unbinding;
+    /// see [`ToolServerBuilder::on_session_unbound`].
+    on_session_unbound: Option<Arc<SessionUnboundCallback>>,
     /// Per-session handler maps. Each session owns its own handler vec.
     session_handlers: SessionHandlerMap,
+    /// Per-session handlers added via [`ToolServer::register_tool_dynamic`],
+    /// tracked separately so a resolver re-run (soft rebind) can preserve
+    /// them: dynamic registrations survive a rebind, with the resolver's
+    /// handlers winning tool-id collisions. Removed by
+    /// `unregister_tool_dynamic` (matching generation only) and
+    /// `unbind_session`. A dynamic handler shadowed by a resolver tool
+    /// STAYS registered here — only its publication is suppressed — so it
+    /// re-appears if a later install no longer claims the id (see
+    /// `merge_resolved_with_dynamic`'s tests). Each entry carries the
+    /// embedder "life" generation that made it, so a stale unregister can
+    /// never hit a newer life's registration.
+    dynamic_handlers: parking_lot::RwLock<HashMap<SessionId, Vec<DynamicRegistration>>>,
     /// Per-session unserved tool ids from the last resolver run; same
     /// lifetime as the `session_handlers` entry.
     session_unserved: parking_lot::RwLock<HashMap<SessionId, Vec<String>>>,
@@ -598,6 +738,7 @@ struct ToolServerInner {
     /// same lifetime as the `session_handlers` entry.
     session_resolve_errors: parking_lot::RwLock<HashMap<SessionId, String>>,
     binary_version: Option<String>,
+    image_capabilities: Vec<String>,
 
     /// Raw notification forwarding channel. Session loops write here;
     /// the parsing task (spawned in `run()`) reads and parses into
@@ -627,10 +768,11 @@ struct ToolServerInner {
     /// Optional readiness / settle hook after serve replay (see
     /// [`ToolServerBuilder::on_reconnect_settled`]).
     on_reconnect_settled: Option<Arc<ReconnectSettledCallback>>,
-    /// Bumped on every disconnect. The reconnect task snapshots this before
-    /// `serve` replay and only fires `on_reconnect_settled` if it is unchanged
-    /// afterward — so a disconnect racing the (async) replay cannot resurrect a
-    /// stale ready marker while the socket is already down.
+    /// Bumped on every disconnect and terminal close. The reconnect task
+    /// snapshots this before `serve` replay and only fires `on_reconnect_settled`
+    /// if it is unchanged afterward — so a disconnect or terminal close racing
+    /// the (async) replay cannot resurrect a stale ready marker while the socket
+    /// is already down.
     disconnect_epoch: Arc<AtomicU64>,
     /// Three-tier (session/connection/global) admission controller. Drives
     /// the bounded-wait-then-overloaded backpressure on the spawned path.
@@ -803,10 +945,26 @@ impl ToolServer {
 
         match resolved {
             Some(resolved) => {
+                // Dynamic registrations survive a soft rebind: the resolver
+                // describes the session's base tool set, while dynamically
+                // registered tools (e.g. MCP tools published after the
+                // session came up) are owned by `register_tool_dynamic` /
+                // `unregister_tool_dynamic` and must not be wiped by a
+                // resolver re-run. The resolver's handlers win id collisions.
+                let installed = {
+                    let dynamic: Vec<Arc<dyn ToolServerHandler>> = self
+                        .inner()
+                        .dynamic_handlers
+                        .read()
+                        .get(&sid)
+                        .map(|regs| regs.iter().map(|reg| reg.handler.clone()).collect())
+                        .unwrap_or_default();
+                    merge_resolved_with_dynamic(resolved.handlers, dynamic)
+                };
                 self.inner()
                     .session_handlers
                     .write()
-                    .insert(sid.clone(), resolved.handlers);
+                    .insert(sid.clone(), installed);
                 self.inner()
                     .session_unserved
                     .write()
@@ -940,7 +1098,16 @@ impl ToolServer {
         Ok(())
     }
 
-    /// Register a tool handler at runtime for the given sessions.
+    /// Register a tool handler at runtime for the given sessions, owned by
+    /// `generation` (an embedder-defined monotonic "life" counter — the
+    /// workspace passes its per-session MCP life epoch).
+    ///
+    /// Registrations are life-scoped: a registration whose ledger entry
+    /// carries an OLDER generation is superseded by this one (a revived
+    /// life re-registering an id a stale, still-in-flight teardown never
+    /// unregistered), while a same-or-newer generation entry — or a
+    /// non-dynamic handler such as a resolver-installed native — refuses
+    /// the duplicate exactly as before.
     ///
     /// Adds the handler to the local session handler map and replays
     /// `serve` for each affected session so the server sees the updated
@@ -949,67 +1116,128 @@ impl ToolServer {
         &self,
         handler: Arc<dyn ToolServerHandler>,
         sessions: Vec<SessionId>,
+        generation: u64,
     ) -> Result<(), ClientError> {
         let _guard = self.inner().dynamic_tool_mu.lock().await;
 
         let tool_id = handler.tool_id();
 
-        // Reject duplicates within the target sessions.
+        // Per session, the ledger decides: a SAME-generation entry makes
+        // this call an idempotent no-op (reconcile passes within one life
+        // re-offer the same claims); an OLDER-generation entry is
+        // superseded; a NEWER-generation entry, or a same-id handler that is
+        // not a dynamic registration at all (a resolver-installed native),
+        // refuses the duplicate.
+        let mut to_serve: Vec<SessionId> = Vec::new();
         {
             let map = self.inner().session_handlers.read();
+            let dynamic = self.inner().dynamic_handlers.read();
             for sid in &sessions {
-                if let Some(handlers) = map.get(sid)
-                    && handlers.iter().any(|h| h.tool_id() == tool_id)
-                {
-                    return Err(ClientError::InvalidConfig(format!(
-                        "tool_id {tool_id} is already registered for session {sid}"
-                    )));
+                let ledger = dynamic.get(sid).and_then(|regs| {
+                    regs.iter()
+                        .find(|reg| reg.handler.tool_id() == tool_id)
+                        .map(|reg| reg.generation)
+                });
+                match ledger {
+                    Some(existing) if existing == generation => continue, // idempotent
+                    Some(existing) if existing < generation => to_serve.push(sid.clone()),
+                    Some(_) => {
+                        return Err(ClientError::InvalidConfig(format!(
+                            "tool_id {tool_id} is registered for session {sid} by a newer life"
+                        )));
+                    }
+                    None => {
+                        if map
+                            .get(sid)
+                            .is_some_and(|handlers| handlers.iter().any(|h| h.tool_id() == tool_id))
+                        {
+                            return Err(ClientError::InvalidConfig(format!(
+                                "tool_id {tool_id} is already registered for session {sid}"
+                            )));
+                        }
+                        to_serve.push(sid.clone());
+                    }
                 }
             }
         }
 
-        // Insert into each target session's handler list.
+        // Insert into each target session's handler list, and record the
+        // handler as dynamic so a resolver re-run (soft rebind) preserves
+        // it. A superseded older-generation registration is removed by ARC
+        // IDENTITY, so a resolver-installed handler sharing the id is never
+        // touched.
         {
             let mut map = self.inner().session_handlers.write();
-            for sid in &sessions {
+            let mut dynamic = self.inner().dynamic_handlers.write();
+            for sid in &to_serve {
+                if let Some(regs) = dynamic.get_mut(sid) {
+                    let stale: Vec<Arc<dyn ToolServerHandler>> = regs
+                        .iter()
+                        .filter(|reg| {
+                            reg.handler.tool_id() == tool_id && reg.generation < generation
+                        })
+                        .map(|reg| reg.handler.clone())
+                        .collect();
+                    regs.retain(|reg| {
+                        !(reg.handler.tool_id() == tool_id && reg.generation < generation)
+                    });
+                    if let Some(handlers) = map.get_mut(sid) {
+                        handlers.retain(|h| !stale.iter().any(|stale_h| Arc::ptr_eq(h, stale_h)));
+                    }
+                }
                 map.entry(sid.clone()).or_default().push(handler.clone());
+                dynamic
+                    .entry(sid.clone())
+                    .or_default()
+                    .push(DynamicRegistration {
+                        generation,
+                        handler: handler.clone(),
+                    });
             }
         }
 
         // Replay `serve` for each affected session so the server sees
         // the updated tool set.
-        for sid in sessions {
+        for sid in to_serve {
             self.serve(sid).await?;
         }
 
         Ok(())
     }
 
-    /// Remove a dynamically registered tool from a specific session.
-    /// Returns `Ok(false)` if not found.
+    /// Remove a dynamically registered tool from a specific session, but
+    /// only when its ledger entry carries exactly `generation`: a stale
+    /// unregister (an in-flight teardown of a life a revive has since
+    /// superseded) is a no-op, and a handler that is not a dynamic
+    /// registration at all — a resolver-installed native sharing the id —
+    /// is never touched (removal is by ARC identity, not id).
+    /// Returns `Ok(false)` if no matching registration exists.
     pub async fn unregister_tool_dynamic(
         &self,
         tool_id: &ToolId,
         session_id: &SessionId,
+        generation: u64,
     ) -> Result<bool, ClientError> {
         let _guard = self.inner().dynamic_tool_mu.lock().await;
 
-        // Check existence in the target session.
-        {
-            let map = self.inner().session_handlers.read();
-            let found = map
-                .get(session_id)
-                .is_some_and(|h| h.iter().any(|h| h.tool_id() == *tool_id));
-            if !found {
+        // Find (and remove) the exact life's registration.
+        let removed: Option<Arc<dyn ToolServerHandler>> = {
+            let mut dynamic = self.inner().dynamic_handlers.write();
+            let Some(regs) = dynamic.get_mut(session_id) else {
                 return Ok(false);
-            }
-        }
-
-        // Remove from the session's handler list.
-        {
+            };
+            let Some(index) = regs
+                .iter()
+                .position(|reg| reg.handler.tool_id() == *tool_id && reg.generation == generation)
+            else {
+                return Ok(false);
+            };
+            Some(regs.remove(index).handler)
+        };
+        if let Some(removed) = removed {
             let mut map = self.inner().session_handlers.write();
             if let Some(handlers) = map.get_mut(session_id) {
-                handlers.retain(|h| h.tool_id() != *tool_id);
+                handlers.retain(|h| !Arc::ptr_eq(h, &removed));
             }
         }
 
@@ -1034,6 +1262,7 @@ impl ToolServer {
             .retain(|s| s != session_id);
 
         self.inner().session_handlers.write().remove(session_id);
+        self.inner().dynamic_handlers.write().remove(session_id);
         self.inner().session_unserved.write().remove(session_id);
         self.inner()
             .session_resolve_errors
@@ -1405,6 +1634,10 @@ impl ToolServer {
                                             binary_version: server.inner().binary_version.clone(),
                                             unserved_tool_ids: server.unserved_for_session(&sid),
                                             resolve_error: server.resolve_error_for_session(&sid),
+                                            image_capabilities: server
+                                                .inner()
+                                                .image_capabilities
+                                                .clone(),
                                         };
                                         serde_json::json!({
                                             "jsonrpc": "2.0",
@@ -1469,6 +1702,13 @@ impl ToolServer {
                             // Unbind precedes hibernate: flush while up.
                             server.flush_donations().await;
                             let _ = server.unbind_session(&sid).await;
+                            // The hub says this session is gone — let the
+                            // embedder tear down whatever it runs for it
+                            // (MCP children, terminals, ...), which nothing
+                            // else would ever clean up.
+                            if let Some(cb) = server.inner().on_session_unbound.clone() {
+                                cb(&sid);
+                            }
 
                             // Respond so session.close returns synchronously.
                             if let Some(id) = request_id {
@@ -1560,8 +1800,9 @@ impl ToolServer {
                     notify.notified().await;
                     // Snapshot the disconnect epoch for the connection we are
                     // now replaying onto; if it advances during replay a fresh
-                    // disconnect raced us and `settled` must not fire (it would
-                    // resurrect a stale ready marker over a downed socket).
+                    // disconnect or terminal close raced us and `settled` must
+                    // not fire (it would resurrect a stale ready marker over a
+                    // downed socket).
                     let epoch_at_start = epoch.load(Ordering::Acquire);
                     let sessions: Vec<SessionId> = server.active_sessions();
                     tracing::info!(
@@ -1580,8 +1821,8 @@ impl ToolServer {
                         }
                     }
                     // Only settle when every session re-served AND no disconnect
-                    // raced this replay — otherwise the next reconnect's notify
-                    // re-runs this loop and settles then.
+                    // or terminal close raced this replay — otherwise the next
+                    // reconnect's notify re-runs this loop and settles then.
                     let raced = epoch.load(Ordering::Acquire) != epoch_at_start;
                     if !all_served || raced {
                         tracing::info!(
@@ -2342,6 +2583,19 @@ mod tests {
         ToolCallId::new_v7()
     }
 
+    #[test]
+    fn tool_server_tuning_does_not_override_attempt_reset_dwell() {
+        let tuning = ToolServerBuilder::default().connection_tuning();
+        assert_eq!(
+            tuning.reconnect_attempt_reset_after, None,
+            "builder must pass None so connect() applies the 10s default"
+        );
+        assert_eq!(
+            crate::connection::resolve_attempt_reset_after(tuning.reconnect_attempt_reset_after),
+            std::time::Duration::from_secs(10),
+        );
+    }
+
     // ── build_error_response: wire fidelity ─────────────────────────
 
     #[test]
@@ -2512,53 +2766,6 @@ mod tests {
         assert_eq!(frame.body[0]["text"], "a,b\n1,2");
     }
 
-    // ── serde round-trips ───────────────────────────────────────────
-
-    #[test]
-    fn progress_frame_text_round_trips() {
-        let progress = ToolProgress::Text {
-            text: "round-trip".to_owned(),
-        };
-        let frame = progress_to_frame(progress, call_id());
-        let json = serde_json::to_value(&frame).expect("serialize");
-        let back: ToolCallProgressFrame = serde_json::from_value(json).expect("deserialize");
-        assert_eq!(back, frame);
-    }
-
-    #[test]
-    fn progress_frame_content_round_trips() {
-        let blocks = vec![
-            ContentBlock::Text {
-                text: "hello".to_owned(),
-            },
-            ContentBlock::Image {
-                mime_type: "image/png".to_owned(),
-                data: "abc".to_owned(),
-                media_id: None,
-                filename: None,
-                path: None,
-                metadata: Default::default(),
-            },
-        ];
-        let progress = ToolProgress::Content { blocks };
-        let frame = progress_to_frame(progress, call_id());
-        let json = serde_json::to_value(&frame).expect("serialize");
-        let back: ToolCallProgressFrame = serde_json::from_value(json).expect("deserialize");
-        assert_eq!(back, frame);
-    }
-
-    #[test]
-    fn progress_frame_custom_round_trips() {
-        let progress = ToolProgress::Custom {
-            subkind: "streaming.chunk".to_owned(),
-            payload: serde_json::json!({ "offset": 1024, "data": [1, 2, 3] }),
-        };
-        let frame = progress_to_frame(progress, call_id());
-        let json = serde_json::to_value(&frame).expect("serialize");
-        let back: ToolCallProgressFrame = serde_json::from_value(json).expect("deserialize");
-        assert_eq!(back, frame);
-    }
-
     // ── wire notification shape ─────────────────────────────────────
 
     #[test]
@@ -2645,5 +2852,76 @@ mod tests {
             data: None,
         });
         assert!(system_notify_ack_from_outcome(outcome).is_err());
+    }
+
+    struct MergeTestHandler(ToolId);
+
+    #[async_trait::async_trait]
+    impl ToolServerHandler for MergeTestHandler {
+        fn tool_id(&self) -> ToolId {
+            self.0.clone()
+        }
+        fn description(&self) -> xai_tool_types::ToolDescription {
+            xai_tool_types::ToolDescription::new(self.0.as_str().to_owned(), "test")
+        }
+        fn input_schema(&self) -> Option<Value> {
+            None
+        }
+        async fn handle_call(
+            &self,
+            _ctx: xai_tool_runtime::ToolCallContext,
+            _args: Value,
+        ) -> xai_tool_runtime::ToolStream<xai_tool_runtime::TypedToolOutput> {
+            unreachable!("merge test never calls tools")
+        }
+    }
+
+    fn merge_handler(id: &str) -> Arc<dyn ToolServerHandler> {
+        Arc::new(MergeTestHandler(ToolId::new(id).unwrap()))
+    }
+
+    /// Dynamic registrations survive a resolver install (soft rebind), and
+    /// the resolver's handlers win tool-id collisions.
+    #[test]
+    fn resolver_install_preserves_dynamic_handlers() {
+        let merged = merge_resolved_with_dynamic(
+            vec![merge_handler("native"), merge_handler("shared")],
+            vec![merge_handler("mcp_tool"), merge_handler("shared")],
+        );
+        let ids: Vec<String> = merged
+            .iter()
+            .map(|h| h.tool_id().as_str().to_owned())
+            .collect();
+        assert_eq!(ids, ["native", "shared", "mcp_tool"]);
+    }
+
+    /// A dynamic handler shadowed by a resolver tool is suppressed, not
+    /// dropped: it stays in `dynamic_handlers`, so a later install that no
+    /// longer claims the id publishes it again.
+    #[test]
+    fn shadowed_dynamic_handler_reappears_when_the_shadow_lifts() {
+        // The stored dynamic set is unchanged by installs; only the merged
+        // publication varies with what the resolver claims.
+        let dynamic = || vec![merge_handler("shared")];
+
+        let shadowed = merge_resolved_with_dynamic(vec![merge_handler("shared")], dynamic());
+        assert_eq!(
+            shadowed
+                .iter()
+                .map(|h| h.tool_id().as_str().to_owned())
+                .collect::<Vec<_>>(),
+            ["shared"],
+            "while shadowed, the resolver's handler is the only publication"
+        );
+
+        let lifted = merge_resolved_with_dynamic(vec![merge_handler("native")], dynamic());
+        assert_eq!(
+            lifted
+                .iter()
+                .map(|h| h.tool_id().as_str().to_owned())
+                .collect::<Vec<_>>(),
+            ["native", "shared"],
+            "once the resolver stops claiming the id, the dynamic handler re-appears"
+        );
     }
 }

@@ -61,7 +61,7 @@ chmod +x ~/.grok/hooks/bin/session-log.sh
 
 ### 4. Tool Activity Logger (`tool-logger.json`)
 
-**Type:** passive (`PreToolUse` + `PostToolUse`)
+**Type:** observe-only in this example (`PreToolUse` + `PostToolUse`) — logging only; it exits 0 and writes nothing to stdout, so it changes nothing the model sees
 
 Logs all tool calls to `~/.grok/tool-activity.log` — tool name, event type, effective tool name, backgrounded status.
 
@@ -71,6 +71,20 @@ mkdir -p ~/.grok/hooks/bin
 cp examples/hooks/tool-logger.json ~/.grok/hooks/
 cp examples/hooks/bin/tool-logger.sh ~/.grok/hooks/bin/
 chmod +x ~/.grok/hooks/bin/tool-logger.sh
+```
+
+### 5. Stop Gate: verify before finishing (`stop-verify.json`)
+
+**Type:** blocking (`Stop`)
+
+Keeps the agent working until `cargo build` passes. A `Stop` hook runs when the agent is about to finish its turn; returning `{"decision":"block","reason":"…"}` feeds the reason back to the model and runs another round. The built-in cap ends the turn after 8 continuations. The hook sets a 300-second timeout because a timed-out Stop hook fails open and lets the agent stop.
+
+**Install:**
+```sh
+mkdir -p ~/.grok/hooks/bin
+cp examples/hooks/stop-verify.json ~/.grok/hooks/
+cp examples/hooks/bin/stop-verify.sh ~/.grok/hooks/bin/
+chmod +x ~/.grok/hooks/bin/stop-verify.sh
 ```
 
 ## Format
@@ -92,7 +106,7 @@ Hook files use the Claude-compatible JSON format:
 }
 ```
 
-- **Event names:** `SessionStart`, `PreToolUse`, `PostToolUse`, `SessionEnd`
+- **Event names:** `SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop`, `SessionEnd` (see the [user guide](../../xai-grok-pager/docs/user-guide/10-hooks.md) for the full set)
 - **Matcher:** regex on tool name. Claude names like `Bash`, `Read`, `Edit` are auto-expanded to also match Grok names (`run_terminal_cmd`, `read_file`, `search_replace`)
 - **Timeout:** in seconds (default: 5)
 - **Command:** path to script (relative to hook file directory) or inline shell command
@@ -101,7 +115,7 @@ Hook files use the Claude-compatible JSON format:
 
 Scripts receive the hook event envelope as JSON on **stdin** and should write a response to **stdout**:
 
-**For blocking hooks (`PreToolUse`):**
+**For tool gates (`PreToolUse`):**
 ```json
 {"decision":"allow"}
 ```
@@ -110,9 +124,33 @@ or
 {"decision":"deny","reason":"Explanation for the user"}
 ```
 
-**Exit codes:** `0` = allow, `2` = deny, other = fail-open.
+**For stop gates (`Stop` / `SubagentStop`):** keep the agent working or force it to stop:
+```json
+{"decision":"block","reason":"Feedback fed back to the model"}
+```
+```json
+{"hookSpecificOutput":{"hookEventName":"Stop","additionalContext":"Non-error feedback"}}
+```
+```json
+{"continue":false,"stopReason":"Shown to the user; overrides any block"}
+```
+The turn ends after 8 consecutive continuations. The input carries `stopHookActive` (true once a block has already continued this turn) so a hook can give up.
 
-**For passive hooks:** stdout is informational only. Exit `0` for success.
+**For `PostToolUse`:** the tool has already run, so nothing is blocked, but stdout decides what the model sees next:
+```json
+{"decision":"block","reason":"Feedback delivered to the model with the tool result"}
+```
+```json
+{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"A note for the model"}}
+```
+```json
+{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedMCPToolOutput":"[redacted]"}}
+```
+`updatedToolOutput` replaces a built-in tool's output and must match that tool's own output shape (the `toolResult` in the same event); `updatedMCPToolOutput` replaces an MCP tool's output and is not shape-checked. The scrollback and telemetry keep the original either way. Every hook's block reason and `additionalContext` are delivered in call order, each naming its hook; only the replacements are last-writer-wins.
+
+**Exit codes:** `0` = allow / no decision, `2` = deny (`PreToolUse`), block-stop with stderr as the feedback (`Stop`/`SubagentStop`), or stderr fed to the model as feedback (`PostToolUse`), other = fail-open. Valid decision JSON on stdout wins over the exit code, except that a `PostToolUse` hook that exits non-zero keeps only its block reason — its context and its replacement are dropped.
+
+**For passive hooks (`SessionStart`, `Notification`, …):** stdout is informational only. Exit `0` for success.
 
 ## Uninstall
 

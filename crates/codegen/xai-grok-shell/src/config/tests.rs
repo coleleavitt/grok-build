@@ -125,23 +125,102 @@ fn memory_config_default_disabled() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
         let mem = MemoryConfig::resolve(false, false, &config, None);
-        assert!(! mem.enabled);
+        assert!(!mem.enabled);
     });
 }
 #[test]
-fn memory_config_cli_flag_enables() {
+fn memory_config_legacy_wrapper_matches_tri_state_override() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
-        let mem = MemoryConfig::resolve(true, false, &config, None);
-        assert!(mem.enabled);
+        let enabled = MemoryConfig::resolve(true, false, &config, None);
+        let disabled = MemoryConfig::resolve(true, true, &config, None);
+        let deferred = MemoryConfig::resolve(false, false, &config, None);
+        assert_eq!(
+                enabled,
+                MemoryConfig::resolve_with_override(Some(true), &config, None)
+            );
+        assert_eq!(
+                disabled,
+                MemoryConfig::resolve_with_override(Some(false), &config, None)
+            );
+        assert_eq!(
+                deferred,
+                MemoryConfig::resolve_with_override(None, &config, None)
+            );
     });
 }
 #[test]
 fn memory_config_from_toml() {
     without_grok_memory(|| {
-        let config: toml::Value = toml::from_str("[memory]\nenabled = true").unwrap();
+        let config: toml::Value = toml::from_str(
+                "[memory]\nenabled = true\nmode = \"v2\"",
+            )
+            .unwrap();
         let mem = MemoryConfig::resolve(false, false, &config, None);
         assert!(mem.enabled);
+        assert_eq!(mem.mode, crate::config::MemoryMode::V2);
+    });
+}
+#[test]
+fn public_memory_config_deserializes_with_skipped_defaults() {
+    let config: crate::config::MemoryConfig = toml::from_str(
+            "enabled = true\n[search]\nmax_results = 9\n[flush]\nenabled = false",
+        )
+        .unwrap();
+    assert!(config.enabled);
+    assert_eq!(config.mode, crate::config::MemoryMode::Legacy);
+    assert_eq!(config.search.max_results, 9);
+    assert_eq!(config.flush, MemoryFlushConfig::default());
+    assert_eq!(config.pruning, PruningConfig::default());
+    assert_eq!(config.root_dir_override, None);
+    assert!(!config.flat_memory_root);
+}
+#[test]
+fn invalid_memory_mode_is_rejected() {
+    let invalid: toml::Value = toml::from_str(
+            "[memory]\nenabled = true\nmode = \"unknown\"",
+        )
+        .unwrap();
+    assert!(crate::agent::config::Config::new_from_toml_cfg(&invalid).is_err());
+}
+#[test]
+fn memory_config_deserializes_through_config() {
+    let raw: toml::Value = toml::from_str(
+            "[memory]\nenabled = true\n[memory.search]\nmax_results = 9\nunknown_future = 'ignored'",
+        )
+        .unwrap();
+    let config = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+    assert_eq!(config.memory.enabled, Some(true));
+    assert_eq!(
+            config
+                .memory
+                .search
+                .as_ref()
+                .and_then(|search| search.max_results),
+            Some(9)
+        );
+    let invalid: toml::Value = toml::from_str("[memory.search]\nmax_results = 'many'")
+        .unwrap();
+    assert!(crate::agent::config::Config::new_from_toml_cfg(&invalid).is_err());
+}
+#[test]
+fn memory_config_toml_sentinels_beat_remote_values() {
+    without_grok_memory(|| {
+        let raw: toml::Value = toml::from_str(
+                "[memory.embedding]\nmodel = ''\n[memory.dream]\ncheck_interval_secs = 0\n[compaction.memory_flush]\nidle_timeout_secs = 0",
+            )
+            .unwrap();
+        let config = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+        let remote = crate::util::config::RemoteSettings {
+            memory_embedding_model: Some("remote-model".to_owned()),
+            dream_check_interval_secs: Some(900),
+            flush_idle_timeout_secs: Some(120),
+            ..Default::default()
+        };
+        let memory = config.resolve_memory(None, Some(&remote));
+        assert_eq!(memory.embedding.model, None);
+        assert_eq!(memory.dream.check_interval_secs, None);
+        assert_eq!(memory.flush.idle_timeout_secs, None);
     });
 }
 #[test]
@@ -149,7 +228,7 @@ fn memory_config_toml_disabled() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = false").unwrap();
         let mem = MemoryConfig::resolve(false, false, &config, None);
-        assert!(! mem.enabled);
+        assert!(!mem.enabled);
     });
 }
 #[test]
@@ -181,7 +260,7 @@ fn memory_config_env_var_zero_does_not_enable() {
         || {
             let config = toml::Value::Table(toml::map::Map::new());
             let mem = MemoryConfig::resolve(false, false, &config, None);
-            assert!(! mem.enabled, "GROK_MEMORY=0 should not enable memory");
+            assert!(!mem.enabled, "GROK_MEMORY=0 should not enable memory");
         },
     );
 }
@@ -192,7 +271,7 @@ fn memory_config_env_var_false_does_not_enable() {
         || {
             let config = toml::Value::Table(toml::map::Map::new());
             let mem = MemoryConfig::resolve(false, false, &config, None);
-            assert!(! mem.enabled, "GROK_MEMORY=false should not enable memory");
+            assert!(!mem.enabled, "GROK_MEMORY=false should not enable memory");
         },
     );
 }
@@ -213,7 +292,7 @@ fn memory_config_env_zero_force_disables_toml_enabled() {
                 .unwrap();
             let mem = MemoryConfig::resolve(false, false, &config, None);
             assert!(
-                ! mem.enabled,
+                !mem.enabled,
                 "GROK_MEMORY=0 should force-disable even when TOML enables memory"
             );
         },
@@ -228,7 +307,7 @@ fn memory_config_env_false_force_disables_toml_enabled() {
                 .unwrap();
             let mem = MemoryConfig::resolve(false, false, &config, None);
             assert!(
-                ! mem.enabled,
+                !mem.enabled,
                 "GROK_MEMORY=false should force-disable even when TOML enables memory"
             );
         },
@@ -242,22 +321,8 @@ fn memory_config_cli_flag_overrides_env_disable() {
             let config = toml::Value::Table(toml::map::Map::new());
             let mem = MemoryConfig::resolve(true, false, &config, None);
             assert!(
-                mem.enabled, "CLI --experimental-memory should override GROK_MEMORY=0"
-            );
-        },
-    );
-}
-#[test]
-fn memory_config_no_memory_overrides_all() {
-    with_grok_memory(
-        "1",
-        || {
-            let config: toml::Value = toml::from_str("[memory]\nenabled = true")
-                .unwrap();
-            let mem = MemoryConfig::resolve(true, true, &config, None);
-            assert!(
-                ! mem.enabled,
-                "--no-memory should override --experimental-memory, GROK_MEMORY=1, and TOML enabled=true"
+                mem.enabled,
+                "CLI --experimental-memory should override GROK_MEMORY=0"
             );
         },
     );
@@ -267,7 +332,7 @@ fn memory_config_no_memory_alone_disables() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
         let mem = MemoryConfig::resolve(false, true, &config, None);
-        assert!(! mem.enabled, "--no-memory alone should disable");
+        assert!(!mem.enabled, "--no-memory alone should disable");
     });
 }
 #[test]
@@ -277,7 +342,7 @@ fn memory_config_no_memory_overrides_env_enable() {
         || {
             let config = toml::Value::Table(toml::map::Map::new());
             let mem = MemoryConfig::resolve(false, true, &config, None);
-            assert!(! mem.enabled, "--no-memory should override GROK_MEMORY=1");
+            assert!(!mem.enabled, "--no-memory should override GROK_MEMORY=1");
         },
     );
 }
@@ -286,7 +351,7 @@ fn memory_config_no_memory_overrides_toml_enabled() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = true").unwrap();
         let mem = MemoryConfig::resolve(false, true, &config, None);
-        assert!(! mem.enabled, "--no-memory should override TOML enabled=true");
+        assert!(!mem.enabled, "--no-memory should override TOML enabled=true");
     });
 }
 #[test]
@@ -298,7 +363,10 @@ fn memory_config_no_memory_overrides_remote_enabled() {
             ..Default::default()
         };
         let mem = MemoryConfig::resolve(false, true, &config, Some(&remote));
-        assert!(! mem.enabled, "--no-memory should override remote memory_enabled=true");
+        assert!(
+                !mem.enabled,
+                "--no-memory should override remote memory_enabled=true"
+            );
     });
 }
 #[test]
@@ -312,25 +380,25 @@ fn memory_config_defaults_are_correct() {
         assert_eq!(mem.embedding.model, None);
         assert_eq!(mem.embedding.dimensions, 1024);
         assert_eq!(mem.search.max_results, 6);
-        assert!((mem.search.min_score - 0.35).abs() < f32::EPSILON);
+        assert!((mem.search.min_score - 0.7).abs() < f32::EPSILON);
         assert!((mem.search.vector_weight - 0.7).abs() < f32::EPSILON);
         assert!((mem.search.text_weight - 0.3).abs() < f32::EPSILON);
         assert!((mem.search.recency_decay - 0.95).abs() < f32::EPSILON);
         assert!(mem.search.temporal_decay.enabled);
-        assert!((mem.search.temporal_decay.half_life_days - 7.0).abs() < f64::EPSILON);
-        assert!(! mem.search.mmr.enabled);
+        assert!((mem.search.temporal_decay.half_life_days - 30.0).abs() < f64::EPSILON);
+        assert!(mem.search.mmr.enabled);
         assert!((mem.search.mmr.lambda - 0.7).abs() < f64::EPSILON);
         assert!((mem.search.source_weights["workspace"] - 1.0).abs() < f32::EPSILON);
         assert!((mem.search.source_weights["session"] - 1.0).abs() < f32::EPSILON);
         assert!((mem.search.source_weights["global"] - 1.0).abs() < f32::EPSILON);
         assert!(mem.initial_injection.enabled);
-        assert_eq!(mem.initial_injection.min_score, None);
+        assert_eq!(mem.initial_injection.min_score, Some(0.9));
         assert!(mem.session.save_on_end);
         assert!(mem.flush.enabled);
         assert_eq!(mem.flush.soft_threshold_tokens, 4000);
         assert!(mem.flush.flush_model.is_none());
         assert_eq!(mem.flush.max_flush_write_chars, 8000);
-        assert!(mem.flush.idle_timeout_secs.is_none());
+        assert_eq!(mem.flush.idle_timeout_secs, Some(300));
         assert!(mem.pruning.enabled);
         assert_eq!(mem.pruning.keep_last_n_turns, 3);
         assert_eq!(mem.pruning.soft_trim_threshold, 4000);
@@ -340,16 +408,14 @@ fn memory_config_defaults_are_correct() {
         assert!(mem.watcher.enabled);
         assert_eq!(mem.watcher.stale_claim_secs, 60);
         assert!(mem.dream.enabled);
-        assert_eq!(mem.dream.min_hours, 4);
-        assert_eq!(mem.dream.min_sessions, 3);
+        assert_eq!(mem.dream.min_hours, 24);
+        assert_eq!(mem.dream.min_sessions, 5);
         assert_eq!(mem.dream.stale_lock_secs, 3600);
-        assert_eq!(mem.dream.check_interval_secs, None);
+        assert_eq!(mem.dream.check_interval_secs, Some(3600));
     });
 }
-/// `debounce_ms` was a dead field on `MemoryWatcherConfig` that was never
-/// read by any watcher or search path.  Verify that existing TOML config
-/// files that contain `debounce_ms` are still parsed without error
-/// (unknown fields are silently ignored by serde default).
+/// `debounce_ms` was a dead field on `MemoryWatcherConfig` that was never read by any watcher or search path.
+/// Verify that existing TOML config files that contain `debounce_ms` still parse without error (serde ignores unknown fields by default).
 #[test]
 fn memory_config_watcher_debounce_ms_in_toml_is_silently_ignored() {
     without_grok_memory(|| {
@@ -421,23 +487,26 @@ hard_clear_age_turns = 20
         assert_eq!(mem.index.max_chunk_chars, 2000);
         assert_eq!(mem.index.chunk_overlap_chars, 400);
         assert_eq!(mem.embedding.provider, "local");
-        assert_eq!(mem.embedding.model.as_deref(), Some("all-MiniLM-L6-v2"));
+        assert_eq!(
+                mem.embedding.model.as_deref(),
+                Some("all-MiniLM-L6-v2")
+            );
         assert_eq!(mem.embedding.dimensions, 384);
         assert_eq!(mem.search.max_results, 10);
         assert!((mem.search.min_score - 0.5).abs() < f32::EPSILON);
-        assert!(! mem.initial_injection.enabled);
+        assert!(!mem.initial_injection.enabled);
         assert_eq!(mem.initial_injection.min_score, Some(0.8));
         assert!(mem.search.temporal_decay.enabled);
         assert!((mem.search.temporal_decay.half_life_days - 14.0).abs() < f64::EPSILON);
         assert!((mem.search.source_weights["global"] - 0.5).abs() < f32::EPSILON);
-        assert!(! mem.session.save_on_end);
-        assert!(! mem.flush.enabled);
+        assert!(!mem.session.save_on_end);
+        assert!(!mem.flush.enabled);
         assert_eq!(mem.flush.soft_threshold_tokens, 8000);
         assert_eq!(mem.flush.flush_model.as_deref(), Some("grok-4"));
         assert_eq!(mem.flush.max_flush_write_chars, 16000);
         assert_eq!(mem.flush.idle_timeout_secs, Some(300));
         assert_eq!(mem.flush.semantic_dedup_threshold, Some(0.85));
-        assert!(! mem.pruning.enabled);
+        assert!(!mem.pruning.enabled);
         assert_eq!(mem.pruning.keep_last_n_turns, 5);
         assert_eq!(mem.pruning.hard_clear_age_turns, 20);
     });
@@ -472,7 +541,10 @@ fn memory_config_remote_settings_enable() {
             ..Default::default()
         };
         let mem = MemoryConfig::resolve(false, false, &config, Some(&remote));
-        assert!(mem.enabled, "remote memory_enabled=true should enable memory");
+        assert!(
+                mem.enabled,
+                "remote memory_enabled=true should enable memory"
+            );
     });
 }
 #[test]
@@ -490,17 +562,27 @@ fn memory_config_remote_settings_pruning() {
     });
 }
 #[test]
-fn memory_config_remote_settings_initial_injection() {
+fn partial_embedding_injection_and_watcher_use_remote_for_missing_fields() {
     without_grok_memory(|| {
-        let config = toml::Value::Table(toml::map::Map::new());
+        let config: toml::Value = toml::from_str(
+                "[memory.embedding]\ndimensions = 384\n[memory.initial_injection]\nenabled = false\n[memory.watcher]\nstale_claim_secs = 75",
+            )
+            .unwrap();
         let remote = crate::util::config::RemoteSettings {
-            memory_initial_injection_enabled: Some(false),
+            memory_embedding_model: Some("remote-model".to_owned()),
+            memory_embedding_dimensions: Some(768),
+            memory_initial_injection_enabled: Some(true),
             memory_initial_injection_min_score: Some(0.77),
+            memory_watcher_enabled: Some(false),
             ..Default::default()
         };
         let mem = MemoryConfig::resolve(false, false, &config, Some(&remote));
-        assert!(! mem.initial_injection.enabled);
+        assert_eq!(mem.embedding.model.as_deref(), Some("remote-model"));
+        assert_eq!(mem.embedding.dimensions, 384);
+        assert!(!mem.initial_injection.enabled);
         assert_eq!(mem.initial_injection.min_score, Some(0.77));
+        assert!(!mem.watcher.enabled);
+        assert_eq!(mem.watcher.stale_claim_secs, 75);
     });
 }
 #[test]
@@ -532,24 +614,24 @@ fn memory_config_local_disabled_blocks_remote_enable() {
         };
         let mem = MemoryConfig::resolve(false, false, &config, Some(&remote));
         assert!(
-            ! mem.enabled, "local [memory] enabled=false should block remote enable"
-        );
+                !mem.enabled,
+                "local [memory] enabled=false should block remote enable"
+            );
     });
 }
 #[test]
-fn memory_config_local_overrides_remote() {
+fn memory_config_partial_search_uses_remote_for_missing_field() {
     without_grok_memory(|| {
-        let toml_str = r#"
-[memory.search]
-max_results = 20
-"#;
-        let config: toml::Value = toml::from_str(toml_str).unwrap();
+        let config: toml::Value = toml::from_str("[memory.search]\nmax_results = 20")
+            .unwrap();
         let remote = crate::util::config::RemoteSettings {
             memory_search_max_results: Some(5),
+            memory_search_min_score: Some(0.82),
             ..Default::default()
         };
         let mem = MemoryConfig::resolve(false, false, &config, Some(&remote));
-        assert_eq!(mem.search.max_results, 20, "local config should override remote");
+        assert_eq!(mem.search.max_results, 20);
+        assert!((mem.search.min_score - 0.82).abs() < f32::EPSILON);
     });
 }
 #[test]
@@ -563,7 +645,10 @@ fn memory_config_remote_none_is_noop() {
             &config,
             Some(&crate::util::config::RemoteSettings::default()),
         );
-        assert_eq!(mem_without.search.max_results, mem_with_empty.search.max_results);
+        assert_eq!(
+                mem_without.search.max_results,
+                mem_with_empty.search.max_results
+            );
         assert_eq!(mem_without.enabled, mem_with_empty.enabled);
     });
 }
@@ -577,9 +662,10 @@ fn flush_semantic_dedup_threshold_from_remote_when_no_local_flush() {
         };
         let mem = MemoryConfig::resolve(false, false, &config, Some(&remote));
         assert_eq!(
-            mem.flush.semantic_dedup_threshold, Some(0.85),
-            "remote threshold should apply when no local flush config"
-        );
+                mem.flush.semantic_dedup_threshold,
+                Some(0.85),
+                "remote threshold should apply when no local flush config"
+            );
     });
 }
 #[test]
@@ -592,38 +678,41 @@ fn flush_semantic_dedup_threshold_clamped_from_remote() {
         };
         let mem = MemoryConfig::resolve(false, false, &config, Some(&remote));
         assert_eq!(
-            mem.flush.semantic_dedup_threshold, Some(1.0),
-            "remote threshold above 1.0 should be clamped"
-        );
+                mem.flush.semantic_dedup_threshold,
+                Some(1.0),
+                "remote threshold above 1.0 should be clamped"
+            );
         let remote_neg = crate::util::config::RemoteSettings {
             flush_semantic_dedup_threshold: Some(-0.5),
             ..Default::default()
         };
         let mem_neg = MemoryConfig::resolve(false, false, &config, Some(&remote_neg));
         assert_eq!(
-            mem_neg.flush.semantic_dedup_threshold, Some(0.0),
-            "remote threshold below 0.0 should be clamped"
-        );
+                mem_neg.flush.semantic_dedup_threshold,
+                Some(0.0),
+                "remote threshold below 0.0 should be clamped"
+            );
     });
 }
 #[test]
-fn flush_semantic_dedup_threshold_local_blocks_remote() {
+fn partial_flush_and_pruning_use_remote_for_missing_fields() {
     without_grok_memory(|| {
-        let toml_str = r#"
-[compaction.memory_flush]
-enabled = true
-semantic_dedup_threshold = 0.88
-"#;
-        let config: toml::Value = toml::from_str(toml_str).unwrap();
+        let config: toml::Value = toml::from_str(
+                "[compaction.memory_flush]\nsemantic_dedup_threshold = 0.88\n[compaction.pruning]\nkeep_last_n_turns = 7",
+            )
+            .unwrap();
         let remote = crate::util::config::RemoteSettings {
+            flush_enabled: Some(false),
             flush_semantic_dedup_threshold: Some(0.70),
+            pruning_enabled: Some(false),
+            pruning_keep_last_n_turns: Some(2),
             ..Default::default()
         };
         let mem = MemoryConfig::resolve(false, false, &config, Some(&remote));
-        assert_eq!(
-            mem.flush.semantic_dedup_threshold, Some(0.88),
-            "local flush config should block remote override"
-        );
+        assert!(!mem.flush.enabled);
+        assert_eq!(mem.flush.semantic_dedup_threshold, Some(0.88));
+        assert!(!mem.pruning.enabled);
+        assert_eq!(mem.pruning.keep_last_n_turns, 7);
     });
 }
 #[test]
@@ -632,9 +721,9 @@ fn flush_semantic_dedup_threshold_defaults_to_none() {
         let config = toml::Value::Table(toml::map::Map::new());
         let mem = MemoryConfig::resolve(false, false, &config, None);
         assert_eq!(
-            mem.flush.semantic_dedup_threshold, None,
-            "threshold should default to None (fallback to compiled-in constant)"
-        );
+                mem.flush.semantic_dedup_threshold, None,
+                "threshold should default to None (fallback to compiled-in constant)"
+            );
     });
 }
 #[test]
@@ -643,10 +732,10 @@ fn memory_dream_config_defaults() {
         let config = toml::Value::Table(toml::map::Map::new());
         let mem = MemoryConfig::resolve(false, false, &config, None);
         assert!(mem.dream.enabled);
-        assert_eq!(mem.dream.min_hours, 4);
-        assert_eq!(mem.dream.min_sessions, 3);
+        assert_eq!(mem.dream.min_hours, 24);
+        assert_eq!(mem.dream.min_sessions, 5);
         assert_eq!(mem.dream.stale_lock_secs, 3600);
-        assert_eq!(mem.dream.check_interval_secs, None);
+        assert_eq!(mem.dream.check_interval_secs, Some(3600));
     });
 }
 #[test]
@@ -689,7 +778,7 @@ fn memory_dream_config_remote_override_when_toml_absent() {
     });
 }
 #[test]
-fn memory_dream_config_remote_ignored_when_toml_present() {
+fn memory_dream_config_partial_toml_uses_remote_for_missing_fields() {
     without_grok_memory(|| {
         let toml_str = r#"
 [memory.dream]
@@ -705,10 +794,10 @@ min_hours = 6
             ..Default::default()
         };
         let mem = MemoryConfig::resolve(false, false, &config, Some(&remote));
-        assert!(! mem.dream.enabled, "local TOML should win over remote");
+        assert!(!mem.dream.enabled, "local TOML should win over remote");
         assert_eq!(mem.dream.min_hours, 6);
-        assert_eq!(mem.dream.min_sessions, 3);
-        assert_eq!(mem.dream.check_interval_secs, None);
+        assert_eq!(mem.dream.min_sessions, 10);
+        assert_eq!(mem.dream.check_interval_secs, Some(300));
     });
 }
 #[test]
@@ -765,9 +854,10 @@ fn effective_half_life_temporal_decay_enabled_zero_disables() {
         ..Default::default()
     };
     assert_eq!(
-        config.effective_half_life_days(), None,
-        "zero half_life_days should disable decay"
-    );
+            config.effective_half_life_days(),
+            None,
+            "zero half_life_days should disable decay"
+        );
 }
 #[test]
 fn effective_half_life_temporal_decay_enabled_negative_disables() {
@@ -779,9 +869,10 @@ fn effective_half_life_temporal_decay_enabled_negative_disables() {
         ..Default::default()
     };
     assert_eq!(
-        config.effective_half_life_days(), None,
-        "negative half_life_days should disable decay"
-    );
+            config.effective_half_life_days(),
+            None,
+            "negative half_life_days should disable decay"
+        );
 }
 #[test]
 fn effective_half_life_disabled_default_recency_returns_none() {
@@ -794,9 +885,10 @@ fn effective_half_life_disabled_default_recency_returns_none() {
         ..Default::default()
     };
     assert_eq!(
-        config.effective_half_life_days(), None,
-        "disabled + default recency_decay should return None"
-    );
+            config.effective_half_life_days(),
+            None,
+            "disabled + default recency_decay should return None"
+        );
 }
 #[test]
 fn effective_half_life_disabled_legacy_recency_converts() {
@@ -812,9 +904,9 @@ fn effective_half_life_disabled_legacy_recency_converts() {
         .effective_half_life_days()
         .expect("should convert legacy recency_decay=0.9");
     assert!(
-        (half_life - 6.58).abs() < 0.1,
-        "recency_decay=0.9 should convert to ~6.58 day half-life, got {half_life}"
-    );
+            (half_life - 6.58).abs() < 0.1,
+            "recency_decay=0.9 should convert to ~6.58 day half-life, got {half_life}"
+        );
 }
 #[test]
 fn effective_half_life_disabled_legacy_recency_098() {
@@ -830,9 +922,9 @@ fn effective_half_life_disabled_legacy_recency_098() {
         .effective_half_life_days()
         .expect("should convert legacy recency_decay=0.98");
     assert!(
-        (half_life - 34.3).abs() < 0.5,
-        "recency_decay=0.98 should convert to ~34.3 day half-life, got {half_life}"
-    );
+            (half_life - 34.3).abs() < 0.5,
+            "recency_decay=0.98 should convert to ~34.3 day half-life, got {half_life}"
+        );
 }
 #[test]
 fn effective_half_life_disabled_legacy_recency_out_of_range_ignored() {
@@ -846,9 +938,10 @@ fn effective_half_life_disabled_legacy_recency_out_of_range_ignored() {
             ..Default::default()
         };
         assert_eq!(
-            config.effective_half_life_days(), None,
-            "recency_decay={bad_value} should not convert"
-        );
+                config.effective_half_life_days(),
+                None,
+                "recency_decay={bad_value} should not convert"
+            );
     }
 }
 #[test]
@@ -866,9 +959,10 @@ lambda = 2.0
         let mem = MemoryConfig::resolve(false, false, &config, None);
         assert!(mem.search.mmr.enabled);
         assert!(
-            (mem.search.mmr.lambda - 1.0).abs() < f64::EPSILON,
-            "lambda=2.0 should clamp to 1.0, got {}", mem.search.mmr.lambda
-        );
+                (mem.search.mmr.lambda - 1.0).abs() < f64::EPSILON,
+                "lambda=2.0 should clamp to 1.0, got {}",
+                mem.search.mmr.lambda
+            );
     });
 }
 #[test]
@@ -886,9 +980,10 @@ lambda = -0.5
         let mem = MemoryConfig::resolve(false, false, &config, None);
         assert!(mem.search.mmr.enabled);
         assert!(
-            mem.search.mmr.lambda.abs() < f64::EPSILON,
-            "lambda=-0.5 should clamp to 0.0, got {}", mem.search.mmr.lambda
-        );
+                mem.search.mmr.lambda.abs() < f64::EPSILON,
+                "lambda=-0.5 should clamp to 0.0, got {}",
+                mem.search.mmr.lambda
+            );
     });
 }
 #[test]
@@ -901,7 +996,7 @@ fn memory_config_remote_temporal_decay() {
             ..Default::default()
         };
         let mem = MemoryConfig::resolve(false, false, &config, Some(&remote));
-        assert!(! mem.search.temporal_decay.enabled);
+        assert!(!mem.search.temporal_decay.enabled);
         assert!((mem.search.temporal_decay.half_life_days - 14.0).abs() < f64::EPSILON);
     });
 }
@@ -929,13 +1024,13 @@ fn memory_config_remote_mmr_lambda_clamped() {
         };
         let mem = MemoryConfig::resolve(false, false, &config, Some(&remote));
         assert!(
-            (mem.search.mmr.lambda - 1.0).abs() < f64::EPSILON,
-            "remote mmr_lambda=5.0 should be clamped to 1.0"
-        );
+                (mem.search.mmr.lambda - 1.0).abs() < f64::EPSILON,
+                "remote mmr_lambda=5.0 should be clamped to 1.0"
+            );
     });
 }
 #[test]
-fn memory_config_local_search_blocks_remote_temporal_decay_and_mmr() {
+fn memory_config_partial_search_uses_remote_temporal_decay_and_mmr() {
     without_grok_memory(|| {
         let toml_str = r#"
 [memory.search]
@@ -949,14 +1044,9 @@ max_results = 8
             ..Default::default()
         };
         let mem = MemoryConfig::resolve(false, false, &config, Some(&remote));
-        assert!(
-            mem.search.temporal_decay.enabled,
-            "local search section should block remote temporal_decay override"
-        );
-        assert!(
-            ! mem.search.mmr.enabled,
-            "local search section should block remote mmr override"
-        );
+        assert!(!mem.search.temporal_decay.enabled);
+        assert!(mem.search.mmr.enabled);
+        assert!((mem.search.mmr.lambda - 0.3).abs() < f64::EPSILON);
     });
 }
 /// Mutex to serialize tests that touch the GROK_SUBAGENTS env var.
@@ -975,15 +1065,182 @@ fn with_grok_subagents<T>(value: &str, f: impl FnOnce() -> T) -> T {
 fn subagents_config_default_enabled() {
     without_grok_subagents(|| {
         let config = toml::Value::Table(toml::map::Map::new());
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(sa.enabled);
+    });
+}
+#[test]
+fn subagents_max_depth_defaults_to_one() {
+    assert_eq!(
+            SubagentsConfig::resolve_max_depth(None, None, None),
+            SubagentsConfig::DEFAULT_MAX_DEPTH
+        );
+    assert_eq!(SubagentsConfig::DEFAULT_MAX_DEPTH, 1);
+}
+#[test]
+fn subagents_max_depth_env_beats_toml_and_remote() {
+    assert_eq!(
+            SubagentsConfig::resolve_max_depth(Some("3"), Some(2), Some(4)),
+            3
+        );
+}
+#[test]
+fn subagents_max_depth_toml_beats_remote() {
+    assert_eq!(
+            SubagentsConfig::resolve_max_depth(None, Some(2), Some(4)),
+            2
+        );
+}
+#[test]
+fn subagents_max_depth_remote_used_when_local_absent() {
+    assert_eq!(SubagentsConfig::resolve_max_depth(None, None, Some(5)), 5);
+}
+#[test]
+fn subagents_max_depth_clamps_below_one_to_one() {
+    assert_eq!(SubagentsConfig::clamp_max_depth(-3, "test"), 1);
+    assert_eq!(SubagentsConfig::clamp_max_depth(0, "test"), 1);
+    assert_eq!(
+            SubagentsConfig::resolve_max_depth(Some("-2"), None, None),
+            1
+        );
+    assert_eq!(
+            SubagentsConfig::resolve_max_depth(None, Some(0), Some(3)),
+            1
+        );
+    assert_eq!(
+            SubagentsConfig::resolve_max_depth(None, None, Some(0)),
+            1
+        );
+}
+#[test]
+fn subagents_max_depth_invalid_env_falls_through() {
+    assert_eq!(
+            SubagentsConfig::resolve_max_depth(Some("not-a-number"), Some(2), None),
+            2
+        );
+}
+#[test]
+fn subagents_config_parses_max_depth_from_toml() {
+    without_grok_subagents(|| {
+        let config: toml::Value = toml::from_str("[subagents]\nmax_depth = 2\n")
+            .unwrap();
+        let sa = SubagentsConfig::resolve(false, &config);
+        assert_eq!(sa.max_depth, Some(2));
+    });
+}
+#[test]
+fn subagent_limit_counts_resolve_env_over_toml_over_remote_over_default() {
+    use xai_grok_tools::implementations::grok_build::task::admission;
+    let resolve = SubagentsConfig::resolve_max_concurrent;
+    assert_eq!(resolve(Some("3"), Some(2), Some(4)), 3);
+    assert_eq!(resolve(None, Some(2), Some(4)), 2);
+    assert_eq!(resolve(None, None, Some(5)), 5);
+    assert_eq!(resolve(None, None, None), admission::DEFAULT_MAX_CONCURRENT);
+    assert_eq!(resolve(Some("-2"), Some(2), None), 2);
+    assert_eq!(resolve(None, Some(0), Some(3)), 1);
+    assert_eq!(
+            SubagentsConfig::resolve_workflow_max_concurrent(None, None, None),
+            crate::session::workflow::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS
+        );
+}
+#[test]
+fn subagent_sampling_limit_applies_precedence_and_clamps() {
+    use crate::agent::subagent::MAX_SUBAGENT_SAMPLING_LIMIT;
+    use xai_grok_tools::implementations::grok_build::task::admission::DEFAULT_MAX_CONCURRENT;
+    let resolve = |env: Option<&str>, config: Option<i64>, remote: Option<u32>| SubagentsConfig::resolve_sampling_limit(
+        env,
+        config,
+        remote,
+        DEFAULT_MAX_CONCURRENT,
+    );
+    assert_eq!(resolve(None, None, None), DEFAULT_MAX_CONCURRENT);
+    assert_eq!(resolve(Some("24"), Some(8), Some(4)), 24);
+    for bad in ["0", "-1", "garbage"] {
+        assert_eq!(resolve(Some(bad), None, None), DEFAULT_MAX_CONCURRENT);
+    }
+    let huge = (MAX_SUBAGENT_SAMPLING_LIMIT as u64 + 1_000).to_string();
+    assert_eq!(resolve(Some(&huge), None, None), MAX_SUBAGENT_SAMPLING_LIMIT);
+    assert_eq!(
+            resolve(Some("999999999999999999999999999"), None, None),
+            DEFAULT_MAX_CONCURRENT
+        );
+    assert!(resolve(Some("0"), Some(0), Some(0)) > 0);
+}
+#[test]
+fn subagent_sampling_limit_env_override_beats_toml() {
+    let _lock = SUBAGENTS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::env::EnvVarGuard::set(SubagentsConfig::ENV_SAMPLING_LIMIT, "24");
+    let raw: toml::Value = toml::from_str("[subagents]\nsampling_limit = 8\n").unwrap();
+    let mut config = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+    config.resolve_subagents(false, &raw);
+    assert_eq!(config.subagents_sampling_limit, 24);
+}
+#[test]
+fn subagent_sampling_limit_defaults_to_resolved_subagents_max_concurrent() {
+    let _lock = SUBAGENTS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = crate::env::EnvVarGuard::remove(SubagentsConfig::ENV_SAMPLING_LIMIT)
+        .and_set(SubagentsConfig::ENV_MAX_CONCURRENT, "20");
+    let raw: toml::Value = toml::from_str("[subagents]\n").unwrap();
+    let mut config = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+    config.resolve_subagents(false, &raw);
+    assert_eq!(config.subagents_max_concurrent, 20);
+    assert_eq!(
+            config.subagents_sampling_limit,
+            config.subagents_max_concurrent
+        );
+}
+#[test]
+fn subagent_limit_behavior_resolves_env_over_toml_over_remote_over_queue() {
+    use xai_grok_tools::implementations::grok_build::task::admission::LimitBehavior;
+    let resolve = SubagentsConfig::resolve_limit_behavior;
+    assert_eq!(
+            resolve(Some("fail"), Some("queue"), Some("queue")),
+            LimitBehavior::Fail
+        );
+    assert_eq!(resolve(None, Some("FAIL"), Some("queue")), LimitBehavior::Fail);
+    assert_eq!(resolve(None, None, Some("fail")), LimitBehavior::Fail);
+    assert_eq!(resolve(None, None, None), LimitBehavior::Queue);
+    assert_eq!(
+            resolve(Some("sometimes"), Some("fail"), None),
+            LimitBehavior::Fail
+        );
+    assert_eq!(resolve(None, Some("sometimes"), None), LimitBehavior::Queue);
+}
+#[test]
+fn subagents_config_parses_limits_from_toml() {
+    without_grok_subagents(|| {
+        let config: toml::Value = toml::from_str(
+                "[subagents]\nmax_concurrent = 4\nsampling_limit = 6\nlimit_behavior = \"fail\"\nworkflow_max_concurrent = 8\n",
+            )
+            .unwrap();
+        let sa = SubagentsConfig::resolve(false, &config);
+        assert_eq!(sa.max_concurrent, Some(4));
+        assert_eq!(sa.sampling_limit, Some(6));
+        assert_eq!(sa.limit_behavior.as_deref(), Some("fail"));
+        assert_eq!(sa.workflow_max_concurrent, Some(8));
+    });
+}
+#[test]
+fn subagents_config_parses_negative_max_depth_without_dropping_section() {
+    without_grok_subagents(|| {
+        let config: toml::Value = toml::from_str(
+                "[subagents]\nenabled = true\nmax_depth = -1\n",
+            )
+            .unwrap();
+        let sa = SubagentsConfig::resolve(false, &config);
+        assert!(sa.enabled);
+        assert_eq!(sa.max_depth, Some(-1));
+        assert_eq!(
+                SubagentsConfig::resolve_max_depth(None, sa.max_depth, None),
+                1
+            );
     });
 }
 #[test]
 fn subagents_config_cli_flag_enables() {
     without_grok_subagents(|| {
         let config = toml::Value::Table(toml::map::Map::new());
-        let sa = SubagentsConfig::resolve(true, &config, None);
+        let sa = SubagentsConfig::resolve(true, &config);
         assert!(sa.enabled);
     });
 }
@@ -993,7 +1250,7 @@ fn subagents_config_env_var_enables() {
         "1",
         || {
             let config = toml::Value::Table(toml::map::Map::new());
-            let sa = SubagentsConfig::resolve(false, &config, None);
+            let sa = SubagentsConfig::resolve(false, &config);
             assert!(sa.enabled);
         },
     );
@@ -1005,8 +1262,8 @@ fn subagents_config_env_var_disables() {
         || {
             let config: toml::Value = toml::from_str("[subagents]\nenabled = true")
                 .unwrap();
-            let sa = SubagentsConfig::resolve(false, &config, None);
-            assert!(! sa.enabled, "GROK_SUBAGENTS=0 should override config file");
+            let sa = SubagentsConfig::resolve(false, &config);
+            assert!(!sa.enabled, "GROK_SUBAGENTS=0 should override config file");
         },
     );
 }
@@ -1014,7 +1271,7 @@ fn subagents_config_env_var_disables() {
 fn subagents_config_toml_enables() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(sa.enabled);
     });
 }
@@ -1023,8 +1280,8 @@ fn subagents_config_local_disabled_wins() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = false")
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config, None);
-        assert!(! sa.enabled, "local [subagents] enabled=false should win");
+        let sa = SubagentsConfig::resolve(false, &config);
+        assert!(!sa.enabled, "local [subagents] enabled=false should win");
     });
 }
 #[test]
@@ -1033,15 +1290,15 @@ fn subagents_config_env_var_disables_default() {
         "0",
         || {
             let config = toml::Value::Table(toml::map::Map::new());
-            let sa = SubagentsConfig::resolve(false, &config, None);
+            let sa = SubagentsConfig::resolve(false, &config);
             assert!(
-                ! sa.enabled, "GROK_SUBAGENTS=0 should override the enabled default"
+                !sa.enabled,
+                "GROK_SUBAGENTS=0 should override the enabled default"
             );
         },
     );
 }
-/// A `subagents_enabled` key served by an old cli-chat-proxy must parse
-/// as an unknown key and have no effect on resolution.
+/// A `subagents_enabled` key served by an old cli-chat-proxy must parse as an unknown key and have no effect on resolution.
 #[test]
 fn subagents_config_remote_settings_key_is_ignored() {
     without_grok_subagents(|| {
@@ -1050,7 +1307,7 @@ fn subagents_config_remote_settings_key_is_ignored() {
             )
             .expect("unknown subagents_enabled key must not break parsing");
         let config = toml::Value::Table(toml::map::Map::new());
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(sa.enabled);
     });
 }
@@ -1060,8 +1317,11 @@ fn subagents_config_cli_flag_overrides_env_var() {
         "0",
         || {
             let config = toml::Value::Table(toml::map::Map::new());
-            let sa = SubagentsConfig::resolve(true, &config, None);
-            assert!(sa.enabled, "--subagents CLI flag should override GROK_SUBAGENTS=0");
+            let sa = SubagentsConfig::resolve(true, &config);
+            assert!(
+                sa.enabled,
+                "--subagents CLI flag should override GROK_SUBAGENTS=0"
+            );
         },
     );
 }
@@ -1079,7 +1339,7 @@ fn subagents_config_models_parsed() {
                 "#,
             )
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(sa.enabled);
         assert_eq!(sa.models.len(), 2);
         assert_eq!(sa.models.get("explore").unwrap(), "grok-3-fast");
@@ -1090,7 +1350,7 @@ fn subagents_config_models_parsed() {
 fn subagents_config_models_empty_when_missing() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(sa.enabled);
         assert!(sa.models.is_empty());
     });
@@ -1105,10 +1365,11 @@ fn subagents_config_models_without_enabled() {
                 "#,
             )
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(
-            ! sa.enabled, "explicit [subagents] section without enabled should be false"
-        );
+                !sa.enabled,
+                "explicit [subagents] section without enabled should be false"
+            );
         assert_eq!(sa.models.len(), 1);
         assert_eq!(sa.models.get("explore").unwrap(), "grok-3-fast");
     });
@@ -1125,7 +1386,7 @@ fn subagents_config_models_with_env_var_enables() {
                 "#,
                 )
                 .unwrap();
-            let sa = SubagentsConfig::resolve(false, &config, None);
+            let sa = SubagentsConfig::resolve(false, &config);
             assert!(sa.enabled, "GROK_SUBAGENTS=1 should enable");
             assert_eq!(sa.models.get("explore").unwrap(), "grok-3-fast");
         },
@@ -1147,7 +1408,7 @@ fn subagents_config_toggle_mixed_values() {
                 "#,
             )
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(sa.enabled);
         assert_eq!(sa.toggle.len(), 4);
         assert_eq!(sa.toggle.get("explore").copied(), Some(true));
@@ -1160,12 +1421,12 @@ fn subagents_config_toggle_mixed_values() {
 fn subagents_config_toggle_missing_defaults_to_empty() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(sa.enabled);
         assert!(
-            sa.toggle.is_empty(),
-            "missing [subagents.toggle] should produce empty HashMap"
-        );
+                sa.toggle.is_empty(),
+                "missing [subagents.toggle] should produce empty HashMap"
+            );
     });
 }
 #[test]
@@ -1176,12 +1437,13 @@ fn subagents_config_is_subagent_enabled_absent_defaults_true() {
         ..Default::default()
     };
     assert!(
-        sa.is_subagent_enabled("explore"), "absent key should default to enabled (true)"
-    );
+            sa.is_subagent_enabled("explore"),
+            "absent key should default to enabled (true)"
+        );
     assert!(
-        sa.is_subagent_enabled("general-purpose"),
-        "absent key should default to enabled (true)"
-    );
+            sa.is_subagent_enabled("general-purpose"),
+            "absent key should default to enabled (true)"
+        );
 }
 #[test]
 fn subagents_config_is_subagent_enabled_false_when_toggled_off() {
@@ -1194,12 +1456,18 @@ fn subagents_config_is_subagent_enabled_false_when_toggled_off() {
         ]),
         ..Default::default()
     };
-    assert!(! sa.is_subagent_enabled("plan"), "plan = false should return disabled");
     assert!(
-        ! sa.is_subagent_enabled("code-reviewer"),
-        "code-reviewer = false should return disabled"
-    );
-    assert!(sa.is_subagent_enabled("explore"), "explore = true should return enabled");
+            !sa.is_subagent_enabled("plan"),
+            "plan = false should return disabled"
+        );
+    assert!(
+            !sa.is_subagent_enabled("code-reviewer"),
+            "code-reviewer = false should return disabled"
+        );
+    assert!(
+            sa.is_subagent_enabled("explore"),
+            "explore = true should return enabled"
+        );
 }
 fn with_managed_mcp_env<T>(
     managed_mcps: Option<&str>,
@@ -1236,7 +1504,7 @@ fn managed_mcps_headless_default_disabled() {
         || {
             let empty = toml::Value::Table(toml::map::Map::new());
             let cfg = ManagedMcpsConfig::resolve(&empty, None, true);
-            assert!(! cfg.enabled);
+            assert!(!cfg.enabled);
         },
     );
 }
@@ -1249,7 +1517,7 @@ fn managed_mcp_gateway_tools_default_disabled() {
         || {
             let empty = toml::Value::Table(toml::map::Map::new());
             let cfg = ManagedMcpsConfig::resolve(&empty, None, false);
-            assert!(! cfg.gateway_tools_enabled);
+            assert!(!cfg.gateway_tools_enabled);
         },
     );
 }
@@ -1272,8 +1540,8 @@ fn managed_mcp_gateway_tools_require_managed_master() {
                 ..Default::default()
             };
             let cfg = ManagedMcpsConfig::resolve(&config, Some(&remote), true);
-            assert!(! cfg.enabled);
-            assert!(! cfg.gateway_tools_enabled);
+            assert!(!cfg.enabled);
+            assert!(!cfg.gateway_tools_enabled);
         },
     );
 }
@@ -1307,7 +1575,7 @@ fn managed_mcp_gateway_tools_env_overrides_remote() {
                 ..Default::default()
             };
             let cfg = ManagedMcpsConfig::resolve(&empty, Some(&remote), false);
-            assert!(! cfg.gateway_tools_enabled);
+            assert!(!cfg.gateway_tools_enabled);
         },
     );
 }
@@ -1486,8 +1754,8 @@ fn model_overrides_default_image_description_is_grok_build() {
             let empty = toml::Value::Table(toml::map::Map::new());
             let cfg = ModelOverrideConfig::resolve(None, None, &empty, None);
             assert_eq!(
-                cfg.image_description, Some(crate
-                ::models::default_image_description_model().to_owned())
+                cfg.image_description,
+                Some(crate::models::default_image_description_model().to_owned())
             );
         },
     );
@@ -1502,8 +1770,8 @@ fn model_overrides_default_session_summary_is_grok_build() {
             let empty = toml::Value::Table(toml::map::Map::new());
             let cfg = ModelOverrideConfig::resolve(None, None, &empty, None);
             assert_eq!(
-                cfg.session_summary, Some(crate ::models::default_session_summary_model()
-                .to_owned())
+                cfg.session_summary,
+                Some(crate::models::default_session_summary_model().to_owned())
             );
         },
     );
@@ -1583,8 +1851,8 @@ fn model_overrides_empty_session_summary_toml_uses_default() {
                 .unwrap();
             let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
             assert_eq!(
-                cfg.session_summary, Some(crate ::models::default_session_summary_model()
-                .to_owned())
+                cfg.session_summary,
+                Some(crate::models::default_session_summary_model().to_owned())
             );
         },
     );
@@ -1603,8 +1871,8 @@ fn model_overrides_empty_session_summary_remote_uses_default() {
             };
             let cfg = ModelOverrideConfig::resolve(None, None, &empty, Some(&remote));
             assert_eq!(
-                cfg.session_summary, Some(crate ::models::default_session_summary_model()
-                .to_owned())
+                cfg.session_summary,
+                Some(crate::models::default_session_summary_model().to_owned())
             );
         },
     );
@@ -1647,8 +1915,8 @@ fn model_overrides_empty_cli_session_summary_uses_default() {
             let empty = toml::Value::Table(toml::map::Map::new());
             let cfg = ModelOverrideConfig::resolve(None, Some(""), &empty, None);
             assert_eq!(
-                cfg.session_summary, Some(crate ::models::default_session_summary_model()
-                .to_owned())
+                cfg.session_summary,
+                Some(crate::models::default_session_summary_model().to_owned())
             );
         },
     );
@@ -1705,8 +1973,8 @@ fn model_overrides_empty_image_description_toml_uses_default() {
                 .unwrap();
             let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
             assert_eq!(
-                cfg.image_description, Some(crate
-                ::models::default_image_description_model().to_owned())
+                cfg.image_description,
+                Some(crate::models::default_image_description_model().to_owned())
             );
         },
     );
@@ -1725,8 +1993,8 @@ fn model_overrides_empty_image_description_remote_uses_default() {
             };
             let cfg = ModelOverrideConfig::resolve(None, None, &empty, Some(&remote));
             assert_eq!(
-                cfg.image_description, Some(crate
-                ::models::default_image_description_model().to_owned())
+                cfg.image_description,
+                Some(crate::models::default_image_description_model().to_owned())
             );
         },
     );
@@ -1764,8 +2032,8 @@ fn model_overrides_prompt_suggestion_local_wins_over_remote() {
             };
             let cfg = ModelOverrideConfig::resolve(None, None, &config, Some(&remote));
             assert_eq!(
-                cfg.prompt_suggestion, PromptSuggestModelPin::Pinned("local-ps"
-                .to_owned())
+                cfg.prompt_suggestion,
+                PromptSuggestModelPin::Pinned("local-ps".to_owned())
             );
         },
     );
@@ -1784,8 +2052,8 @@ fn model_overrides_prompt_suggestion_remote_applies_without_local() {
             };
             let cfg = ModelOverrideConfig::resolve(None, None, &empty, Some(&remote));
             assert_eq!(
-                cfg.prompt_suggestion, PromptSuggestModelPin::Pinned("remote-ps"
-                .to_owned())
+                cfg.prompt_suggestion,
+                PromptSuggestModelPin::Pinned("remote-ps".to_owned())
             );
         },
     );
@@ -1811,7 +2079,8 @@ fn model_overrides_prompt_suggestion_env_wins_over_local_and_remote() {
             };
             let cfg = ModelOverrideConfig::resolve(None, None, &config, Some(&remote));
             assert_eq!(
-                cfg.prompt_suggestion, PromptSuggestModelPin::Env("env-ps".to_owned())
+                cfg.prompt_suggestion,
+                PromptSuggestModelPin::Env("env-ps".to_owned())
             );
         },
     );
@@ -1833,8 +2102,8 @@ fn model_overrides_prompt_suggestion_blank_values_are_unset() {
                 .unwrap();
             let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
             assert_eq!(
-                cfg.prompt_suggestion, PromptSuggestModelPin::Pinned("local-ps"
-                .to_owned())
+                cfg.prompt_suggestion,
+                PromptSuggestModelPin::Pinned("local-ps".to_owned())
             );
         },
     );
@@ -1859,11 +2128,10 @@ fn model_overrides_prompt_suggestion_blank_values_are_unset() {
         },
     );
 }
-/// Lock shared by every test that touches the env vars read by
-/// `ToolsConfig::resolve`, so tests across both fields can't race.
+/// Lock shared by every test that touches the env vars read by `ToolsConfig::resolve`, so tests across both fields can't race.
 static TOOLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-/// Set both `ToolsConfig` env vars for the duration of `f`, then
-/// restore. `None` clears the var.
+/// Set both `ToolsConfig` env vars for the duration of `f`, then restore.
+/// `None` clears the var.
 fn with_tools_env<T>(
     respect_gitignore: Option<&str>,
     disable_zdr: Option<&str>,
@@ -1887,7 +2155,7 @@ fn tools_config_default_disabled() {
     without_grok_respect_gitignore(|| {
         let config = toml::Value::Table(toml::map::Map::new());
         let tc = ToolsConfig::resolve(&config);
-        assert!(! tc.respect_gitignore);
+        assert!(!tc.respect_gitignore);
     });
 }
 #[test]
@@ -1896,7 +2164,7 @@ fn tools_config_toml_disables() {
         let config: toml::Value = toml::from_str("[tools]\nrespect_gitignore = false")
             .unwrap();
         let tc = ToolsConfig::resolve(&config);
-        assert!(! tc.respect_gitignore);
+        assert!(!tc.respect_gitignore);
     });
 }
 #[test]
@@ -1906,7 +2174,7 @@ fn tools_config_env_var_disables() {
         || {
             let config = toml::Value::Table(toml::map::Map::new());
             let tc = ToolsConfig::resolve(&config);
-            assert!(! tc.respect_gitignore);
+            assert!(!tc.respect_gitignore);
         },
     );
 }
@@ -1933,7 +2201,7 @@ fn tools_config_env_false_overrides_toml_true() {
                 .unwrap();
             let tc = ToolsConfig::resolve(&config);
             assert!(
-                ! tc.respect_gitignore,
+                !tc.respect_gitignore,
                 "GROK_RESPECT_GITIGNORE=false should override config file"
             );
         },
@@ -1993,9 +2261,9 @@ fn incomplete_zdr_video_output_s3_is_ignored() {
         let tc = ToolsConfig::resolve(&config);
         assert!(tc.zdr_video_output_s3.is_none());
         assert!(
-            tc.disable_zdr_incompatible_tools,
-            "incomplete zdr_video_output_s3 must not drop disable_zdr_incompatible_tools"
-        );
+                tc.disable_zdr_incompatible_tools,
+                "incomplete zdr_video_output_s3 must not drop disable_zdr_incompatible_tools"
+            );
     });
 }
 #[test]
@@ -2021,6 +2289,30 @@ fn malformed_zdr_video_output_s3_preserves_zdr_flag() {
     });
 }
 #[test]
+fn media_gen_caps_resolve_env_over_toml_over_remote_over_default() {
+    use xai_grok_tools::media_gen_limits::{
+        DEFAULT_MAX_PARALLEL_IMAGE_GEN, DEFAULT_MAX_PARALLEL_VIDEO_GEN,
+    };
+    let config: toml::Value = toml::from_str(
+            "[tools.media_gen]\nmax_parallel_image_gen_calls = 2\nmax_parallel_video_gen_calls = 1\n",
+        )
+        .unwrap();
+    let tc = ToolsConfig::resolve(&config);
+    assert_eq!(tc.media_gen.max_parallel_image_gen_calls, Some(2));
+    assert_eq!(tc.media_gen.max_parallel_video_gen_calls, Some(1));
+    let image = ToolsConfig::resolve_max_parallel_image_gen_calls;
+    let video = ToolsConfig::resolve_max_parallel_video_gen_calls;
+    assert_eq!(image(Some("3"), Some(2), Some(4)), 3);
+    assert_eq!(image(None, Some(2), Some(4)), 2);
+    assert_eq!(image(None, None, Some(5)), 5);
+    assert_eq!(image(None, None, None), DEFAULT_MAX_PARALLEL_IMAGE_GEN);
+    assert_eq!(image(Some("not-a-number"), Some(2), None), 2);
+    assert_eq!(image(Some("0"), Some(2), None), 1);
+    assert_eq!(image(None, Some(0), Some(3)), 1);
+    assert_eq!(video(None, None, None), DEFAULT_MAX_PARALLEL_VIDEO_GEN);
+    assert_eq!(video(Some("9"), Some(1), Some(2)), 9);
+}
+#[test]
 fn roles_parse_from_toml() {
     let toml_str = r#"
             [roles.researcher]
@@ -2037,14 +2329,20 @@ fn roles_parse_from_toml() {
     assert_eq!(cfg.roles.len(), 2);
     let researcher = cfg.get_role("researcher").unwrap();
     assert_eq!(researcher.description, "Deep research agent");
-    assert_eq!(researcher.default_capability_mode.as_deref(), Some("read-only"));
+    assert_eq!(
+            researcher.default_capability_mode.as_deref(),
+            Some("read-only")
+        );
     assert_eq!(researcher.model.as_deref(), Some("grok-3"));
     assert!(researcher.prompt_file.is_none());
     let implementer = cfg.get_role("implementer").unwrap();
     assert_eq!(implementer.description, "Implementation agent");
     assert_eq!(implementer.default_capability_mode.as_deref(), Some("all"));
     assert!(implementer.model.is_none());
-    assert_eq!(implementer.prompt_file.as_deref(), Some(".grok/prompts/impl.md"));
+    assert_eq!(
+            implementer.prompt_file.as_deref(),
+            Some(".grok/prompts/impl.md")
+        );
 }
 #[test]
 fn roles_default_to_empty() {
@@ -2166,9 +2464,9 @@ fn discover_roles_inline_takes_precedence() {
     cfg.discover_roles(tmp.path());
     let role = cfg.get_role("researcher").unwrap();
     assert_eq!(
-        role.description, "Inline researcher",
-        "inline config should take precedence over file"
-    );
+            role.description, "Inline researcher",
+            "inline config should take precedence over file"
+        );
 }
 #[test]
 fn discover_roles_ignores_non_toml_files() {
@@ -2202,12 +2500,16 @@ fn personas_parse_from_toml() {
     assert_eq!(cfg.personas.len(), 2);
     let researcher = cfg.get_persona("researcher").unwrap();
     assert_eq!(
-        researcher.instructions.as_deref(), Some("You are a thorough researcher.")
-    );
+            researcher.instructions.as_deref(),
+            Some("You are a thorough researcher.")
+        );
     assert!(researcher.instructions_file.is_none());
     let concise = cfg.get_persona("concise").unwrap();
     assert_eq!(concise.instructions.as_deref(), Some("Be concise."));
-    assert_eq!(concise.instructions_file.as_deref(), Some(".grok/personas/concise.md"));
+    assert_eq!(
+            concise.instructions_file.as_deref(),
+            Some(".grok/personas/concise.md")
+        );
 }
 #[test]
 fn personas_default_to_empty() {
@@ -2250,9 +2552,149 @@ fn discover_personas_inline_takes_precedence() {
         .unwrap();
     cfg.discover_personas(tmp.path());
     assert_eq!(
-        cfg.get_persona("strict").unwrap().instructions.as_deref(),
-        Some("Inline strict"),
+            cfg.get_persona("strict").unwrap().instructions.as_deref(),
+            Some("Inline strict"),
+        );
+}
+fn write_subagent_definitions(root: &std::path::Path, definitions: &[(&str, &str)]) {
+    let roles = root.join("roles");
+    let personas = root.join("personas");
+    std::fs::create_dir_all(&roles).unwrap();
+    std::fs::create_dir_all(&personas).unwrap();
+    for (name, source) in definitions {
+        std::fs::write(
+                roles.join(format!("{name}.toml")),
+                format!("description = \"{source} role\""),
+            )
+            .unwrap();
+        std::fs::write(
+                personas.join(format!("{name}.toml")),
+                format!("instructions = \"{source} persona\""),
+            )
+            .unwrap();
+    }
+}
+#[test]
+fn project_overlay_preserves_source_precedence() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    let home = tmp.path().join("home");
+    let bundled = tmp.path().join("bundled");
+    write_subagent_definitions(
+        &project.join(".grok"),
+        &[
+            ("shadowed", "Project"),
+            ("bundled-shadowed", "Project"),
+            ("inline", "Project"),
+            ("project-only", "Project"),
+        ],
     );
+    write_subagent_definitions(
+        &home.join(".grok"),
+        &[("shadowed", "User"), ("user-only", "User")],
+    );
+    write_subagent_definitions(
+        &bundled,
+        &[("bundled-shadowed", "Bundled"), ("bundled-only", "Bundled")],
+    );
+    let config = toml::from_str::<
+        toml::Value,
+    >(
+            r#"
+            [subagents]
+            enabled = true
+
+            [subagents.roles.inline]
+            description = "Inline role"
+
+            [subagents.personas.inline]
+            instructions = "Inline persona"
+            "#,
+        )
+        .unwrap();
+    let base = SubagentsConfig::resolve_base_with_sources(
+        false,
+        &config,
+        Some(&home.join(".grok")),
+        &bundled,
+    );
+    let resolve = |project_trusted| {
+        let (roles, personas) = SubagentsConfig::effective_definition_maps(
+            &base.roles,
+            &base.personas,
+            &project,
+            project_trusted,
+        );
+        SubagentsConfig {
+            roles,
+            personas,
+            ..Default::default()
+        }
+    };
+    let untrusted = resolve(false);
+    assert_eq!(
+            untrusted.get_role("shadowed").unwrap().description,
+            "User role"
+        );
+    assert_eq!(
+            untrusted
+                .get_persona("shadowed")
+                .and_then(|persona| persona.instructions.as_deref()),
+            Some("User persona")
+        );
+    assert!(untrusted.get_role("project-only").is_none());
+    assert!(untrusted.get_persona("project-only").is_none());
+    assert!(untrusted.get_role("user-only").is_some());
+    assert!(untrusted.get_persona("user-only").is_some());
+    assert!(untrusted.get_role("bundled-only").is_some());
+    assert!(untrusted.get_persona("bundled-only").is_some());
+    assert_eq!(
+            untrusted.get_role("bundled-shadowed").unwrap().description,
+            "Bundled role"
+        );
+    assert_eq!(
+            untrusted
+                .get_persona("bundled-shadowed")
+                .and_then(|persona| persona.instructions.as_deref()),
+            Some("Bundled persona")
+        );
+    let trusted = resolve(true);
+    assert_eq!(
+            trusted.get_role("shadowed").unwrap().description,
+            "Project role"
+        );
+    assert_eq!(
+            trusted
+                .get_persona("shadowed")
+                .and_then(|persona| persona.instructions.as_deref()),
+            Some("Project persona")
+        );
+    assert_eq!(
+            trusted.get_role("bundled-shadowed").unwrap().description,
+            "Project role"
+        );
+    assert_eq!(
+            trusted
+                .get_persona("bundled-shadowed")
+                .and_then(|persona| persona.instructions.as_deref()),
+            Some("Project persona")
+        );
+    assert_eq!(
+            trusted.get_role("inline").unwrap().description,
+            "Inline role"
+        );
+    assert_eq!(
+            trusted
+                .get_persona("inline")
+                .and_then(|persona| persona.instructions.as_deref()),
+            Some("Inline persona")
+        );
+    let denied_again = resolve(false);
+    assert_eq!(
+            denied_again.get_role("shadowed").unwrap().description,
+            "User role"
+        );
+    assert!(denied_again.get_role("project-only").is_none());
 }
 #[test]
 fn bundled_personas_and_roles_have_lowest_priority_in_resolve_order() {
@@ -2296,85 +2738,126 @@ fn bundled_personas_and_roles_have_lowest_priority_in_resolve_order() {
             r#"instructions = "Project persona""#,
         )
         .unwrap();
-    with_env_var(
-        "HOME",
-        home.to_str().unwrap(),
-        || {
-            let config = toml::from_str::<
-                toml::Value,
-            >(
-                    r#"
-                [subagents]
-                enabled = true
+    let config = toml::from_str::<
+        toml::Value,
+    >(
+            r#"
+            [subagents]
+            enabled = true
 
-                [subagents.roles.reviewer]
-                description = "Inline reviewer"
+            [subagents.roles.reviewer]
+            description = "Inline reviewer"
 
-                [subagents.personas.reviewer]
-                instructions = "Inline persona"
-                "#,
-                )
-                .unwrap();
-            let resolved = SubagentsConfig::resolve(true, &config, Some(&workspace));
-            assert_eq!(
-                resolved.get_role("reviewer").unwrap().description, "Inline reviewer"
-            );
-            assert_eq!(
-                resolved.get_persona("reviewer").unwrap().instructions.as_deref(),
-                Some("Inline persona")
-            );
-        },
+            [subagents.personas.reviewer]
+            instructions = "Inline persona"
+            "#,
+        )
+        .unwrap();
+    let base = SubagentsConfig::resolve_base_with_sources(
+        true,
+        &config,
+        Some(&home.join(".grok")),
+        &bundled,
     );
+    let (roles, personas) = SubagentsConfig::effective_definition_maps(
+        &base.roles,
+        &base.personas,
+        &workspace,
+        true,
+    );
+    let resolved = SubagentsConfig {
+        roles,
+        personas,
+        ..Default::default()
+    };
+    assert_eq!(
+            resolved.get_role("reviewer").unwrap().description,
+            "Inline reviewer"
+        );
+    assert_eq!(
+            resolved
+                .get_persona("reviewer")
+                .unwrap()
+                .instructions
+                .as_deref(),
+            Some("Inline persona")
+        );
     std::fs::remove_file(workspace.join(".grok/roles/reviewer.toml")).unwrap();
     std::fs::remove_file(workspace.join(".grok/personas/reviewer.toml")).unwrap();
-    with_env_var(
-        "HOME",
-        home.to_str().unwrap(),
-        || {
-            let config = toml::from_str::<
-                toml::Value,
-            >(
-                    r#"
-                [subagents]
-                enabled = true
-                "#,
-                )
-                .unwrap();
-            let resolved = SubagentsConfig::resolve(true, &config, Some(&workspace));
-            assert_eq!(
-                resolved.get_role("reviewer").unwrap().description, "User reviewer"
-            );
-            assert_eq!(
-                resolved.get_persona("reviewer").unwrap().instructions.as_deref(),
-                Some("User persona")
-            );
-        },
+    let config = toml::from_str::<
+        toml::Value,
+    >(r#"
+            [subagents]
+            enabled = true
+            "#)
+        .unwrap();
+    let base = SubagentsConfig::resolve_base_with_sources(
+        true,
+        &config,
+        Some(&home.join(".grok")),
+        &bundled,
     );
+    let (roles, personas) = SubagentsConfig::effective_definition_maps(
+        &base.roles,
+        &base.personas,
+        &workspace,
+        true,
+    );
+    let resolved = SubagentsConfig {
+        roles,
+        personas,
+        ..Default::default()
+    };
+    assert_eq!(
+            resolved.get_role("reviewer").unwrap().description,
+            "User reviewer"
+        );
+    assert_eq!(
+            resolved
+                .get_persona("reviewer")
+                .unwrap()
+                .instructions
+                .as_deref(),
+            Some("User persona")
+        );
     std::fs::remove_file(home.join(".grok/roles/reviewer.toml")).unwrap();
     std::fs::remove_file(home.join(".grok/personas/reviewer.toml")).unwrap();
-    with_env_var(
-        "HOME",
-        home.to_str().unwrap(),
-        || {
-            let config = toml::from_str::<
-                toml::Value,
-            >(
-                    r#"
-                [subagents]
-                enabled = true
-                "#,
-                )
-                .unwrap();
-            let resolved = SubagentsConfig::resolve(true, &config, Some(&workspace));
-            assert_eq!(
-                resolved.get_role("reviewer").unwrap().description, "Bundled reviewer"
-            );
-            assert_eq!(
-                resolved.get_persona("reviewer").unwrap().instructions.as_deref(),
-                Some("Bundled persona")
-            );
-        },
+    let config = toml::from_str::<
+        toml::Value,
+    >(r#"
+            [subagents]
+            enabled = true
+            "#)
+        .unwrap();
+    let base = SubagentsConfig::resolve_base_with_sources(
+        true,
+        &config,
+        Some(&home.join(".grok")),
+        &bundled,
     );
+    let (roles, personas) = SubagentsConfig::effective_definition_maps(
+        &base.roles,
+        &base.personas,
+        &workspace,
+        true,
+    );
+    let resolved = SubagentsConfig {
+        roles,
+        personas,
+        ..Default::default()
+    };
+    assert_eq!(
+            resolved.get_role("reviewer").unwrap().description,
+            "Bundled reviewer"
+        );
+    assert_eq!(
+            resolved
+                .get_persona("reviewer")
+                .unwrap()
+                .instructions
+                .as_deref(),
+            Some("Bundled persona")
+        );
 }
 #[test]
 fn render_io_summary_shows_bundled_for_bundled_personas() {
@@ -2400,8 +2883,11 @@ fn roles_coexist_with_models_and_toggle() {
         "#;
     let cfg: SubagentsConfig = toml::from_str(toml_str).unwrap();
     assert!(cfg.enabled);
-    assert_eq!(cfg.models.get("explore").map(| s | s.as_str()), Some("grok-fast"));
-    assert!(! cfg.is_subagent_enabled("plan"));
+    assert_eq!(
+            cfg.models.get("explore").map(|s| s.as_str()),
+            Some("grok-fast")
+        );
+    assert!(!cfg.is_subagent_enabled("plan"));
     assert!(cfg.get_role("researcher").is_some());
 }
 #[test]
@@ -2427,16 +2913,18 @@ fn remove_hooks_path_removes() {
     let tmp = tempfile::tempdir().unwrap();
     let paths_file = tmp.path().join("hooks-paths");
     let _ = add_hooks_path_to_file("/to/remove", &paths_file);
-    let _ = remove_hooks_path_from_file("/to/remove", &paths_file);
+    let removed = remove_hooks_path_from_file("/to/remove", &paths_file).unwrap();
+    assert!(removed);
     let content = std::fs::read_to_string(&paths_file).unwrap_or_default();
-    assert!(! content.contains("/to/remove"));
+    assert!(!content.contains("/to/remove"));
 }
+/// Unregistered paths report `false` so callers refuse instead of claiming a removal that never happened.
 #[test]
-fn remove_hooks_path_is_noop_if_missing() {
+fn remove_hooks_path_reports_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let paths_file = tmp.path().join("hooks-paths");
-    let result = remove_hooks_path_from_file("/nonexistent/path", &paths_file);
-    assert!(result.is_ok());
+    let removed = remove_hooks_path_from_file("/nonexistent/path", &paths_file).unwrap();
+    assert!(!removed);
 }
 #[test]
 fn remove_hooks_path_preserves_others() {
@@ -2449,7 +2937,7 @@ fn remove_hooks_path_preserves_others() {
     let content = std::fs::read_to_string(&paths_file).unwrap_or_default();
     assert!(content.contains("/keep/me"));
     assert!(content.contains("/keep/me/too"));
-    assert!(! content.contains("/remove/me"));
+    assert!(!content.contains("/remove/me"));
 }
 #[test]
 fn add_hooks_path_succeeds_on_first_add() {
@@ -2489,7 +2977,7 @@ fn add_dismissed_plugin_cta_creates_table() {
     let content = std::fs::read_to_string(&config_path).unwrap();
     assert!(content.contains("[plugin_cta]"));
     assert!(content.contains("figma"));
-    assert!(dismissed_plugin_ctas_in_file(& config_path).contains("figma"));
+    assert!(dismissed_plugin_ctas_in_file(&config_path).contains("figma"));
 }
 #[test]
 fn add_dismissed_plugin_cta_is_idempotent() {
@@ -2513,11 +3001,11 @@ fn add_dismissed_plugin_cta_is_idempotent() {
 fn dismissed_plugin_ctas_reflects_added_entries() {
     let tmp = tempfile::tempdir().unwrap();
     let config_path = tmp.path().join("config.toml");
-    assert!(! dismissed_plugin_ctas_in_file(& config_path).contains("figma"));
+    assert!(!dismissed_plugin_ctas_in_file(&config_path).contains("figma"));
     add_dismissed_plugin_cta_to_file("figma", &config_path).unwrap();
     let dismissed = dismissed_plugin_ctas_in_file(&config_path);
     assert!(dismissed.contains("figma"));
-    assert!(! dismissed.contains("notion"));
+    assert!(!dismissed.contains("notion"));
 }
 #[test]
 fn add_dismissed_plugin_cta_preserves_other_config() {
@@ -2530,11 +3018,15 @@ fn add_dismissed_plugin_cta_preserves_other_config() {
         )
         .unwrap();
     assert_eq!(
-        config.get("plugins").and_then(| v | v.get("disabled")).and_then(| v | v
-        .as_array()).and_then(| a | a.first()).and_then(| v | v.as_str()),
-        Some("keep-me"),
-    );
-    assert!(dismissed_plugin_ctas_in_file(& config_path).contains("figma"));
+            config
+                .get("plugins")
+                .and_then(|v| v.get("disabled"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str()),
+            Some("keep-me"),
+        );
+    assert!(dismissed_plugin_ctas_in_file(&config_path).contains("figma"));
 }
 #[test]
 fn config_layers_user_overrides_managed() {
@@ -2552,15 +3044,60 @@ fn config_layers_user_overrides_managed() {
         )
         .unwrap();
     assert_eq!(
-        Some(crate ::agent::config::TelemetryMode::Enabled), cfg.features.telemetry
-    );
+            Some(crate::agent::config::TelemetryMode::Enabled),
+            cfg.features.telemetry
+        );
 }
-/// REGRESSION: the real enterprise two-file merge —
-/// `managed_config.toml` (proxy + BYO model host) layered with
-/// `requirements.toml` (deployment key + S3 trace upload) via the actual
-/// `ConfigLayers::effective_config()` path — must resolve the deployment-config
-/// fetch to cli-chat-proxy, never the model host, and must preserve the
-/// customer's S3 trace-upload endpoint.
+/// A provider in a trusted disk layer resolves through the real `ConfigLayers` and `effective_config_disk_only` parse path.
+/// The direct-TOML parse tests bypass that path.
+/// (`ConfigLayers` has no project slot, so a repo `.grok/config.toml` structurally cannot supply one.)
+#[test]
+fn auth_provider_honored_only_from_trusted_disk_layers() {
+    let layers = ConfigLayers {
+        managed: toml::from_str(
+                "[auth_provider.corp]\ncommand = \"/usr/local/bin/corp-token\"\n",
+            )
+            .unwrap(),
+        ..Default::default()
+    };
+    let cfg = crate::agent::config::Config::new_from_toml_cfg(
+            &layers.effective_config_disk_only(),
+        )
+        .unwrap();
+    assert_eq!(
+            cfg.auth_providers.get("corp").map(|c| c.command.as_str()),
+            Some("/usr/local/bin/corp-token"),
+            "a provider in a trusted disk layer is honored"
+        );
+}
+#[test]
+fn model_provider_honored_only_from_trusted_disk_layers() {
+    let layers = ConfigLayers {
+        managed: toml::from_str(
+                "[model_providers.gateway]\nbase_url = \"https://gateway.example/v1\"\n\
+                 [model_providers.gateway.auth]\ncommand = \"/usr/local/bin/gw-token\"\n",
+            )
+            .unwrap(),
+        ..Default::default()
+    };
+    let cfg = crate::agent::config::Config::new_from_toml_cfg(
+            &layers.effective_config_disk_only(),
+        )
+        .unwrap();
+    assert!(
+            cfg.model_providers.contains_key("gateway"),
+            "a model provider in a trusted disk layer is honored"
+        );
+    assert_eq!(
+            cfg.auth_providers
+                .get("model_provider:gateway")
+                .map(|c| c.command.as_str()),
+            Some("/usr/local/bin/gw-token"),
+            "its inline auth registers as a synthetic auth provider"
+        );
+}
+/// REGRESSION: the real enterprise two-file merge must resolve the deployment-config fetch to cli-chat-proxy, never the model host. It must also preserve the customer's S3 trace-upload endpoint.
+/// The merge layers `managed_config.toml` (proxy and BYO model host) with `requirements.toml` (deployment key and S3 trace upload). It runs via the actual `ConfigLayers::effective_config()` path.
 #[test]
 #[serial_test::serial]
 fn enterprise_two_file_merge_routes_deployment_key_to_proxy() {
@@ -2615,15 +3152,92 @@ trace_upload_endpoint_url = "https://s3.acme-corp.example"
         )
         .unwrap();
     assert_eq!(
-        cfg.endpoints.resolve_managed_config_url(),
-        "https://cli-chat-proxy.grok.com/v1/deployment/config"
-    );
-    assert!(! cfg.endpoints.resolve_managed_config_url().contains("acme-corp"));
+            cfg.endpoints.resolve_managed_config_url(),
+            "https://cli-chat-proxy.grok.com/v1/deployment/config"
+        );
+    assert!(
+            !cfg.endpoints
+                .resolve_managed_config_url()
+                .contains("acme-corp")
+        );
     assert_eq!(
-        cfg.endpoints.trace_upload_endpoint_url.as_deref(),
-        Some("https://s3.acme-corp.example")
-    );
+            cfg.endpoints.trace_upload_endpoint_url.as_deref(),
+            Some("https://s3.acme-corp.example")
+        );
     assert!(cfg.endpoints.deployment_key.is_some());
+}
+/// `[feedback.user]` in the managed layer must survive the layer merge into the resolved `Config` (its presence is the opt-in).
+#[test]
+fn managed_config_feedback_user_reaches_resolved_config() {
+    let managed = toml::from_str(
+            r#"
+[endpoints]
+cli_chat_proxy_base_url = "https://cli-chat-proxy.grok.com/v1"
+
+[feedback.user]
+name = ["os_user"]
+email = ["git_email", "team@example.com"]
+email_domain = "example.com"
+"#,
+        )
+        .unwrap();
+    let layers = ConfigLayers {
+        managed,
+        ..Default::default()
+    };
+    let cfg = crate::agent::config::Config::new_from_toml_cfg(
+            &layers.effective_config_disk_only(),
+        )
+        .unwrap();
+    let user = cfg
+        .feedback
+        .user
+        .expect("[feedback.user] from managed_config.toml must reach Config");
+    assert_eq!(user.name, vec!["os_user"]);
+    assert_eq!(user.email, vec!["git_email", "team@example.com"]);
+    assert_eq!(user.email_domain.as_deref(), Some("example.com"));
+    let layers = ConfigLayers::default();
+    let cfg = crate::agent::config::Config::new_from_toml_cfg(
+            &layers.effective_config_disk_only(),
+        )
+        .unwrap();
+    assert_eq!(cfg.feedback.user, None);
+}
+/// RCE guard: a project `.grok/config.toml` must never source `[feedback.user]` (its `command` runs `sh -c`).
+#[test]
+#[serial_test::serial]
+fn project_config_never_sources_feedback_user() {
+    use xai_grok_test_support::EnvGuard;
+    let home = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::set("GROK_HOME", home.path());
+    let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
+    let _sim = simulate_release_build();
+    let repo = tempfile::tempdir().unwrap();
+    git2::Repository::init(repo.path()).unwrap();
+    let grok = repo.path().join(".grok");
+    std::fs::create_dir_all(&grok).unwrap();
+    std::fs::write(
+            grok.join("config.toml"),
+            "[plugins]\npaths = [\"./p\"]\n\n[feedback.user]\ncommand = \"/evil\"\n",
+        )
+        .unwrap();
+    let cwd = repo.path();
+    xai_grok_workspace::folder_trust::grant_folder_trust(cwd);
+    assert!(
+            resolve_effective_plugins_config(cwd)
+                .paths
+                .iter()
+                .any(|p| p == "./p"),
+            "trusted project [plugins].paths must merge (proves the project config is read)"
+        );
+    let cfg = crate::agent::config::Config::new_from_toml_cfg(
+            &load_effective_config().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+            cfg.feedback.user, None,
+            "a project [feedback.user] must never reach Config (would be sh -c RCE)"
+        );
 }
 #[test]
 fn config_layers_origins_tracks_source() {
@@ -2672,8 +3286,9 @@ fn config_layers_system_managed_lowest_priority() {
         )
         .unwrap();
     assert_eq!(
-        Some(crate ::agent::config::TelemetryMode::Enabled), cfg.features.telemetry
-    );
+            Some(crate::agent::config::TelemetryMode::Enabled),
+            cfg.features.telemetry
+        );
 }
 #[test]
 fn apply_requirements_value_overrides_user_settings() {
@@ -2692,75 +3307,95 @@ fn apply_requirements_value_overrides_user_settings() {
     };
     let enforced = apply_requirements_inner(&mut cfg, &requirements, &source);
     assert_eq!(
-        Some(crate ::agent::config::TelemetryMode::Disabled), cfg.features.telemetry
-    );
-    assert_eq!(Some(false), cfg.features.feedback);
-    assert_eq!(Some(false), cfg.features.lsp_tools);
-    assert_eq!(Some(false), cfg.features.web_fetch);
-    assert_eq!(Some(false), cfg.features.write_file);
+            Some(crate::agent::config::TelemetryMode::Disabled),
+            cfg.features.telemetry
+        );
+    assert!(!cfg.is_feature_enabled(crate::agent::config::Feature::Feedback));
+    assert!(!cfg.is_feature_enabled(crate::agent::config::Feature::LspTools));
+    assert!(!cfg.is_feature_enabled(crate::agent::config::Feature::WebFetch));
+    assert!(
+            enforced
+                .iter()
+                .any(|e| e.path == "features.lsp_tools" && e.value == "false")
+        );
+    assert!(!cfg.is_feature_enabled(crate::agent::config::Feature::WriteFile));
     assert_eq!(Some(false), cfg.requirements.remote_fetch.pinned());
     assert!(
-        enforced.iter().any(| e | e.path == "features.remote_fetch" && e.value ==
-        "false")
-    );
+            enforced
+                .iter()
+                .any(|e| e.path == "features.remote_fetch" && e.value == "false")
+        );
     assert_eq!(Some(false), cfg.telemetry.trace_upload);
     assert_eq!(Some(false), cfg.cli.auto_update);
-    assert!(! cfg.ui.yolo);
-    assert!(! cfg.default_yolo_mode);
+    assert!(!cfg.ui.yolo);
+    assert!(!cfg.default_yolo_mode);
     assert_eq!(Some("managed-model"), cfg.models.default.as_deref());
     assert_eq!(Some("managed-ws-model"), cfg.models.web_search.as_deref());
     assert_eq!(Some("stable"), cfg.cli.channel.as_deref());
     assert_eq!(
-        Some("https://managed-proxy.example/v1"), cfg.endpoints.cli_chat_proxy_base_url
-        .as_deref()
-    );
-    assert_eq!("https://managed-api.example/v1", cfg.endpoints.xai_api_base_url);
+            Some("https://managed-proxy.example/v1"),
+            cfg.endpoints.cli_chat_proxy_base_url.as_deref()
+        );
     assert_eq!(
-        Some("https://managed-models.example/v1"), cfg.endpoints.models_base_url
-        .as_deref()
-    );
+            "https://managed-api.example/v1",
+            cfg.endpoints.xai_api_base_url
+        );
     assert_eq!(
-        Some("https://managed-models.example/v1/models"), cfg.endpoints.models_list_url
-        .as_deref()
-    );
-    assert!(
-        enforced.iter().any(| e | e.path == "ui.yolo" && e.value == "--yolo blocked")
-    );
+            Some("https://managed-models.example/v1"),
+            cfg.endpoints.models_base_url.as_deref()
+        );
     assert_eq!(
-        Some("https://s3.custom.example.com"), cfg.endpoints.trace_upload_endpoint_url
-        .as_deref()
-    );
+            Some("https://managed-models.example/v1/models"),
+            cfg.endpoints.models_list_url.as_deref()
+        );
     assert!(
-        cfg.endpoints.trace_upload_credentials.is_some(),
-        "trace_upload_credentials should be set"
-    );
-    assert!(
-        enforced.iter().any(| e | e.path == "endpoints.trace_upload_credentials" && e
-        .value == "[redacted]")
-    );
+            enforced
+                .iter()
+                .any(|e| e.path == "ui.yolo" && e.value == "--yolo blocked")
+        );
     assert_eq!(
-        Some("enterprise-deploy-key-should-not-log"), cfg.endpoints.deployment_key
-        .as_deref()
-    );
+            Some("https://s3.custom.example.com"),
+            cfg.endpoints.trace_upload_endpoint_url.as_deref()
+        );
     assert!(
-        enforced.iter().any(| e | e.path == "endpoints.deployment_key" && e.value ==
-        "[redacted]"), "deployment_key must use the redacted enforce_str variant"
-    );
+            cfg.endpoints.trace_upload_credentials.is_some(),
+            "trace_upload_credentials should be set"
+        );
     assert!(
-        enforced.iter().all(| e | e.path != "endpoints.deployment_key" || e.value !=
-        "enterprise-deploy-key-should-not-log"),
-        "raw deployment_key must not appear in enforced audit entries"
-    );
-    assert!(! cfg.telemetry.mixpanel_enabled);
-    assert_eq!(Some("enterprise-mp-token"), cfg.telemetry.mixpanel_token.as_deref());
+            enforced
+                .iter()
+                .any(|e| e.path == "endpoints.trace_upload_credentials" && e.value == "[redacted]")
+        );
+    assert_eq!(
+            Some("enterprise-deploy-key-should-not-log"),
+            cfg.endpoints.deployment_key.as_deref()
+        );
     assert!(
-        enforced.iter().any(| e | e.path == "telemetry.mixpanel_token" && e.value ==
-        "[redacted]")
-    );
+            enforced
+                .iter()
+                .any(|e| e.path == "endpoints.deployment_key" && e.value == "[redacted]"),
+            "deployment_key must use the redacted enforce_str variant"
+        );
+    assert!(
+            enforced
+                .iter()
+                .all(|e| e.path != "endpoints.deployment_key"
+                    || e.value != "enterprise-deploy-key-should-not-log"),
+            "raw deployment_key must not appear in enforced audit entries"
+        );
+    assert!(!cfg.telemetry.mixpanel_enabled);
+    assert_eq!(
+            Some("enterprise-mp-token"),
+            cfg.telemetry.mixpanel_token.as_deref()
+        );
+    assert!(
+            enforced
+                .iter()
+                .any(|e| e.path == "telemetry.mixpanel_token" && e.value == "[redacted]")
+        );
 }
-/// Strict precedence: requirement always wins (covers from-None and
-/// from-higher-user cases). The enforced floor lives in
-/// `resolve_minimum_version`, not this field.
+/// Strict precedence: requirement always wins (covers from-None and from-higher-user cases).
+/// The enforced floor lives in `VersionPolicy`, not this field.
 #[test]
 fn apply_requirements_pins_minimum_version() {
     let source = RequirementSource::Requirements {
@@ -2790,22 +3425,95 @@ fn apply_requirements_pins_voice_mode_false() {
         path: std::path::PathBuf::from("/test/requirements.toml"),
     };
     apply_requirements_inner(&mut cfg, &req, &source);
-    assert_eq!(cfg.requirements.voice_mode.pinned(), Some(false));
-    assert_eq!(cfg.features.voice_mode, Some(false));
-    assert!(! cfg.resolve_voice_mode().value);
+    assert_eq!(
+            cfg.requirements
+                .pinned_feature(crate::agent::config::Feature::VoiceMode),
+            Some(false)
+        );
+    assert!(!cfg.is_feature_enabled(crate::agent::config::Feature::VoiceMode));
 }
-/// Requirements enforcement beats a campaign-supplied default. The on-disk
-/// `Config` arrives campaign-overlaid (`models.default` = a campaign value);
-/// a requirements layer enforcing `[models] default` clamps it back.
+/// Two layers pinning one key alike must report the layer that decided, not the first that asked.
+/// Otherwise the operator log names a user's file for an administrator's pin.
+/// Layers apply user first, system last.
+#[test]
+fn a_repeated_pin_is_reported_against_the_layer_that_decided() {
+    let mut cfg = crate::agent::config::Config::default();
+    let req: toml::Value = toml::from_str("[features]\nsession_search = false\n")
+        .unwrap();
+    let user = RequirementSource::Requirements {
+        path: std::path::PathBuf::from("/home/dev/.grok/requirements.toml"),
+    };
+    let system = RequirementSource::Requirements {
+        path: std::path::PathBuf::from("/etc/grok/requirements.toml"),
+    };
+    let mut enforced = apply_requirements_inner(&mut cfg, &req, &user);
+    enforced.extend(apply_requirements_inner(&mut cfg, &req, &system));
+    let deduped = keep_the_deciding_layer(enforced);
+    let reported: Vec<_> = deduped
+        .iter()
+        .filter(|field| field.path == "features.session_search")
+        .collect();
+    assert_eq!(reported.len(), 1, "one row per pinned key");
+    assert_eq!(reported[0].source, system);
+}
+/// title_refresh is not a registry row, so the loop that pins those does not reach it.
+/// An administrator pinning the title off must still outrank a user's GROK_TITLE_REFRESH, which a config-tier value would lose to.
+#[test]
+#[serial_test::serial]
+fn apply_requirements_pins_title_refresh_over_the_environment() {
+    use xai_grok_test_support::EnvGuard;
+    let _env = EnvGuard::set("GROK_TITLE_REFRESH", "1");
+    let mut cfg = crate::agent::config::Config::default();
+    let req: toml::Value = toml::from_str("[features]\ntitle_refresh = false\n")
+        .unwrap();
+    let source = RequirementSource::Requirements {
+        path: std::path::PathBuf::from("/test/requirements.toml"),
+    };
+    let enforced = apply_requirements_inner(&mut cfg, &req, &source);
+    let resolved = cfg.resolve_title_refresh();
+    assert!(!resolved.value, "the pin lost to GROK_TITLE_REFRESH");
+    assert_eq!(
+            resolved.source,
+            crate::agent::config::ConfigSource::Requirement
+        );
+    assert!(
+            enforced
+                .iter()
+                .any(|field| field.path == "features.title_refresh"),
+            "the pin is reported to the operator log"
+        );
+}
+/// A non-boolean pin reaches the applier only when a higher layer supplied a valid value, so ignoring it leaves that winning layer standing.
+#[test]
+fn malformed_requirements_pin_is_ignored() {
+    use crate::agent::config::Feature;
+    let mut cfg = crate::agent::config::Config::default();
+    let req: toml::Value = toml::from_str("[features]\nweb_fetch = 1\n").unwrap();
+    let source = RequirementSource::Requirements {
+        path: std::path::PathBuf::from("/home/dev/.grok/requirements.toml"),
+    };
+    let enforced = apply_requirements_inner(&mut cfg, &req, &source);
+    assert_eq!(cfg.requirements.pinned_feature(Feature::WebFetch), None);
+    assert!(
+            !enforced
+                .iter()
+                .any(|e| e.path == Feature::WebFetch.path()),
+            "an ignored pin enforces nothing"
+        );
+}
+/// Requirements enforcement beats a campaign-supplied default.
+/// The on-disk `Config` arrives campaign-overlaid (`models.default` holds a campaign value).
+/// A requirements layer enforcing `[models] default` clamps it back.
 #[test]
 fn apply_requirements_default_beats_campaign_default() {
     let raw: toml::Value = toml::from_str("[models]\ndefault = \"campaign-model\"\n")
         .unwrap();
     let mut cfg = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
     assert_eq!(
-        cfg.models.default.as_deref(), Some("campaign-model"),
-        "precondition: config carries the campaign default"
-    );
+            cfg.models.default.as_deref(),
+            Some("campaign-model"),
+            "precondition: config carries the campaign default"
+        );
     let req: toml::Value = toml::from_str("[models]\ndefault = \"enforced-model\"\n")
         .unwrap();
     let source = RequirementSource::Requirements {
@@ -2813,13 +3521,234 @@ fn apply_requirements_default_beats_campaign_default() {
     };
     let enforced = apply_requirements_inner(&mut cfg, &req, &source);
     assert_eq!(
-        cfg.models.default.as_deref(), Some("enforced-model"),
-        "requirements default must beat the campaign default"
-    );
+            cfg.models.default.as_deref(),
+            Some("enforced-model"),
+            "requirements default must beat the campaign default"
+        );
     assert!(
-        enforced.iter().any(| e | e.path == "models.default" && e.value ==
-        "enforced-model"), "the enforcement must be reported in the audit trail"
-    );
+            enforced
+                .iter()
+                .any(|e| e.path == "models.default" && e.value == "enforced-model"),
+            "the enforcement must be reported in the audit trail"
+        );
+}
+fn pin_allowed_models(cfg: &mut crate::agent::config::Config, req_toml: &str) {
+    let req: toml::Value = toml::from_str(req_toml).unwrap();
+    let source = RequirementSource::Requirements {
+        path: std::path::PathBuf::from("/test/requirements.toml"),
+    };
+    apply_requirements_inner(cfg, &req, &source);
+}
+#[test]
+fn apply_requirements_allowed_models_clamps_catalog_and_names_source() {
+    let raw: toml::Value = toml::from_str(
+            r#"
+            [models]
+            default = "grok-3"
+            allowed_models = ["*"]
+            [model.grok-3]
+            model = "grok-3"
+            base_url = "https://api.x.ai/v1"
+            context_window = 256000
+            [model.grok-4]
+            model = "grok-4"
+            base_url = "https://api.x.ai/v1"
+            context_window = 256000
+            "#,
+        )
+        .unwrap();
+    let mut cfg = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+    pin_allowed_models(&mut cfg, "[models]\nallowed_models = [\"grok-4\"]\n");
+    let catalog = crate::agent::remote_config::resolve_model_catalog(&cfg, None);
+    assert!(
+            catalog["grok-4"].info.user_selectable,
+            "signed allowlist member must stay selectable"
+        );
+    assert!(
+            !catalog["grok-3"].info.user_selectable,
+            "models outside the signed set must not be selectable"
+        );
+    let err = crate::agent::remote_config::validate_selectable(&cfg, &catalog)
+        .unwrap_err();
+    assert!(
+            err.contains("administrator"),
+            "fail-closed error must tell the user to contact their administrator: {err}"
+        );
+    assert!(
+            !err.contains("requirements.toml"),
+            "must not name an administrator file the user cannot edit: {err}"
+        );
+    assert!(err.contains("grok-3"), "error must name the excluded default: {err}");
+}
+#[test]
+fn apply_requirements_allowed_models_ignores_user_catalog_key() {
+    let raw: toml::Value = toml::from_str(
+            r#"
+            [models]
+            default = "grok-4"
+            allowed_models = ["*"]
+            [model.grok-4]
+            model = "grok-4"
+            base_url = "https://api.x.ai/v1"
+            context_window = 256000
+            [model.grok-4-anything]
+            model = "other-model"
+            base_url = "https://evil.example/v1"
+            context_window = 256000
+            [model.my-alias]
+            model = "grok-4"
+            base_url = "https://api.x.ai/v1"
+            context_window = 256000
+            "#,
+        )
+        .unwrap();
+    let mut cfg = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+    pin_allowed_models(&mut cfg, "[models]\nallowed_models = [\"grok-4*\"]\n");
+    let catalog = crate::agent::remote_config::resolve_model_catalog(&cfg, None);
+    assert!(
+            catalog["grok-4"].info.user_selectable,
+            "routing slug grok-4 matches grok-4*"
+        );
+    assert!(
+            catalog["my-alias"].info.user_selectable,
+            "user alias whose model id is grok-4 stays selectable"
+        );
+    assert!(
+            !catalog["grok-4-anything"].info.user_selectable,
+            "catalog key grok-4-anything pointing at another model must not satisfy the pin"
+        );
+}
+#[test]
+fn apply_requirements_malformed_allowed_models_fail_closes() {
+    let raw: toml::Value = toml::from_str(
+            r#"
+            [models]
+            default = "grok-4"
+            allowed_models = ["*"]
+            [model.grok-4]
+            model = "grok-4"
+            base_url = "https://api.x.ai/v1"
+            context_window = 256000
+            "#,
+        )
+        .unwrap();
+    let mut cfg = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+    pin_allowed_models(&mut cfg, "[models]\nallowed_models = \"grok-4\"\n");
+    let catalog = crate::agent::remote_config::resolve_model_catalog(&cfg, None);
+    assert!(
+            !catalog["grok-4"].info.user_selectable,
+            "malformed fleet pin must mark nothing selectable, not keep the user list"
+        );
+    assert!(
+            matches!(
+                cfg.requirements.allowed_models.pin_ref(),
+                Some(crate::agent::config::AllowlistPin::FailClosed)
+            ),
+            "unreadable pin must be FailClosed, not a reserved glob"
+        );
+    let err = crate::agent::remote_config::validate_selectable(&cfg, &catalog)
+        .unwrap_err();
+    assert!(
+            err.contains("administrator"),
+            "malformed pin must tell the user to contact their administrator: {err}"
+        );
+    assert!(
+            !err.contains("allowed_models"),
+            "fleet invalid-policy message must not tell the user to edit allowed_models: {err}"
+        );
+}
+#[test]
+fn apply_requirements_allowed_models_empty_array_is_unrestricted() {
+    let raw: toml::Value = toml::from_str(
+            r#"
+            [models]
+            allowed_models = ["grok-4"]
+            [model.grok-3]
+            model = "grok-3"
+            base_url = "https://api.x.ai/v1"
+            context_window = 256000
+            [model.grok-4]
+            model = "grok-4"
+            base_url = "https://api.x.ai/v1"
+            context_window = 256000
+            "#,
+        )
+        .unwrap();
+    let mut cfg = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+    pin_allowed_models(&mut cfg, "[models]\nallowed_models = []\n");
+    let catalog = crate::agent::remote_config::resolve_model_catalog(&cfg, None);
+    assert!(
+            catalog["grok-3"].info.user_selectable && catalog["grok-4"].info.user_selectable,
+            "empty fleet array must not restrict"
+        );
+    assert!(
+            matches!(
+                cfg.requirements.allowed_models.pin_ref(),
+                Some(crate::agent::config::AllowlistPin::List(v)) if v.is_empty()
+            ),
+            "empty array is an explicit unrestricted pin"
+        );
+    assert_eq!(
+            cfg.models.allowed_models,
+            Some(vec!["grok-4".to_string()]),
+            "pin must not overwrite the user-field copy; EffectiveAllowlist reads the pin"
+        );
+}
+#[test]
+fn apply_requirements_allowed_models_replaces_user_list() {
+    let raw: toml::Value = toml::from_str(
+            r#"
+            [models]
+            allowed_models = ["*"]
+            [model.grok-3]
+            model = "grok-3"
+            base_url = "https://api.x.ai/v1"
+            context_window = 256000
+            [model.grok-4]
+            model = "grok-4"
+            base_url = "https://api.x.ai/v1"
+            context_window = 256000
+            "#,
+        )
+        .unwrap();
+    let mut cfg = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+    pin_allowed_models(&mut cfg, "[models]\nallowed_models = [\"grok-4\"]\n");
+    let catalog = crate::agent::remote_config::resolve_model_catalog(&cfg, None);
+    assert!(catalog["grok-4"].info.user_selectable);
+    assert!(
+            !catalog["grok-3"].info.user_selectable,
+            "user * must not union with the fleet pin"
+        );
+}
+#[test]
+fn validate_selectable_rejects_dash_m_outside_fleet_pin() {
+    let raw: toml::Value = toml::from_str(
+            r#"
+            [models]
+            default = "grok-4"
+            [model.grok-3]
+            model = "grok-3"
+            base_url = "https://api.x.ai/v1"
+            context_window = 256000
+            [model.grok-4]
+            model = "grok-4"
+            base_url = "https://api.x.ai/v1"
+            context_window = 256000
+            "#,
+        )
+        .unwrap();
+    let mut cfg = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+    pin_allowed_models(&mut cfg, "[models]\nallowed_models = [\"grok-4\"]\n");
+    cfg.default_model_override = Some("grok-3".into());
+    let catalog = crate::agent::remote_config::resolve_model_catalog(&cfg, None);
+    let err = crate::agent::remote_config::validate_selectable(&cfg, &catalog)
+        .unwrap_err();
+    assert!(err.contains("-m flag"), "must name the -m source: {err}");
+    assert!(err.contains("administrator"), "fleet -m deny must be admin language: {err}");
+    assert!(
+            !err.contains("Broaden"),
+            "must not tell the user to edit the fleet list: {err}"
+        );
 }
 #[test]
 fn apply_requirements_telemetry_string_form_pins_known_modes_only() {
@@ -2836,23 +3765,26 @@ fn apply_requirements_telemetry_string_form_pins_known_modes_only() {
     };
     let (cfg, enforced) = apply("[features]\ntelemetry = \"session_metrics\"\n");
     assert_eq!(
-        cfg.requirements.telemetry.pinned(), Some(TelemetryMode::SessionMetrics),
-    );
+            cfg.requirements.telemetry.pinned(),
+            Some(TelemetryMode::SessionMetrics),
+        );
     assert!(
-        enforced.iter().any(| e | e.path == "features.telemetry" && e.value ==
-        "session_metrics"),
-    );
+            enforced
+                .iter()
+                .any(|e| e.path == "features.telemetry" && e.value == "session_metrics"),
+        );
     let (cfg, enforced) = apply("[features]\ntelemetry = \"garbage\"\n");
     assert_eq!(cfg.requirements.telemetry.pinned(), None);
-    assert!(! enforced.iter().any(| e | e.path == "features.telemetry"));
+    assert!(!enforced.iter().any(|e| e.path == "features.telemetry"));
 }
 #[test]
 fn validate_hooks_path_rejects_relative_path() {
     let result = validate_hooks_path("relative/path/hooks");
     assert!(result.is_err());
     assert!(
-        result.unwrap_err().to_string().contains("absolute"), "should mention 'absolute'"
-    );
+            result.unwrap_err().to_string().contains("absolute"),
+            "should mention 'absolute'"
+        );
 }
 #[test]
 fn validate_hooks_path_rejects_outside_grok_home() {
@@ -2860,9 +3792,9 @@ fn validate_hooks_path_rejects_outside_grok_home() {
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(
-        msg.contains("must be under ~/.grok/"),
-        "should mention ~/.grok/ restriction, got: {msg}"
-    );
+            msg.contains("must be under ~/.grok/"),
+            "should mention ~/.grok/ restriction, got: {msg}"
+        );
 }
 #[test]
 fn validate_hooks_path_rejects_traversal_attack() {
@@ -2872,9 +3804,9 @@ fn validate_hooks_path_rejects_traversal_attack() {
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(
-        msg.contains("must be under ~/.grok/"),
-        "traversal should be rejected, got: {msg}"
-    );
+            msg.contains("must be under ~/.grok/"),
+            "traversal should be rejected, got: {msg}"
+        );
 }
 #[test]
 fn validate_hooks_path_accepts_grok_hooks_subdir() {
@@ -2886,10 +3818,11 @@ fn validate_hooks_path_accepts_grok_hooks_subdir() {
 }
 #[test]
 fn managed_settings_disables_features_and_requirements_overrides() {
+    use crate::agent::config::Feature;
     use xai_grok_workspace::permission::resolution::ManagedSettingsFeatures;
     let mut cfg = crate::agent::config::Config::default();
     cfg.features.telemetry = Some(crate::agent::config::TelemetryMode::Enabled);
-    cfg.features.feedback = Some(true);
+    cfg.feature_values.insert(Feature::Feedback, true);
     cfg.default_yolo_mode = true;
     let features = ManagedSettingsFeatures {
         disable_telemetry: Some(true),
@@ -2899,12 +3832,13 @@ fn managed_settings_disables_features_and_requirements_overrides() {
     };
     let enforced = apply_managed_settings_features_inner(&mut cfg, &features);
     assert_eq!(
-        cfg.features.telemetry, Some(crate ::agent::config::TelemetryMode::Disabled)
-    );
-    assert_eq!(cfg.features.feedback, Some(false));
+            cfg.features.telemetry,
+            Some(crate::agent::config::TelemetryMode::Disabled)
+        );
+    assert_eq!(cfg.feature_values.get(&Feature::Feedback), Some(&false));
     assert!(cfg.default_yolo_mode);
     assert_eq!(enforced.len(), 2);
-    assert!(! enforced.iter().any(| e | e.path == "ui.yolo"));
+    assert!(!enforced.iter().any(|e| e.path == "ui.yolo"));
     let req: toml::Value = toml::from_str(
             "[features]\ntelemetry = true\nfeedback = true\n\n[ui]\nyolo = true\n",
         )
@@ -2914,19 +3848,21 @@ fn managed_settings_disables_features_and_requirements_overrides() {
     };
     apply_requirements_inner(&mut cfg, &req, &source);
     assert_eq!(
-        cfg.features.telemetry, Some(crate ::agent::config::TelemetryMode::Enabled)
-    );
-    assert_eq!(cfg.features.feedback, Some(true));
+            cfg.features.telemetry,
+            Some(crate::agent::config::TelemetryMode::Enabled)
+        );
+    assert!(cfg.is_feature_enabled(Feature::Feedback));
     assert!(cfg.ui.yolo);
 }
 /// REGRESSION: external managed-settings.json is advisory, not authoritative.
-/// disableBypassPermissionsMode (-> features.disable_yolo) must NOT clamp the user's own grok yolo.
+/// disableBypassPermissionsMode (mapped to features.disable_yolo) must NOT clamp the user's own grok yolo.
 #[test]
 fn managed_settings_does_not_override_user_yolo() {
+    use crate::agent::config::Feature;
     use xai_grok_workspace::permission::resolution::ManagedSettingsFeatures;
     let mut cfg = crate::agent::config::Config::default();
     cfg.features.telemetry = Some(crate::agent::config::TelemetryMode::Enabled);
-    cfg.features.feedback = Some(true);
+    cfg.feature_values.insert(Feature::Feedback, true);
     cfg.ui.yolo = true;
     cfg.default_yolo_mode = true;
     let features = ManagedSettingsFeatures {
@@ -2939,31 +3875,109 @@ fn managed_settings_does_not_override_user_yolo() {
     };
     let enforced = apply_managed_settings_features_inner(&mut cfg, &features);
     assert_eq!(
-        cfg.features.telemetry, Some(crate ::agent::config::TelemetryMode::Disabled)
-    );
-    assert_eq!(cfg.features.feedback, Some(false));
+            cfg.features.telemetry,
+            Some(crate::agent::config::TelemetryMode::Disabled)
+        );
+    assert_eq!(cfg.feature_values.get(&Feature::Feedback), Some(&false));
     assert!(cfg.ui.yolo);
     assert!(cfg.default_yolo_mode);
     assert_eq!(enforced.len(), 2);
-    assert!(! enforced.iter().any(| e | e.path == "ui.yolo"));
+    assert!(!enforced.iter().any(|e| e.path == "ui.yolo"));
 }
-/// Simulate a release-stamped build so the folder-trust gate engages (a
-/// local/dev build auto-trusts). Hold the returned guard for the test body.
+/// Simulate a release-stamped build so the folder-trust gate engages (a local/dev build auto-trusts).
+/// Hold the returned guard for the test body.
 fn simulate_release_build() -> xai_grok_test_support::EnvGuard {
     xai_grok_test_support::EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0.0-sim")
 }
-/// SECURITY (plugin-RCE): a PROJECT-declared `[plugins].paths` loads as an
-/// auto-enabled, auto-trusted ConfigPath plugin, so it must merge into the
-/// effective config ONLY when the folder is trusted; project
-/// `[plugins].disabled` is never gated. The closing set-difference proves
-/// the gate toggles ONLY that path (user/global paths pass through both
-/// verdicts untouched). GROK_HOME-isolated + `#[serial]` for folder-trust
-/// store hygiene (empty store ⇒ deterministic untrusted;
-/// `EnvGuard` restores GROK_HOME even on panic). No user-global
-/// `$GROK_HOME/config.toml` is seeded: `grok_home()` is `OnceLock`-cached,
-/// so under a shared-process harness (Bazel) such a seed is read
-/// non-deterministically — reliable only under nextest's process-per-test
-/// isolation.
+#[test]
+fn project_overlay_tracks_authoritative_trust_transitions() {
+    let source_root = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git2::Repository::init(repo.path()).unwrap();
+    write_subagent_definitions(
+        &repo.path().join(".grok"),
+        &[("shared", "Project"), ("project-only", "Project")],
+    );
+    let mut base = SubagentsConfig::default();
+    base.roles
+        .insert(
+            "shared".into(),
+            SubagentRole {
+                description: "User role".into(),
+                source_dir: Some(source_root.path().join("roles")),
+                ..Default::default()
+            },
+        );
+    base.personas
+        .insert(
+            "shared".into(),
+            SubagentPersona {
+                instructions: Some("User persona".into()),
+                source_path: Some(
+                    source_root.path().join("personas/shared.toml").display().to_string(),
+                ),
+                ..Default::default()
+            },
+        );
+    let (untrusted_roles, _) = SubagentsConfig::effective_definition_maps(
+        &base.roles,
+        &base.personas,
+        repo.path(),
+        false,
+    );
+    assert_eq!(untrusted_roles["shared"].description, "User role");
+    assert!(!untrusted_roles.contains_key("project-only"));
+    let (trusted_roles, trusted_personas) = SubagentsConfig::effective_definition_maps(
+        &base.roles,
+        &base.personas,
+        repo.path(),
+        true,
+    );
+    assert_eq!(trusted_roles["shared"].description, "Project role");
+    assert!(trusted_personas.contains_key("project-only"));
+    let (revoked_roles, _) = SubagentsConfig::effective_definition_maps(
+        &base.roles,
+        &base.personas,
+        repo.path(),
+        false,
+    );
+    assert_eq!(revoked_roles["shared"].description, "User role");
+    assert!(!revoked_roles.contains_key("project-only"));
+}
+#[test]
+fn base_resolver_without_project_cwd_keeps_project_files_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_subagent_definitions(&tmp.path().join(".grok"), &[("project", "Project")]);
+    let base = SubagentsConfig::resolve_base_with_sources(
+        false,
+        &toml::Value::Table(Default::default()),
+        None,
+        &tmp.path().join("bundled"),
+    );
+    assert!(base.get_role("project").is_none());
+    assert!(base.get_persona("project").is_none());
+}
+#[test]
+fn explicit_grok_root_is_the_only_user_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ambient = tmp.path().join("ambient-home/.grok");
+    let configured = tmp.path().join("configured-grok-home");
+    write_subagent_definitions(&ambient, &[("ambient", "Ambient")]);
+    write_subagent_definitions(&configured, &[("configured", "Configured")]);
+    let base = SubagentsConfig::resolve_base_with_sources(
+        false,
+        &toml::Value::Table(Default::default()),
+        Some(&configured),
+        &configured.join("bundled"),
+    );
+    assert!(base.get_role("ambient").is_none());
+    assert!(base.get_persona("ambient").is_none());
+    assert!(base.get_role("configured").is_some());
+    assert!(base.get_persona("configured").is_some());
+}
+/// SECURITY (plugin-RCE): a PROJECT-declared `[plugins].paths` loads as an auto-enabled, auto-trusted ConfigPath plugin.
+/// It must therefore merge into the effective config ONLY when the folder is trusted; project `[plugins].disabled` is never gated.
+/// The closing set-difference proves the gate toggles ONLY that path (user/global paths pass through both verdicts untouched). The test is GROK_HOME-isolated and `#[serial]` for folder-trust store hygiene: an empty store is deterministically untrusted. `EnvGuard` restores GROK_HOME even on panic. It is reliable only under nextest's process-per-test isolation.
 #[test]
 #[serial_test::serial]
 fn resolve_effective_plugins_config_gates_project_paths_on_folder_trust() {
@@ -2986,23 +4000,23 @@ fn resolve_effective_plugins_config_gates_project_paths_on_folder_trust() {
     let proj_disabled = "proj-bad".to_string();
     let untrusted = resolve_effective_plugins_config(cwd);
     assert!(
-        ! untrusted.paths.contains(& proj_path),
-        "untrusted folder must NOT merge the project [plugins].paths"
-    );
+            !untrusted.paths.contains(&proj_path),
+            "untrusted folder must NOT merge the project [plugins].paths"
+        );
     assert!(
-        untrusted.disabled.contains(& proj_disabled),
-        "project [plugins].disabled must merge even when untrusted (fail-safe)"
-    );
-    crate::agent::folder_trust::grant_folder_trust(cwd);
+            untrusted.disabled.contains(&proj_disabled),
+            "project [plugins].disabled must merge even when untrusted (fail-safe)"
+        );
+    xai_grok_workspace::folder_trust::grant_folder_trust(cwd);
     let trusted = resolve_effective_plugins_config(cwd);
     assert!(
-        trusted.paths.contains(& proj_path),
-        "trusted folder must merge the project [plugins].paths"
-    );
+            trusted.paths.contains(&proj_path),
+            "trusted folder must merge the project [plugins].paths"
+        );
     assert!(
-        trusted.disabled.contains(& proj_disabled),
-        "project [plugins].disabled must merge when trusted too"
-    );
+            trusted.disabled.contains(&proj_disabled),
+            "project [plugins].disabled must merge when trusted too"
+        );
     let trusted_minus_project: Vec<String> = trusted
         .paths
         .iter()
@@ -3010,20 +4024,13 @@ fn resolve_effective_plugins_config_gates_project_paths_on_folder_trust() {
         .cloned()
         .collect();
     assert_eq!(
-        trusted_minus_project, untrusted.paths,
-        "the trust gate must toggle ONLY the project path; user/global paths unaffected"
-    );
+            trusted_minus_project, untrusted.paths,
+            "the trust gate must toggle ONLY the project path; user/global paths unaffected"
+        );
 }
-/// SECURITY (plugin-RCE) end-to-end: prove through the REAL `discover_plugins`
-/// that a PROJECT-declared `[plugins].paths` ConfigPath plugin is EXCLUDED
-/// from discovery while untrusted and included once trusted. The Part-2
-/// set-difference test covers the config merge; this closes the loop at the
-/// discovery boundary (if it is never discovered it can never activate).
-/// Mirrors the Project-scope analog `discover_real_project_plugin_gated_on_project_trusted`
-/// in `xai-grok-agent`. An ABSOLUTE plugin path is used so the merged
-/// `config_paths` entry resolves against the repo — `discover_plugins`' `is_dir()`
-/// check resolves a relative `./x` against the process cwd, not `cwd`.
-/// GROK_HOME-isolated + `#[serial]` (`EnvGuard` restores it even on panic).
+/// SECURITY (plugin-RCE) end-to-end, proved through the REAL `discover_plugins`. A PROJECT-declared `[plugins].paths` ConfigPath plugin is EXCLUDED from discovery while untrusted and included once trusted.
+/// The Part-2 set-difference test covers the config merge. This closes the loop at the discovery boundary (if it is never discovered it can never activate).
+/// An ABSOLUTE plugin path is used so the merged `config_paths` entry resolves against the repo. `discover_plugins`' `is_dir()` check resolves a relative `./x` against the process cwd, not `cwd`.
 #[test]
 #[serial_test::serial]
 fn discover_plugins_excludes_untrusted_configpath_plugin_end_to_end() {
@@ -3051,13 +4058,16 @@ fn discover_plugins_excludes_untrusted_configpath_plugin_end_to_end() {
     let untrusted_dc = resolve_effective_plugins_config(cwd).to_discovery_config();
     let untrusted_verdict = crate::agent::folder_trust::project_scope_allowed(cwd);
     assert!(
-        ! untrusted_verdict,
-        "a fresh repo declaring [plugins].paths must resolve untrusted"
-    );
+            !untrusted_verdict,
+            "a fresh repo declaring [plugins].paths must resolve untrusted"
+        );
     assert!(
-        ! untrusted_dc.config_paths.iter().any(| p | p.ends_with("cfgpath-probe")),
-        "untrusted: the project path must be absent from config_paths"
-    );
+            !untrusted_dc
+                .config_paths
+                .iter()
+                .any(|p| p.ends_with("cfgpath-probe")),
+            "untrusted: the project path must be absent from config_paths"
+        );
     let untrusted_found = discover_plugins(
             Some(cwd),
             &untrusted_dc,
@@ -3067,10 +4077,10 @@ fn discover_plugins_excludes_untrusted_configpath_plugin_end_to_end() {
         .iter()
         .any(|p| p.manifest.name == "cfgpath-probe");
     assert!(
-        ! untrusted_found,
-        "untrusted folder must EXCLUDE the ConfigPath plugin from discovery"
-    );
-    crate::agent::folder_trust::grant_folder_trust(cwd);
+            !untrusted_found,
+            "untrusted folder must EXCLUDE the ConfigPath plugin from discovery"
+        );
+    xai_grok_workspace::folder_trust::grant_folder_trust(cwd);
     crate::agent::folder_trust::resolve_and_record(cwd, None, false);
     let trusted_dc = resolve_effective_plugins_config(cwd).to_discovery_config();
     let trusted_verdict = crate::agent::folder_trust::project_scope_allowed(cwd);
@@ -3083,16 +4093,14 @@ fn discover_plugins_excludes_untrusted_configpath_plugin_end_to_end() {
         )
         .iter()
         .any(|p| p.manifest.name == "cfgpath-probe");
-    assert!(trusted_found, "trusted folder must DISCOVER the merged ConfigPath plugin");
+    assert!(
+            trusted_found,
+            "trusted folder must DISCOVER the merged ConfigPath plugin"
+        );
 }
-/// Kill-switch ordering regression: `resolve_effective_plugins_config` reads
-/// the folder-trust gate internally, so its call sites (commands/list, plugin
-/// fan-out, reload) resolve with the REAL RemoteSettings first. A cold key
-/// under an org kill-switch must end up allowed — if the plugins-config read
-/// ran first, the gate's remote-less backstop would record a durable
-/// kill-switch-blind deny that `resolve_and_record_inner`'s `Some(false)`
-/// arm (store-only reconcile) could never lift. GROK_HOME-isolated (empty
-/// store); GROK_FOLDER_TRUST unset so the kill-switch is the only signal.
+/// Kill-switch ordering regression: `resolve_effective_plugins_config` reads the folder-trust gate internally. Its call sites (commands/list, plugin fan-out, reload) therefore resolve with the REAL RemoteSettings first.
+/// A cold key under an org kill-switch must end up allowed. If the plugins-config read ran first, the gate's remote-less backstop would record a durable kill-switch-blind deny.
+/// The `Some(false)` arm of `resolve_and_record_inner` (store-only reconcile) could never lift that deny. The test is GROK_HOME-isolated (empty store); GROK_FOLDER_TRUST is unset so the kill-switch is the only signal.
 #[test]
 #[serial_test::serial]
 fn kill_switched_cold_cwd_stays_allowed_through_plugins_config_read() {
@@ -3113,16 +4121,142 @@ fn kill_switched_cold_cwd_stays_allowed_through_plugins_config_read() {
         ..Default::default()
     };
     assert!(
-        crate ::agent::folder_trust::resolve_and_record(cwd, Some(& remote), false),
-        "kill-switch must resolve the cold key trusted"
-    );
+            crate::agent::folder_trust::resolve_and_record(cwd, Some(&remote), false),
+            "kill-switch must resolve the cold key trusted"
+        );
     let cfg = resolve_effective_plugins_config(cwd);
     assert!(
-        cfg.paths.contains(& "./proj-plugin".to_string()),
-        "kill-switched folder counts trusted, so the project path must merge"
-    );
+            cfg.paths.contains(&"./proj-plugin".to_string()),
+            "kill-switched folder counts trusted, so the project path must merge"
+        );
     assert!(
-        crate ::agent::folder_trust::project_scope_allowed(cwd),
-        "gate must still allow the kill-switched folder after the config read"
+            crate::agent::folder_trust::project_scope_allowed(cwd),
+            "gate must still allow the kill-switched folder after the config read"
+        );
+}
+/// Writeback requires grok.com auth: remote may advertise it, but a non-xai credential is downgraded to `Local`.
+#[test]
+#[serial_test::serial]
+fn from_remote_gated_requires_xai_auth_for_writeback() {
+    let _env = crate::env::EnvVarGuard::remove("GROK_STORAGE_MODE");
+    let writeback = crate::util::config::RemoteSettings {
+        writeback_enabled: Some(true),
+        ..Default::default()
+    };
+    assert_eq!(
+        StorageMode::from_remote_gated(Some(&writeback), true),
+        StorageMode::Writeback
     );
+    assert_eq!(
+        StorageMode::from_remote_gated(Some(&writeback), false),
+        StorageMode::Local,
+    );
+    assert_eq!(
+        StorageMode::from_remote_gated(None, true),
+        StorageMode::Local
+    );
+}
+#[test]
+#[cfg(target_os = "linux")]
+fn required_bwrap_routes_fail_closed() {
+    assert_eq!(
+        route_bwrap_startup(Some(()), false, true),
+        BwrapStartup::ReexecRequired(())
+    );
+    assert_eq!(
+        route_bwrap_startup::<()>(None, false, true),
+        BwrapStartup::Refuse
+    );
+    assert_eq!(
+        route_bwrap_startup::<()>(None, true, true),
+        BwrapStartup::Verify
+    );
+}
+#[test]
+#[cfg(target_os = "linux")]
+fn optional_bwrap_routes_can_degrade() {
+    assert_eq!(
+        route_bwrap_startup(Some(()), false, false),
+        BwrapStartup::ReexecOptional(())
+    );
+    assert_eq!(
+        route_bwrap_startup::<()>(None, false, false),
+        BwrapStartup::Continue
+    );
+}
+/// Concurrent `[plugins]` writers must not lose updates: each whole read-modify-write runs under the config-init flock.
+#[test]
+fn concurrent_plugin_list_writers_lose_no_updates() {
+    let home = tempfile::tempdir().unwrap();
+    let n = 8;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
+    let handles: Vec<_> = (0..n)
+        .map(|i| {
+            let home = home.path().to_path_buf();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                update_config_toml_locked(
+                        &home,
+                        |table| plugins_list_add(
+                            table,
+                            "enabled",
+                            &format!("plugin-{i}"),
+                        ),
+                    )
+                    .unwrap();
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let content = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    let config: toml::Value = toml::from_str(&content).unwrap();
+    let enabled = config["plugins"]["enabled"].as_array().unwrap();
+    assert_eq!(enabled.len(), n, "a concurrent enable was lost:\n{content}");
+}
+/// Pins the blocking-pool hop behind the session `[plugins]` writers: LocalSet tasks keep running during a flock poll.
+#[test]
+fn plugin_config_writes_keep_the_caller_local_set_live() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Duration;
+    let home = tempfile::tempdir().unwrap();
+    let held = crate::util::config::acquire_init_lock(home.path()).unwrap();
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+    });
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let local = tokio::task::LocalSet::new();
+    let ticks = Rc::new(Cell::new(0u32));
+    let ticker_ticks = Rc::clone(&ticks);
+    rt.block_on(
+        local
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        ticker_ticks.set(ticker_ticks.get() + 1);
+                    }
+                });
+                let home_path = home.path().to_path_buf();
+                config_write_blocking(move || update_config_toml_locked(
+                        &home_path,
+                        |table| plugins_list_add(table, "enabled", "demo-plugin"),
+                    ))
+                    .await
+                    .expect("write succeeds after the holder releases");
+                assert!(
+            ticks.get() >= 10,
+            "LocalSet starved during a plugin config write: {} ticks",
+            ticks.get()
+        );
+            }),
+    );
+    holder.join().unwrap();
 }

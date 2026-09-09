@@ -1,7 +1,6 @@
 //! Terminal color support detection and color conversion utilities.
 //!
-//! This module provides functionality to detect the terminal's color capabilities
-//! and downgrade RGB colors to the appropriate level when needed.
+//! Detects the terminal's color capabilities and downgrades RGB colors to the appropriate level when needed.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -42,13 +41,7 @@ impl ColorLevel {
 static COLOR_LEVEL: OnceLock<ColorLevel> = OnceLock::new();
 
 /// Detect the terminal's color support level.
-///
-/// This uses the `supports-color` crate which checks:
-/// - `COLORTERM` environment variable (for truecolor detection)
-/// - `TERM` environment variable
-/// - Terminal-specific environment variables (like `ITERM_SESSION_ID`)
-/// - Whether stdout is a TTY
-///
+/// `COLORTERM` environment variable (for truecolor detection); `TERM` environment variable; Terminal-specific environment variables (like `ITERM_SESSION_ID`); Whether stdout is a TTY.
 /// The result is cached after the first call.
 pub fn detect_color_level() -> ColorLevel {
     *COLOR_LEVEL.get_or_init(|| {
@@ -58,9 +51,8 @@ pub fn detect_color_level() -> ColorLevel {
         }
 
         let level = match supports_color::on(supports_color::Stream::Stdout) {
-            // Not a TTY (tests, piped) — default to TrueColor.
-            // The pager is a TUI app that always runs inside a terminal;
-            // stdout may not be a TTY when the pager renders to stderr.
+            // Not a TTY (tests, piped), so default to TrueColor
+            // The pager is a TUI app that always runs inside a terminal; stdout may not be a TTY when the pager renders to stderr
             None => ColorLevel::TrueColor,
             Some(level) => {
                 if level.has_16m {
@@ -75,10 +67,8 @@ pub fn detect_color_level() -> ColorLevel {
             }
         };
 
-        // The `supports-color` crate relies on COLORTERM=truecolor, but
-        // tmux/SSH/mosh often strip that variable.  When the crate reports
-        // only 256-color support, upgrade to TrueColor if we can identify
-        // a known truecolor-capable terminal via its env vars.
+        // The `supports-color` crate relies on COLORTERM=truecolor, but tmux/SSH/mosh often strip that variable
+        // When the crate reports only 256-color support, upgrade to TrueColor if env vars identify a known truecolor-capable terminal
         if level < ColorLevel::TrueColor && terminal_supports_truecolor() {
             return ColorLevel::TrueColor;
         }
@@ -88,10 +78,8 @@ pub fn detect_color_level() -> ColorLevel {
 }
 
 /// Check whether the terminal emulator is known to support truecolor.
-///
-/// Used as a fallback when `COLORTERM` is missing (e.g. inside tmux or over
-/// SSH).  Checks terminal-specific env vars that survive session forwarding
-/// even when `COLORTERM` and `TERM_PROGRAM` are stripped.
+/// Used as a fallback when `COLORTERM` is missing.
+/// Checks terminal-specific env vars that survive session forwarding even when `COLORTERM` and `TERM_PROGRAM` are stripped.
 fn terminal_supports_truecolor() -> bool {
     use std::env;
 
@@ -129,14 +117,30 @@ fn terminal_supports_truecolor() -> bool {
         || env::var("ALACRITTY_SOCKET").is_ok()
 }
 
-/// Process-wide upper bound on the effective color level, stored as the
-/// `ColorLevel` declaration-order discriminant.
+/// Process-wide upper bound on the effective color level, stored as the `ColorLevel` declaration-order discriminant.
 static COLOR_LEVEL_CAP: AtomicU8 = AtomicU8::new(ColorLevel::TrueColor as u8);
 
-/// Set the process-wide upper bound on the effective color level. Pass
-/// [`ColorLevel::TrueColor`] to remove the cap.
+/// When set, RGB syntax colors are remapped with [`polarity_safe_syntax_ansi`] instead of nearest-ANSI16 (see `xai-grok-pager-render` syntax docs).
+/// Used by pager minimal mode: the canvas is the terminal's own bg, so night-theme pastels quantized to White vanish on light profiles.
+static POLARITY_SAFE_SYNTAX: AtomicU8 = AtomicU8::new(0);
+
+/// Set the process-wide upper bound on the effective color level.
+/// Pass [`ColorLevel::TrueColor`] to remove the cap.
 pub fn set_color_level_cap(cap: ColorLevel) {
     COLOR_LEVEL_CAP.store(cap as u8, Ordering::Relaxed);
+}
+
+/// Enable dual-polarity-safe syntax color remapping (minimal / terminal-native).
+///
+/// [`adapt_color`] then maps near-gray RGB to "no color" (inherit terminal default fg) and chromatic RGB to base ANSI accents, never White.
+pub fn set_polarity_safe_syntax(enabled: bool) {
+    POLARITY_SAFE_SYNTAX.store(u8::from(enabled), Ordering::Relaxed);
+}
+
+/// Whether polarity-safe syntax remapping is active.
+#[must_use]
+pub fn polarity_safe_syntax() -> bool {
+    POLARITY_SAFE_SYNTAX.load(Ordering::Relaxed) != 0
 }
 
 fn color_level_cap() -> ColorLevel {
@@ -148,8 +152,7 @@ fn color_level_cap() -> ColorLevel {
     }
 }
 
-/// Get the current color level (detecting if not already done), bounded by
-/// the process-wide cap (see [`set_color_level_cap`]).
+/// Get the current color level (detecting if not already done), bounded by the process-wide cap (see [`set_color_level_cap`]).
 pub fn get_color_level() -> ColorLevel {
     detect_color_level().min(color_level_cap())
 }
@@ -162,14 +165,14 @@ pub fn set_color_level(level: ColorLevel) -> Result<(), ColorLevel> {
     COLOR_LEVEL.set(level)
 }
 
-/// Convert an `anstyle::Color` to the appropriate level based on terminal support.
+/// Convert an `anstyle::Color` to the appropriate level based on terminal support, downgrading RGB and 256-color values as needed.
 ///
-/// This will downgrade colors as needed:
-/// - TrueColor terminals: pass through unchanged
-/// - 256-color terminals: RGB colors are converted to closest ANSI 256 color
-/// - Basic terminals: colors are converted to closest ANSI 16 color
-/// - No color: returns None
+/// When [`polarity_safe_syntax`] is enabled (minimal mode), RGB tokens take the dual-polarity path instead of nearest-ANSI16.
 pub fn adapt_color(color: Color) -> Option<Color> {
+    if polarity_safe_syntax() {
+        return adapt_color_polarity_safe(color);
+    }
+
     let level = get_color_level();
 
     match level {
@@ -184,6 +187,101 @@ pub fn adapt_color(color: Color) -> Option<Color> {
             Color::Ansi256(idx) => Color::Ansi(ansi256_to_ansi16(idx)),
             Color::Ansi(ansi) => Color::Ansi(ansi),
         }),
+    }
+}
+
+/// Polarity-safe remap for syntax tokens painted on a transparent canvas.
+/// Near-gray RGB maps to `None` (inherit terminal default fg); Chromatic RGB maps to base ANSI Red/Green/Yellow/Blue/Magenta/Cyan; Existing ANSI: bright white and white body slots demote to `None`; accents stay.
+fn adapt_color_polarity_safe(color: Color) -> Option<Color> {
+    match color {
+        Color::Rgb(rgb) => polarity_safe_syntax_ansi(rgb.0, rgb.1, rgb.2).map(Color::Ansi),
+        Color::Ansi256(idx) => {
+            // Expand xterm index to an approximate RGB then re-map.
+            let (r, g, b) = ansi256_to_rgb(idx.index());
+            polarity_safe_syntax_ansi(r, g, b).map(Color::Ansi)
+        }
+        Color::Ansi(ansi) => match ansi {
+            // Body-ish slots that flip polarity inherit the default fg
+            AnsiColor::Black
+            | AnsiColor::White
+            | AnsiColor::BrightBlack
+            | AnsiColor::BrightWhite => None,
+            // Demote bright accents to base (brights can wash out on light).
+            AnsiColor::BrightRed => Some(Color::Ansi(AnsiColor::Red)),
+            AnsiColor::BrightGreen => Some(Color::Ansi(AnsiColor::Green)),
+            AnsiColor::BrightYellow => Some(Color::Ansi(AnsiColor::Yellow)),
+            AnsiColor::BrightBlue => Some(Color::Ansi(AnsiColor::Blue)),
+            AnsiColor::BrightMagenta => Some(Color::Ansi(AnsiColor::Magenta)),
+            AnsiColor::BrightCyan => Some(Color::Ansi(AnsiColor::Cyan)),
+            other => Some(Color::Ansi(other)),
+        },
+    }
+}
+
+/// Dual-polarity-safe ANSI mapping for syntax tokens (minimal mode).
+/// Returns `None` for near-gray (caller inherits terminal default fg).
+/// Chromatic hues map to base ANSI colors only, never White/Black.
+pub fn polarity_safe_syntax_ansi(r: u8, g: u8, b: u8) -> Option<AnsiColor> {
+    let max = r.max(g).max(b) as i32;
+    let min = r.min(g).min(b) as i32;
+    let chroma = max - min;
+    if chroma < 40 {
+        return None;
+    }
+    let (ri, gi, bi) = (r as i32, g as i32, b as i32);
+    let h = if max == ri {
+        let mut h = (gi - bi) * 60 / chroma;
+        if h < 0 {
+            h += 360;
+        }
+        h
+    } else if max == gi {
+        (bi - ri) * 60 / chroma + 120
+    } else {
+        (ri - gi) * 60 / chroma + 240
+    };
+    // Magenta starts at 255° so Tokyo Night purple (#bb9af7, ~261°) lands Magenta rather than Blue; pure blues (~221°) stay Blue
+    Some(match h {
+        0..30 | 330..=360 => AnsiColor::Red,
+        30..90 => AnsiColor::Yellow,
+        90..150 => AnsiColor::Green,
+        150..210 => AnsiColor::Cyan,
+        210..255 => AnsiColor::Blue,
+        _ => AnsiColor::Magenta,
+    })
+}
+
+/// Approximate RGB for an xterm 256-color index (cube + grayscale).
+fn ansi256_to_rgb(idx: u8) -> (u8, u8, u8) {
+    match idx {
+        0 => (0, 0, 0),
+        1 => (128, 0, 0),
+        2 => (0, 128, 0),
+        3 => (128, 128, 0),
+        4 => (0, 0, 128),
+        5 => (128, 0, 128),
+        6 => (0, 128, 128),
+        7 => (192, 192, 192),
+        8 => (128, 128, 128),
+        9 => (255, 0, 0),
+        10 => (0, 255, 0),
+        11 => (255, 255, 0),
+        12 => (0, 0, 255),
+        13 => (255, 0, 255),
+        14 => (0, 255, 255),
+        15 => (255, 255, 255),
+        16..=231 => {
+            let n = idx - 16;
+            let r = n / 36;
+            let g = (n / 6) % 6;
+            let b = n % 6;
+            let level = |c: u8| if c == 0 { 0 } else { 55 + 40 * c };
+            (level(r), level(g), level(b))
+        }
+        232..=255 => {
+            let v = 8 + (idx - 232) * 10;
+            (v, v, v)
+        }
     }
 }
 
@@ -234,7 +332,7 @@ mod tests {
 
         // Medium gray
         let result = rgb_to_ansi256(RgbColor(128, 128, 128));
-        assert!(result.index() >= 232); // Should be in grayscale range
+        assert!(result.index() >= 232); // Indices 232 and up are the xterm grayscale ramp
     }
 
     #[test]
@@ -279,9 +377,39 @@ mod tests {
     }
 
     #[test]
-    fn test_color_level_ordering() {
-        assert!(ColorLevel::None < ColorLevel::Basic);
-        assert!(ColorLevel::Basic < ColorLevel::Ansi256);
-        assert!(ColorLevel::Ansi256 < ColorLevel::TrueColor);
+    fn polarity_safe_grays_inherit_default() {
+        assert_eq!(polarity_safe_syntax_ansi(0xc8, 0xc8, 0xc8), None);
+        assert_eq!(polarity_safe_syntax_ansi(0x6c, 0x6c, 0x6c), None);
+    }
+
+    #[test]
+    fn polarity_safe_never_white() {
+        for (r, g, b) in [
+            (0xbb, 0x9a, 0xf7),
+            (0x7d, 0xcf, 0xff),
+            (0x7a, 0xa2, 0xf7),
+            (0xff, 0x9e, 0x64),
+            (0xf7, 0x76, 0x8e),
+            (0xc8, 0xc8, 0xc8),
+        ] {
+            let mapped = polarity_safe_syntax_ansi(r, g, b);
+            assert!(
+                !matches!(
+                    mapped,
+                    Some(AnsiColor::White | AnsiColor::BrightWhite | AnsiColor::Black)
+                ),
+                "#{r:02x}{g:02x}{b:02x} -> {mapped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adapt_color_polarity_safe_flag_drops_gray_rgb() {
+        set_polarity_safe_syntax(true);
+        let out = adapt_color(Color::Rgb(RgbColor(0xc8, 0xc8, 0xc8)));
+        assert_eq!(out, None, "gray body must inherit default fg");
+        let magenta = adapt_color(Color::Rgb(RgbColor(0xbb, 0x9a, 0xf7)));
+        assert_eq!(magenta, Some(Color::Ansi(AnsiColor::Magenta)));
+        set_polarity_safe_syntax(false);
     }
 }

@@ -1,17 +1,13 @@
 use super::RemoteSettings;
-use super::mcp::use_leader_from_toml;
 use serde::{Deserialize, Serialize};
 use toml::Value as TomlValue;
 use xai_fast_worktree::CreationMode;
 
-/// Worktree creation type configuration.
-///
-/// Mirrors the internal `CreationMode` enum from xai-fast-worktree but uses
-/// config-friendly naming (lowercase strings in TOML).
+/// Mirrors the internal `CreationMode` enum from xai-fast-worktree but uses config-friendly naming (lowercase strings in TOML).
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WorktreeType {
-    /// Linked worktree via `git worktree add --no-checkout` + parallel CoW copy.
+    /// Linked worktree via `git worktree add --no-checkout` and a parallel CoW copy.
     /// This is the fastest mode for large repos.
     #[default]
     Linked,
@@ -47,7 +43,7 @@ impl From<WorktreeType> for CreationMode {
 
 /// Returns `Some(type)` when `[cli] worktree_type` is set to a valid value in config.toml,
 /// `None` when absent or the value type is wrong. Logs a warning for invalid strings.
-pub fn worktree_type_from_toml_opt(root: &TomlValue) -> Option<WorktreeType> {
+pub(crate) fn worktree_type_from_toml_opt(root: &TomlValue) -> Option<WorktreeType> {
     if let TomlValue::Table(table) = root
         && let Some(TomlValue::Table(cli)) = table.get("cli")
         && let Some(toml_value) = cli.get("worktree_type")
@@ -66,18 +62,12 @@ pub fn worktree_type_from_toml_opt(root: &TomlValue) -> Option<WorktreeType> {
     None
 }
 
-/// Get the worktree type from config.toml.
-///
-/// Set in config.toml under [cli] as `worktree_type = "linked|standalone|git"`.
-/// Defaults to `WorktreeType::Linked` when not explicitly set.
-pub fn worktree_type_from_toml(root: &TomlValue) -> WorktreeType {
+pub(crate) fn worktree_type_from_toml(root: &TomlValue) -> WorktreeType {
     worktree_type_from_toml_opt(root).unwrap_or_default()
 }
 
 /// Resolve worktree type: local config > remote settings > default (`Linked`).
-///
-/// Returns the resolved type and its provenance (`"local"`, `"remote"`, or `"default"`).
-pub fn resolve_worktree_type(
+pub(crate) fn resolve_worktree_type(
     raw_config: &TomlValue,
     remote: Option<&RemoteSettings>,
 ) -> (WorktreeType, &'static str) {
@@ -95,7 +85,6 @@ pub fn resolve_worktree_type(
     (WorktreeType::default(), "default")
 }
 
-/// Synchronously get the worktree type from the config file.
 pub fn worktree_type() -> WorktreeType {
     let root: TomlValue = match crate::config::load_effective_config() {
         Ok(r) => r,
@@ -104,36 +93,147 @@ pub fn worktree_type() -> WorktreeType {
     worktree_type_from_toml(&root)
 }
 
-/// Returns `Some(value)` when `[cli] restore_code` is set as a boolean in config.toml.
-pub fn restore_code_from_toml(root: &TomlValue) -> Option<bool> {
+/// Env override for grove vs copy (`grove` | `grove-fuse` | `grove-nfs` | `nfs` | `copy`).
+/// Distinct from [`WorktreeType`] (`linked` | `standalone` | `git`).
+pub const ENV_WORKTREE_TYPE: &str = "GROK_WORKTREE_TYPE";
+
+fn grove_from_str(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "grove" | "grove-fuse" | "grove-nfs" | "nfs" | "true" | "1" | "on" => Some(true),
+        "copy" | "false" | "0" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn grove_worktree_from_toml_opt(root: &TomlValue) -> Option<bool> {
+    let cli = root.get("cli")?;
+    for key in ["grove_worktree", "nfs_worktree"] {
+        if let Some(v) = cli.get(key) {
+            if let Some(b) = v.as_bool() {
+                return Some(b);
+            }
+            if let Some(s) = v.as_str() {
+                return grove_from_str(s);
+            }
+            tracing::warn!("Invalid [cli].{key} value: {v:?}, ignoring");
+        }
+    }
+    if let Some(s) = cli.get("worktree_type").and_then(|v| v.as_str()) {
+        match s {
+            "grove" | "grove-fuse" | "grove-nfs" | "nfs" => return Some(true),
+            "copy" => return Some(false),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The kill switch and a missing remote run **last** and fail **closed**.
+/// `remote = None` forces copy; `grove_worktree = false` forces copy even when `desired`, env, or local asked for grove.
+pub fn resolve_grove_worktree(
+    raw_config: &TomlValue,
+    remote: Option<&RemoteSettings>,
+) -> (bool, &'static str) {
+    gate_grove_worktree(None, raw_config, remote)
+}
+
+pub fn grove_worktree_env() -> Option<bool> {
+    std::env::var(ENV_WORKTREE_TYPE)
+        .ok()
+        .and_then(|s| grove_from_str(&s))
+}
+
+/// Resolves in layer order: request, then env, then local, then remote (which only enables when true); the kill switch runs last.
+/// Tests inject `env` instead of mutating process state.
+pub fn gate_grove_worktree_layers(
+    desired: Option<bool>,
+    env: Option<bool>,
+    raw_config: &TomlValue,
+    remote: Option<&RemoteSettings>,
+) -> (bool, &'static str) {
+    let mut enabled = false;
+    let mut src = "default";
+    if let Some(v) = desired {
+        enabled = v;
+        src = "request";
+    } else if let Some(v) = env {
+        enabled = v;
+        src = "env";
+    } else if let Some(v) = grove_worktree_from_toml_opt(raw_config) {
+        enabled = v;
+        src = "local";
+    } else if remote.and_then(|r| r.grove_worktree) == Some(true) {
+        enabled = true;
+        src = "remote";
+    }
+    let refusal = match remote {
+        None => Some("remote_unavailable"),
+        Some(r) if r.grove_worktree == Some(false) => Some("remote_kill"),
+        _ => None,
+    };
+    match refusal {
+        // A refusal is only the *reason* when a layer actually asked for grove;
+        // otherwise callers would read `remote_unavailable` (returned on every
+        // settings-fetch failure) as proof of a grove request that never happened.
+        Some(reason) => (false, if enabled { reason } else { src }),
+        None => (enabled, src),
+    }
+}
+
+/// Single grove-vs-copy gate. `desired` is an explicit client/resume flag.
+pub fn gate_grove_worktree(
+    desired: Option<bool>,
+    raw_config: &TomlValue,
+    remote: Option<&RemoteSettings>,
+) -> (bool, &'static str) {
+    gate_grove_worktree_layers(desired, grove_worktree_env(), raw_config, remote)
+}
+
+pub fn grove_worktree_enabled(remote: Option<&RemoteSettings>) -> bool {
+    let root: TomlValue = match crate::config::load_effective_config() {
+        Ok(r) => r,
+        Err(_) => TomlValue::Table(toml::map::Map::new()),
+    };
+    gate_grove_worktree(None, &root, remote).0
+}
+
+pub(crate) fn restore_code_from_toml(root: &TomlValue) -> Option<bool> {
     root.get("cli")
         .and_then(|c| c.get("restore_code"))
         .and_then(|v| v.as_bool())
 }
 
-/// Resolve restore_code: local config > remote settings > default (`false`).
-pub fn resolve_restore_code(raw_config: &TomlValue, remote: Option<&RemoteSettings>) -> bool {
+/// Used when the client omits `restoreCode` on the wire.
+pub(crate) fn resolve_restore_code(
+    raw_config: &TomlValue,
+    remote: Option<&RemoteSettings>,
+) -> bool {
     restore_code_from_toml(raw_config)
         .or(remote.and_then(|r| r.restore_code))
         .unwrap_or(false)
 }
 
-/// Synchronously check if leader mode is enabled in the config file.
-/// When true, the agent will connect to a shared leader process instead of
-/// running the agent directly. This allows multiple agent instances to share one backend.
-/// Defaults to false when not explicitly set.
-pub fn use_leader_sync() -> bool {
-    let root: TomlValue = match crate::config::load_effective_config() {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
-    use_leader_from_toml(&root)
+/// Resolve `[worktree.auto_gc]` from parsed settings: env > local > remote > defaults (clamped).
+/// Platform age policy is applied later in `maybe_auto_gc`.
+/// (`xai-fast-worktree`'s `resolve_worktree_auto_gc_from_layers` owns and tests precedence and clamping; this only maps settings to layers.)
+pub(crate) fn resolve_worktree_auto_gc_from_settings(
+    local: Option<&super::WorktreeAutoGcSettings>,
+    remote: Option<&super::WorktreeAutoGcSettings>,
+) -> xai_fast_worktree::ResolvedWorktreeAutoGc {
+    use xai_grok_workspace::worktree::worktree_auto_gc_layer_from_settings;
+    let local_layer = local.map(worktree_auto_gc_layer_from_settings);
+    let remote_layer = remote.map(worktree_auto_gc_layer_from_settings);
+    xai_fast_worktree::resolve_worktree_auto_gc_from_layers(
+        local_layer.as_ref(),
+        remote_layer.as_ref(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::RemoteSettings;
     use super::*;
+    use serial_test::serial;
     use toml::Value as TomlValue;
 
     #[test]
@@ -193,7 +293,6 @@ default = "grok-code-fast-1"
 worktree_type = "invalid"
 "#;
         let root: TomlValue = toml::from_str(toml_str).unwrap();
-        // Invalid values should fall back to default
         assert_eq!(worktree_type_from_toml(&root), WorktreeType::Linked);
     }
 
@@ -297,6 +396,189 @@ worktree_type = "invalid"
         );
     }
 
+    fn clear_worktree_type_env() {
+        unsafe { std::env::remove_var(ENV_WORKTREE_TYPE) };
+    }
+
+    fn remote_unset() -> RemoteSettings {
+        RemoteSettings {
+            grove_worktree: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_grove_worktree_default_copy() {
+        clear_worktree_type_env();
+        let root: TomlValue = toml::from_str("[cli]\nauto_update = true").unwrap();
+        assert_eq!(
+            resolve_grove_worktree(&root, Some(&remote_unset())),
+            (false, "default")
+        );
+        assert_eq!(resolve_grove_worktree(&root, None), (false, "default"));
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_grove_worktree_toml_bool_and_type_spelling() {
+        clear_worktree_type_env();
+        let remote = remote_unset();
+        let root: TomlValue = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        assert_eq!(
+            resolve_grove_worktree(&root, Some(&remote)),
+            (true, "local")
+        );
+        let root: TomlValue = toml::from_str("[cli]\nnfs_worktree = true").unwrap();
+        assert_eq!(
+            resolve_grove_worktree(&root, Some(&remote)),
+            (true, "local")
+        );
+        let root: TomlValue = toml::from_str("[cli]\nworktree_type = \"grove\"").unwrap();
+        assert_eq!(
+            resolve_grove_worktree(&root, Some(&remote)),
+            (true, "local")
+        );
+        let root: TomlValue = toml::from_str("[cli]\nworktree_type = \"nfs\"").unwrap();
+        assert_eq!(
+            resolve_grove_worktree(&root, Some(&remote)),
+            (true, "local")
+        );
+        let root: TomlValue = toml::from_str("[cli]\nworktree_type = \"copy\"").unwrap();
+        assert_eq!(
+            resolve_grove_worktree(&root, Some(&remote)),
+            (false, "local")
+        );
+        let root: TomlValue = toml::from_str("[cli]\nworktree_type = \"linked\"").unwrap();
+        assert_eq!(
+            resolve_grove_worktree(&root, Some(&remote)),
+            (false, "default")
+        );
+        let root: TomlValue =
+            toml::from_str("[cli]\ngrove_worktree = false\nnfs_worktree = true").unwrap();
+        assert_eq!(
+            resolve_grove_worktree(&root, Some(&remote)),
+            (false, "local")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_grove_worktree_env_wins_over_local() {
+        clear_worktree_type_env();
+        let remote = remote_unset();
+        unsafe { std::env::set_var(ENV_WORKTREE_TYPE, "grove") };
+        let root: TomlValue = toml::from_str("[cli]\ngrove_worktree = false").unwrap();
+        assert_eq!(resolve_grove_worktree(&root, Some(&remote)), (true, "env"));
+        unsafe { std::env::set_var(ENV_WORKTREE_TYPE, "copy") };
+        let root: TomlValue = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        assert_eq!(resolve_grove_worktree(&root, Some(&remote)), (false, "env"));
+        clear_worktree_type_env();
+    }
+
+    #[test]
+    fn gate_grove_worktree_layers_resume_parity_without_process_env() {
+        let local_grove: TomlValue = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        let empty: TomlValue = toml::from_str("[cli]\nauto_update = true").unwrap();
+        let remote_unset = remote_unset();
+        let remote_kill = RemoteSettings {
+            grove_worktree: Some(false),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            gate_grove_worktree_layers(None, None, &local_grove, Some(&remote_unset)),
+            (true, "local"),
+            "remote Some(unset) + local grove must enable, same as create"
+        );
+        assert_eq!(
+            gate_grove_worktree_layers(None, Some(true), &empty, Some(&remote_unset)),
+            (true, "env"),
+            "remote Some(unset) + env grove must enable, same as create"
+        );
+        assert_eq!(
+            gate_grove_worktree_layers(None, Some(true), &empty, Some(&remote_kill)),
+            (false, "remote_kill"),
+            "remote kill must disable even when env asked for grove"
+        );
+        assert_eq!(
+            gate_grove_worktree_layers(None, Some(true), &empty, None),
+            (false, "remote_unavailable"),
+            "true unavailability must fail-close even if env asked for grove"
+        );
+        assert_eq!(
+            gate_grove_worktree_layers(None, None, &empty, None),
+            (false, "default"),
+            "a missing remote must not be reported as a refused grove request"
+        );
+        assert_eq!(
+            gate_grove_worktree_layers(Some(false), None, &local_grove, Some(&remote_kill)),
+            (false, "request"),
+            "the kill switch must not claim a request that asked for copy"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn gate_grove_worktree_kill_switch_wins_over_request() {
+        clear_worktree_type_env();
+        let root: TomlValue = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        let remote = RemoteSettings {
+            grove_worktree: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            gate_grove_worktree(Some(true), &root, Some(&remote)),
+            (false, "remote_kill")
+        );
+        unsafe { std::env::set_var(ENV_WORKTREE_TYPE, "grove") };
+        assert_eq!(
+            gate_grove_worktree(Some(true), &root, None),
+            (false, "remote_unavailable")
+        );
+        clear_worktree_type_env();
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_grove_worktree_remote_kill_switch_wins() {
+        clear_worktree_type_env();
+        unsafe { std::env::set_var(ENV_WORKTREE_TYPE, "grove") };
+        let root: TomlValue = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        let remote = RemoteSettings {
+            grove_worktree: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_grove_worktree(&root, Some(&remote)),
+            (false, "remote_kill")
+        );
+        clear_worktree_type_env();
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_grove_worktree_remote_true_when_unset() {
+        clear_worktree_type_env();
+        let root: TomlValue = toml::from_str("[cli]\nauto_update = true").unwrap();
+        let remote = RemoteSettings {
+            grove_worktree: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_grove_worktree(&root, Some(&remote)),
+            (true, "remote")
+        );
+    }
+
+    #[test]
+    fn remote_settings_deserializes_nfs_worktree_alias() {
+        let s: RemoteSettings = serde_json::from_str(r#"{"nfs_worktree":false}"#).unwrap();
+        assert_eq!(s.grove_worktree, Some(false));
+        let s: RemoteSettings = serde_json::from_str(r#"{"grove_worktree":true}"#).unwrap();
+        assert_eq!(s.grove_worktree, Some(true));
+    }
+
     // === restore_code config tests ===
 
     #[test]
@@ -374,6 +656,4 @@ worktree_type = "invalid"
         };
         assert!(!resolve_restore_code(&root, Some(&remote)));
     }
-
-    // === minimum_version tests ===
 }

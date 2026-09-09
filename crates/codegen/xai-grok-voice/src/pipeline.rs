@@ -1,9 +1,8 @@
-//! Voice pipeline: mic → streaming STT → pager events.
+//! Voice pipeline: mic capture streams to STT and transcripts come back as pager events.
 //!
-//! The pager drives capture with press/release commands. They back both a
-//! toggle (`/voice`, `Ctrl+Shift+M`) and true push-to-talk (F12 hold) — hence
-//! the `Ptt*` names — so a press may be followed by a release after a long hold
-//! or, for a toggle, a later stop.
+//! The pager drives capture with press/release commands.
+//! They back both a toggle (`/voice`, `Ctrl+Shift+M`) and true push-to-talk (F12 hold), hence the `Ptt*` names.
+//! A press may be followed by a release after a long hold or, for a toggle, a later stop.
 
 #[cfg(feature = "audio")]
 use std::collections::VecDeque;
@@ -47,41 +46,26 @@ pub async fn run_voice_pipeline(
         match cmd {
             VoiceCommand::Shutdown => break,
             VoiceCommand::PttPress => {
-                // Supersede any prior session — including one still draining its
-                // trailing final after a `PttRelease` — rather than ignoring the
-                // press. A rapid stop→start would otherwise be dropped here while
-                // the pager already flipped to "listening", leaving a dead mic
-                // behind a recording UI and letting the old session's final land
-                // on the new target. Aborting drops the old reader's capture +
-                // STT session, releasing the mic and socket at once. (The pager
-                // always sends a `PttRelease` between presses, so an `active`
-                // session here is one that's stopping, never a live duplicate.)
-                // We don't join the old reader, so its stream may still be
-                // releasing as the new one opens — a brief overlap cpal handles.
+                // Aborting drops the old reader's capture and STT session, releasing the mic and socket at once (The pager always sends
+                // a `PttRelease` between presses, so an `active` session is one that's stopping, never a live duplicate.). We don't join
+                // the old reader, so its stream may still be releasing as the new one opens; cpal handles that brief overlap
                 if let Some(prev) = active.take() {
                     prev.reader.abort();
                 }
 
-                // Connect + device-open take hundreds of ms. Race them against
-                // the next command so a release/stop (or shutdown) arriving
-                // mid-connect cancels the start — otherwise a quick tap-and-
-                // release would open a hot mic and append a spurious final after
-                // the user already let go. `biased` polls the start first so a
-                // just-completed session is always kept (dropping it would leak
-                // its reader). Dropping an unfinished start cancels the connect;
-                // the concurrent mic-open still completes but its handle is then
-                // dropped, releasing the device right away.
+                // Otherwise a quick tap-and-release would open a hot mic and append a spurious final after the user already let go
+                // `biased` polls the start first so a just-completed session is always kept (dropping it would leak its reader). The
+                // concurrent mic-open still completes, but its handle is then dropped, releasing the device right away
                 tokio::select! {
                     biased;
                     session = open_session(&config, &auth, &event_tx) => {
                         active = session;
                     }
                     next = cmd_rx.recv() => match next {
-                        // Released before capture was ready → cancel the start.
+                        // Released before capture was ready; cancel the start
                         Some(VoiceCommand::PttRelease) => {}
                         Some(VoiceCommand::Shutdown) | None => break,
-                        // Unreachable per the release-between-presses contract;
-                        // start fresh defensively.
+                        // The pager always sends a release between presses, so this is unreachable; start fresh defensively
                         Some(VoiceCommand::PttPress) => {
                             active = open_session(&config, &auth, &event_tx).await;
                         }
@@ -92,9 +76,8 @@ pub async fn run_voice_pipeline(
                 let Some(session) = active.as_ref() else {
                     continue;
                 };
-                // The reader task owns the capture handle; signalling it lets the
-                // reader stop the mic and send `audio.done` in a single place,
-                // matching the silence-guard teardown below.
+                // The reader task owns the capture handle
+                // Signalling it lets the reader stop the mic and send `audio.done` in a single place, matching the no-speech-watchdog teardown below
                 let _ = session.finish_tx.send(()).await;
             }
         }
@@ -105,9 +88,8 @@ pub async fn run_voice_pipeline(
     }
 }
 
-/// Open a capture session, emitting a `VoiceEvent::Error` (and returning `None`)
-/// on failure. Extracted so the `PttPress` start can be raced against an
-/// incoming release in `select!` and reused for the defensive restart path.
+/// Open a capture session, emitting a `VoiceEvent::Error` (and returning `None`) on failure.
+/// Extracted so the `PttPress` start can be raced against an incoming release in `select!` and reused for the defensive restart path.
 async fn open_session(
     config: &VoiceConfig,
     auth: &SharedVoiceAuth,
@@ -119,6 +101,7 @@ async fn open_session(
             let _ = event_tx
                 .send(VoiceEvent::Error {
                     message: e.to_string(),
+                    hint: None,
                 })
                 .await;
             None
@@ -137,20 +120,15 @@ async fn start_capture_session(
     ))
 }
 
-/// Hard cap on the pre-connect PCM backlog (memory safety). Sized far above any
-/// real connect — the STT connect timeout aborts long before this is reached, so
-/// in practice it never drops; it only bounds a pathological hang.
+/// Hard cap on the pre-connect PCM backlog (memory safety).
+/// Sized far above any real connect: the STT connect timeout aborts long before this is reached.
+/// In practice it never drops; it only bounds a pathological hang.
 #[cfg(feature = "audio")]
 const BACKLOG_MAX_CHUNKS: usize = 1024;
 
-/// Bridge mic PCM into the STT socket across the connect handshake.
-///
-/// Until `audio_tx_rx` yields the live STT sender, captured chunks accumulate in
-/// a bounded backlog (so the mic never backpressures while the socket connects);
-/// once it arrives the backlog is flushed in order and capture streams live.
-/// Holding the sender also defers the writer's `audio.done` until the backlog is
-/// drained on teardown. Returns when the mic stops (`mic_rx` closed), the socket
-/// goes away (`audio_tx` closed), or connect fails (`audio_tx_rx` dropped).
+/// Until `audio_tx_rx` yields the live STT sender, captured chunks accumulate in a bounded backlog, so the mic never
+/// backpressures during connect. Once the sender arrives the backlog is flushed in order and capture streams live.
+/// Holding the sender also defers the writer's `audio.done` until the backlog is drained on teardown.
 #[cfg(feature = "audio")]
 async fn forward_pcm(
     mut mic_rx: mpsc::Receiver<Vec<u8>>,
@@ -160,10 +138,8 @@ async fn forward_pcm(
     let audio_tx = loop {
         tokio::select! {
             chunk = mic_rx.recv() => match chunk {
-                // A normal connect stays well under the cap, so the lead-in is
-                // kept intact; only a pathologically slow connect (which the
-                // connect timeout aborts anyway) drops its oldest chunks rather
-                // than letting the buffer grow unbounded.
+                // A normal connect stays well under the cap, so the lead-in is kept intact
+                // Only a pathologically slow connect (which the connect timeout aborts anyway) drops its oldest chunks
                 Some(c) => {
                     if backlog.len() == BACKLOG_MAX_CHUNKS {
                         backlog.pop_front();
@@ -174,7 +150,7 @@ async fn forward_pcm(
             },
             tx = &mut audio_tx_rx => match tx {
                 Ok(tx) => break tx,
-                Err(_) => return, // connect failed → sender dropped
+                Err(_) => return, // connect failed; the sender was dropped
             },
         }
     };
@@ -190,25 +166,36 @@ async fn forward_pcm(
     }
 }
 
+/// How long a session may run without any transcript before it is torn down (instead of streaming a dead mic until the user gives up).
+/// The first transcript disarms it, so long dictation with pauses is unaffected.
+#[cfg(feature = "audio")]
+const NO_SPEECH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Message and permission guidance for a session torn down by [`NO_SPEECH_TIMEOUT`].
+/// A denied grant is indistinguishable from not speaking because macOS may return silence instead of an error.
+#[cfg(feature = "audio")]
+fn no_speech_error() -> (String, Option<String>) {
+    (
+        "No speech was detected. Voice stopped.".to_owned(),
+        Some(crate::probe::mic_fix_help().to_owned()),
+    )
+}
+
 #[cfg(feature = "audio")]
 async fn start_capture_session(
     config: &VoiceConfig,
     auth: &SharedVoiceAuth,
     event_tx: &mpsc::Sender<VoiceEvent>,
 ) -> Result<ActivePtt, VoiceError> {
-    // Open the mic concurrently with the bearer + connect handshake (TLS +
-    // WebSocket + `transcript.created`). Both legs take hundreds of ms and used
-    // to run in series before any capture, clipping the first word of a hold.
+    // Open the mic concurrently with the bearer fetch and the connect handshake (TLS, WebSocket, `transcript.created`)
+    // Both legs take hundreds of ms and used to run in series before any capture, clipping the first word of a hold
     let (mic_tx, mic_rx) = mpsc::channel::<Vec<u8>>(64);
     let sample_rate = config.sample_rate;
     // `spawn_pcm_capture` blocks until the device opens; keep it off the runtime.
     let capture_task =
         tokio::task::spawn_blocking(move || crate::audio::spawn_pcm_capture(sample_rate, mic_tx));
 
-    // Start draining the mic *now* — before connect resolves — so the capture
-    // chain never backpressures (and cpal never drops chunks) while the socket
-    // comes up. `forward_pcm` buffers until the STT sender arrives, then flushes
-    // and streams live.
+    // Drain mic before connect resolves so capture never backpressures while the socket comes up
     let (audio_tx_tx, audio_tx_rx) = tokio::sync::oneshot::channel::<mpsc::Sender<Vec<u8>>>();
     tokio::spawn(forward_pcm(mic_rx, audio_tx_rx));
 
@@ -218,8 +205,8 @@ async fn start_capture_session(
     };
     let (connect_res, capture_res) = tokio::join!(connect, capture_task);
 
-    // Resolve the mic first so a device/permission failure wins over a socket
-    // error; the `?` on `connect_res` then drops `capture`, releasing the mic.
+    // Resolve the mic first so a device/permission failure wins over a socket error
+    // The `?` on `connect_res` then drops `capture`, releasing the mic
     let capture = match capture_res {
         Ok(Ok(handle)) => handle,
         Ok(Err(e)) => return Err(e),
@@ -242,55 +229,38 @@ async fn start_capture_session(
     let mut capture = Some(capture);
     let out = event_tx.clone();
     let reader = tokio::spawn(async move {
-        // Stop the mic (releasing the device and dropping the capture thread's
-        // clone of the audio sender) before signalling end-of-utterance, so no
-        // stray PCM is queued after `audio.done`. Idempotent via `Option::take`.
+        // Stop the mic before signalling end-of-utterance so no stray PCM is queued after `audio.done`
+        // Stopping releases the device and drops the capture thread's clone of the audio sender. `Option::take` makes it idempotent.
         let stop_capture = |capture: &mut Option<crate::audio::CaptureHandle>| {
             if let Some(handle) = capture.take() {
                 handle.stop();
             }
         };
-        // Surface a hint if nothing is transcribed within the first 10s of a
-        // session — the usual sign of a denied mic permission, a muted mic, or
-        // the wrong input device (on macOS a "healthy" stream still delivers
-        // silence until access is granted). The check applies only before the
-        // first transcript: once the user starts talking, pauses can be as long
-        // as they like.
-        let silence_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut silence_check = true;
-        // Chunk-final (`is_final && !speech_final`) text is locked: the server
-        // sends it as a delta of the turn. Stitch those deltas into the live
-        // preview so a long pauseless utterance keeps accumulating on screen
-        // instead of resetting to the latest ~3s chunk. The committed prompt
-        // text never comes from here — only from `speech_final`, which the
-        // server produces as a clean one-pass re-transcription of the whole
-        // turn (better than stitched deltas). Reset on each `speech_final`.
+        // Tear down when no transcript arrives within the timeout; the first transcript disarms this
+        let no_speech_deadline = tokio::time::Instant::now() + NO_SPEECH_TIMEOUT;
+        let mut awaiting_speech = true;
+        // Stitch those deltas into the live preview so a long pauseless utterance keeps accumulating instead of resetting to the
+        // latest ~3s chunk. The committed prompt text only ever comes from `speech_final`. The server produces that as a clean
+        // one-pass re-transcription of the whole turn, better than stitched deltas. The prefix resets on each `speech_final`
         let mut locked_prefix = String::new();
         loop {
             tokio::select! {
                 msg = finish_rx.recv() => {
                     if msg.is_some() {
-                        // User ended the turn; stop watching for initial silence.
-                        silence_check = false;
+                        // User ended the turn; stop the no-speech watchdog.
+                        awaiting_speech = false;
                         stop_capture(&mut capture);
                         stt.finish_audio();
                     } else {
                         return;
                     }
                 }
-                _ = tokio::time::sleep_until(silence_deadline), if silence_check => {
-                    // Give up on this turn: stop the mic and flush `audio.done`
-                    // so the session tears down instead of streaming silence
-                    // until the pager sends stop (toggle off).
+                _ = tokio::time::sleep_until(no_speech_deadline), if awaiting_speech => {
+                    // Tear down rather than streaming a dead mic until the user stops.
                     stop_capture(&mut capture);
                     stt.finish_audio();
-                    let _ = out
-                        .send(VoiceEvent::Error {
-                            message: "no audio detected in 10s: check that your \
-                                      terminal has microphone permission"
-                                .into(),
-                        })
-                        .await;
+                    let (message, hint) = no_speech_error();
+                    let _ = out.send(VoiceEvent::Error { message, hint }).await;
                     return;
                 }
                 ev = stt.recv() => {
@@ -300,8 +270,8 @@ async fn start_capture_session(
                             if text.is_empty() {
                                 continue;
                             }
-                            // Real speech arrived: disarm the initial-silence guard.
-                            silence_check = false;
+                            // Real speech arrived: disarm the no-speech watchdog.
+                            awaiting_speech = false;
 
                             let event = if p.speech_final {
                                 locked_prefix.clear();
@@ -324,7 +294,7 @@ async fn start_capture_session(
                                     text: format!("{locked_prefix} {text}"),
                                 }
                             };
-                            // Receiver gone (pager dropped the channel): tear down.
+                            // The receiver is gone (the pager dropped the channel), so tear down
                             if out.send(event).await.is_err() {
                                 return;
                             }
@@ -332,12 +302,12 @@ async fn start_capture_session(
                         Some(StreamingSttEvent::Done { text }) => {
                             locked_prefix.clear();
                             if !text.trim().is_empty() {
-                                silence_check = false;
+                                awaiting_speech = false;
                                 let _ = out.send(VoiceEvent::UtteranceFinal { text }).await;
                             }
                         }
                         Some(StreamingSttEvent::Error { message }) => {
-                            let _ = out.send(VoiceEvent::Error { message }).await;
+                            let _ = out.send(VoiceEvent::Error { message, hint: None }).await;
                             return;
                         }
                         Some(StreamingSttEvent::Ready) | None => return,
@@ -354,9 +324,7 @@ async fn start_capture_session(
 mod tests {
     use super::*;
 
-    /// Chunks captured before the STT sender arrives are flushed (in order)
-    /// ahead of the live stream, with nothing reordered or dropped across the
-    /// handoff.
+    /// Chunks captured before the STT sender arrives are flushed ahead of the live stream, with nothing reordered or dropped across the handoff.
     #[tokio::test]
     async fn forward_pcm_delivers_buffered_then_live_in_order() {
         let (mic_tx, mic_rx) = mpsc::channel::<Vec<u8>>(8);
@@ -364,17 +332,15 @@ mod tests {
         let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(8);
         let task = tokio::spawn(forward_pcm(mic_rx, tx_rx));
 
-        // Buffered before the live sender is handed over, then flushed once it
-        // arrives. (Keep `mic_tx` open across the handoff: a mic that closes
-        // before the socket is ready means "abandoned", and discards the
-        // backlog — see the separate test.)
+        // These chunks buffer before the live sender is handed over, then flush once it arrives
+        // (Keep `mic_tx` open across the handoff: a mic that closes before the socket is ready discards the backlog; see the separate test.)
         mic_tx.send(vec![1]).await.unwrap();
         mic_tx.send(vec![2]).await.unwrap();
         tx_tx.send(audio_tx).unwrap();
         assert_eq!(audio_rx.recv().await, Some(vec![1]));
         assert_eq!(audio_rx.recv().await, Some(vec![2]));
 
-        // Streamed live afterward, still in order.
+        // Later chunks stream live, still in order
         mic_tx.send(vec![3]).await.unwrap();
         assert_eq!(audio_rx.recv().await, Some(vec![3]));
 
@@ -383,7 +349,7 @@ mod tests {
         task.await.unwrap();
     }
 
-    /// Mic stops before the socket is ready → the forwarder exits cleanly.
+    /// When the mic stops before the socket is ready, the forwarder exits cleanly.
     #[tokio::test]
     async fn forward_pcm_returns_when_mic_closes_before_connect() {
         let (mic_tx, mic_rx) = mpsc::channel::<Vec<u8>>(8);
@@ -393,8 +359,7 @@ mod tests {
         task.await.unwrap();
     }
 
-    /// Connect fails (oneshot sender dropped without a value) → forwarder exits
-    /// and the buffered audio is discarded.
+    /// When connect fails (the oneshot sender is dropped without a value), the forwarder exits and discards the buffered audio.
     #[tokio::test]
     async fn forward_pcm_returns_when_connect_fails() {
         let (mic_tx, mic_rx) = mpsc::channel::<Vec<u8>>(8);
@@ -403,5 +368,12 @@ mod tests {
         mic_tx.send(vec![1]).await.unwrap();
         drop(tx_tx);
         task.await.unwrap();
+    }
+
+    #[test]
+    fn no_speech_error_carries_permission_hint() {
+        let (message, hint) = no_speech_error();
+        assert_eq!(message, "No speech was detected. Voice stopped.");
+        assert!(hint.is_some_and(|hint| hint.contains(crate::probe::mic_fix_help())));
     }
 }

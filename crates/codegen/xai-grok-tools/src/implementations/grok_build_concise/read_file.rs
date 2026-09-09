@@ -6,17 +6,15 @@ const DESCRIPTION_CONCISE: &str = r#"Reads a file from the computer's filesystem
 It is okay to read a file that does not exist; an error will be returned.
 
 Usage:
-- You can optionally specify a line offset and limit (especially handy for long files).
+- You can optionally specify ${{ params.read.offset }} and ${{ params.read.limit }} (especially handy for long files).
 - Lines in the output are numbered starting at 1, using following format: LINE_NUMBER→LINE_CONTENT.
 - You have the capability to call multiple tools in a single response. It is always better to speculatively read multiple files as a batch that are potentially useful."#;
 use crate::types::output::ReadFileOutput;
 use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::tool::{ToolKind, ToolNamespace};
 
-/// Concise variant of `ReadFileTool`.
-///
-/// Delegates to `run_read_file()`, then swaps `content_concise` into `content`
-/// (no line-number padding).
+/// Concise variant of `ReadFileTool`. Delegates to `run_read_file()`, then swaps `content_concise`
+/// into `content` (no line-number padding).
 #[derive(Debug, Default)]
 pub struct ReadFileConciseTool;
 
@@ -52,7 +50,7 @@ impl xai_tool_runtime::Tool for ReadFileConciseTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "read_file",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -84,7 +82,8 @@ impl xai_tool_runtime::Tool for ReadFileConciseTool {
             .map(|c| c.0.clone());
         // `None`: the concise tool does not stream, so it needs no
         // text-path streamability signal (see `run_read_file`).
-        let result = run_read_file(input, cwd_override, None, resources, None).await?;
+        let invoking = crate::types::tool_metadata::invoking_param_names(&ctx);
+        let result = run_read_file(input, cwd_override, None, resources, None, &invoking).await?;
 
         match result {
             ReadFileOutput::FileContent(mut fc) => {
@@ -127,9 +126,28 @@ mod tests {
             ToolMetadata::description_template(&default_tool),
             ToolMetadata::description_template(&concise_tool),
         );
-        assert_eq!(
-            ToolMetadata::description_template(&concise_tool),
-            super::DESCRIPTION_CONCISE
+    }
+
+    #[test]
+    fn description_template_tracks_renamed_offset_limit() {
+        use crate::types::template_renderer::TemplateRenderer;
+        use crate::types::tool_metadata::ToolMetadata;
+        use std::collections::HashMap;
+
+        let tools = HashMap::from([(ToolKind::Read, "read_file".to_string())]);
+        let params = HashMap::from([(
+            ToolKind::Read,
+            HashMap::from([
+                ("offset".to_string(), "start_line".to_string()),
+                ("limit".to_string(), "num_lines".to_string()),
+            ]),
+        )]);
+        let rendered = TemplateRenderer::new(tools, params)
+            .render(ToolMetadata::description_template(&ReadFileConciseTool))
+            .unwrap();
+        assert!(
+            rendered.contains("start_line") && rendered.contains("num_lines"),
+            "renamed offset/limit must appear:\n{rendered}"
         );
     }
 

@@ -26,7 +26,7 @@ impl crate::types::tool_metadata::ToolMetadata for KillTerminalCommandTool {
         r#"Terminate a running background terminal command${%- if tools.by_kind.monitor %} or monitor${%- endif %}.
 
 Usage notes:
-- Pass its task_id${%- if tools.by_kind.monitor %} (a monitor's task_id is returned by ${{ tools.by_kind.monitor }})${%- endif %}.
+- Pass its ${{ params.kill_task_action.task_id }}${%- if tools.by_kind.monitor %} (a monitor's ${{ params.kill_task_action.task_id }} is returned by ${{ tools.by_kind.monitor }})${%- endif %}.
 - ${%- if is_windows %} Terminates the Job Object of${%- else %} Sends SIGTERM/SIGKILL to${%- endif %} a background command${%- if tools.by_kind.monitor %} or monitor${%- endif %}.
 - Returns success if the command was killed or had already exited."#
     }
@@ -50,7 +50,7 @@ impl xai_tool_runtime::Tool for KillTerminalCommandTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "kill_terminal_command",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -140,11 +140,43 @@ mod tests {
             "kill_terminal_command"
         );
         let tmpl = ToolMetadata::description_template(&tool);
-        assert!(tmpl.contains("background terminal command"));
-        assert!(tmpl.contains("Terminate"));
         assert!(
             !tmpl.to_lowercase().contains("subagent"),
             "workspace tool must not mention subagents: {tmpl}"
+        );
+    }
+
+    #[test]
+    fn description_template_tracks_renamed_task_id() {
+        use crate::types::template_renderer::TemplateRenderer;
+        use crate::types::tool::ToolKind;
+        use std::collections::HashMap;
+
+        let tools = HashMap::from([
+            (ToolKind::Monitor, "monitor".to_string()),
+            (
+                ToolKind::KillTaskAction,
+                "kill_terminal_command".to_string(),
+            ),
+        ]);
+        let params = HashMap::from([(
+            ToolKind::KillTaskAction,
+            HashMap::from([("task_id".to_string(), "id".to_string())]),
+        )]);
+        let rendered = TemplateRenderer::new(tools, params)
+            .render(ToolMetadata::description_template(&KillTerminalCommandTool))
+            .unwrap();
+        assert!(
+            rendered.contains("monitor"),
+            "monitor tool name must appear:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("task_id"),
+            "canonical task_id must not remain after rename:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("${"),
+            "must not leak template markers:\n{rendered}"
         );
     }
 

@@ -1,5 +1,3 @@
-//! Feedback manager for session-level feedback collection.
-//!
 //! This manager coordinates:
 //! - Signal tracking via SessionSignalsHandle
 //! - Heuristics evaluation to determine when to request feedback
@@ -34,22 +32,24 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::agent::feedback_client::{
     FeedbackApiError, FeedbackClient, signals_to_update, snapshot_to_turn_delta,
 };
 use crate::session::feedback::{
-    FeedbackEvaluation, FeedbackHeuristics, FeedbackRequest, FeedbackTier, TriggerCondition,
+    FeedbackHeuristics, FeedbackRequest, FeedbackTier, TriggerCondition,
 };
 use crate::session::signals::{SessionSignalsActor, SessionSignalsHandle, TurnDeltaSnapshot};
 
 use prod_mc_cli_chat_proxy_types::feedback_types::{
     ClientType, ContextType, CreateFeedbackRequestInput, FeedbackContent, FeedbackMode,
-    FeedbackSubmission, FeedbackToolOutcome,
+    FeedbackSubmission, FeedbackToolOutcome, SessionTurnDelta, TurnOutcome,
 };
 
 use crate::session::persistence::{LocalFeedbackEntry, PersistenceMsg, UserFeedbackEntry};
+use xai_grok_feedback::{parse_structured_feedback, wire_value};
+use xai_grok_telemetry::events::{FeedbackSendOutcome, UserFeedback};
 
 pub(crate) enum SubmitOutcome {
     Submitted,
@@ -59,7 +59,36 @@ pub(crate) enum SubmitOutcome {
     Failed(anyhow::Error),
 }
 
-/// Shell-crate constructor: `with_content` + `shell_version`.
+/// The `user_feedback` event for one workflow call. `source` and the taxonomy ride only as the
+/// frozen wire values of the parsed enums, never the client's raw strings.
+fn user_feedback_event(
+    submission: &FeedbackSubmission,
+    outcome: &SubmitOutcome,
+    solicited: bool,
+) -> UserFeedback {
+    let structured = parse_structured_feedback(submission.metadata.as_ref());
+    let taxonomy = structured.map(|s| s.taxonomy).unwrap_or_default();
+    UserFeedback {
+        session_id: submission.session_id.clone(),
+        has_feedback_text: submission
+            .feedback_text
+            .as_ref()
+            .is_some_and(|text| !text.is_empty()),
+        model_id: submission.model_id.clone(),
+        rating_value: submission.rating_value,
+        is_solicited: solicited,
+        outcome: match outcome {
+            SubmitOutcome::Submitted => FeedbackSendOutcome::Submitted,
+            SubmitOutcome::LocalOnly => FeedbackSendOutcome::LocalOnly,
+            SubmitOutcome::Failed(_) => FeedbackSendOutcome::Failed,
+        },
+        source: structured.and_then(|s| s.source).and_then(wire_value),
+        feedback_type: taxonomy.r#type.and_then(wire_value),
+        task_category: taxonomy.task_category.and_then(wire_value),
+        failure_mode: taxonomy.failure_mode.and_then(wire_value),
+    }
+}
+
 pub(crate) fn new_submission(
     session_id: String,
     client_type: ClientType,
@@ -70,18 +99,64 @@ pub(crate) fn new_submission(
     s
 }
 
-/// Pipeline: persist → strip → submit → telemetry (telemetry fields captured
-/// before strip). Callers merge `GROK_USER_METADATA` and set
-/// `submission.request_id`; `telemetry_enabled` must be
-/// `is_telemetry_enabled() && !is_zdr()` for all entry points.
+#[derive(Debug)]
+pub(crate) struct SubmitFeedbackOptions {
+    pub solicited: bool,
+    pub telemetry_enabled: bool,
+    pub author_identity: Option<crate::util::user_identity::ResolvedUserIdentity>,
+}
+
 pub(crate) async fn submit_feedback_workflow(
     submission: &mut FeedbackSubmission,
     feedback_client: Option<&FeedbackClient>,
     persistence_tx: Option<&tokio::sync::mpsc::UnboundedSender<PersistenceMsg>>,
-    solicited: bool,
-    telemetry_enabled: bool,
+    opts: SubmitFeedbackOptions,
 ) -> SubmitOutcome {
+    let SubmitFeedbackOptions {
+        solicited,
+        telemetry_enabled,
+        author_identity,
+    } = opts;
+
+    if let Some(mut user_meta) = crate::util::parse_json_object_env("GROK_USER_METADATA") {
+        // `structured_feedback` is reserved for the client's typed envelope. The shallow merge
+        // is later-wins, so an env copy would silently replace the client's enums (or invent
+        // the key on reports that carry none); every other env key keeps later-wins.
+        if let Some(user_meta) = user_meta.as_object_mut() {
+            user_meta.remove("structured_feedback");
+        }
+        if user_meta.as_object().is_some_and(|meta| !meta.is_empty()) {
+            submission.merge_metadata(user_meta);
+        }
+    }
+    // Exhaustive destructure (no `..`) so a new field must be handled, not dropped.
+    if let Some(crate::util::user_identity::ResolvedUserIdentity { name, email }) = author_identity
+    {
+        if let Some(name) = name {
+            submission.author_name = Some(name);
+        }
+        if let Some(email) = email {
+            submission.author_email = Some(email);
+        }
+    }
+
     if let Some(tx) = persistence_tx {
+        // Persist the image inventory, never the payloads feedback.jsonl rides in trace archives with a hard per-file size cap (one screenshot's base64 would sink the whole record).
+        // The bytes are also cleartext terminal captures.
+        // Take/restore around the clone so the megabytes are never copied either.
+        let images = std::mem::take(&mut submission.images);
+        let mut persisted = submission.clone();
+        persisted.images = images
+            .iter()
+            .map(
+                |i| prod_mc_cli_chat_proxy_types::feedback_types::FeedbackImage {
+                    data: format!("<{} base64 bytes stripped>", i.data.len()),
+                    mime_type: i.mime_type.clone(),
+                    file_name: i.file_name.clone(),
+                },
+            )
+            .collect();
+        submission.images = images;
         let entry = LocalFeedbackEntry::UserFeedback(UserFeedbackEntry {
             submitted_at: chrono::Utc::now(),
             session_id: submission.session_id.clone(),
@@ -89,7 +164,7 @@ pub(crate) async fn submit_feedback_workflow(
             solicited,
             request_id: submission.request_id.clone(),
             dismissed: false,
-            submission: Some(submission.clone()),
+            submission: Some(persisted),
         });
         if tx.send(PersistenceMsg::Feedback(entry)).is_err() {
             tracing::warn!(
@@ -99,17 +174,10 @@ pub(crate) async fn submit_feedback_workflow(
         }
     }
 
-    let telemetry_model_id = submission.model_id.clone();
-    let telemetry_rating_value = submission.rating_value;
-    let telemetry_session_id = submission.session_id.clone();
-    let has_feedback_text = submission
-        .feedback_text
-        .as_ref()
-        .is_some_and(|t| !t.is_empty());
     let request_id = submission.request_id.clone();
     let appearance_id = request_id.clone();
 
-    // Keep client-enriched triage fields; do not strip_metadata (Slack shows Option fields when set).
+    // Send the full submission: the feedback backend shows these triage fields, so session context and metadata are intentionally not stripped here
 
     let outcome = if let Some(client) = feedback_client {
         let result = if let Some(req_id) = request_id {
@@ -128,9 +196,9 @@ pub(crate) async fn submit_feedback_workflow(
         };
         match result {
             Ok(()) => SubmitOutcome::Submitted,
-            Err(e) => {
-                tracing::warn!(error = %e, "feedback submission failed");
-                SubmitOutcome::Failed(e)
+            Err(error) => {
+                tracing::warn!(%error, "feedback submission failed");
+                SubmitOutcome::Failed(error)
             }
         }
     } else {
@@ -138,28 +206,22 @@ pub(crate) async fn submit_feedback_workflow(
     };
 
     if telemetry_enabled {
+        let event = user_feedback_event(submission, &outcome, solicited);
         let feedback_span = tracing::info_span!(
             "feedback.survey",
             survey_type = "session",
             event_type = "responded",
             appearance_id = %appearance_id.as_deref().unwrap_or(""),
-            has_feedback_text = has_feedback_text,
+            has_feedback_text = event.has_feedback_text,
             rating = tracing::field::Empty,
             is_solicited = solicited,
         );
-        // Record `rating` only for star ratings; text-only feedback has no
-        // rating and must not export a fake 0.
-        if let Some(rating) = telemetry_rating_value {
+        // Record `rating` only for star ratings; text-only feedback has no rating and must not export a fake 0
+        if let Some(rating) = event.rating_value {
             feedback_span.record("rating", rating);
         }
         feedback_span.in_scope(|| {});
-        xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::UserFeedback {
-            session_id: telemetry_session_id,
-            has_feedback_text,
-            model_id: telemetry_model_id,
-            rating_value: telemetry_rating_value,
-            is_solicited: solicited,
-        });
+        xai_grok_telemetry::session_ctx::log_event(event);
     }
 
     outcome
@@ -174,36 +236,35 @@ pub(crate) struct SessionFeedbackData {
 }
 
 /// Feedback feature flags threaded through session spawn.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FeedbackFlags {
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FeedbackFlags {
     pub enabled: bool,
+    pub user: Option<crate::agent::config::FeedbackUserConfig>,
 }
 
-/// Configuration for the feedback manager.
-///
-/// Two concerns gated by separate flags (`feedback_enabled`, `telemetry_enabled`).
+/// Two concerns are gated by separate flags (`feedback_enabled`, `telemetry_enabled`).
 /// Both default to `false`.
 #[derive(Debug, Clone)]
 pub struct FeedbackManagerConfig {
     /// Interval for syncing signals to the analytics backend (default: 30s)
     pub sync_interval: Duration,
-    /// Whether user-facing feedback features are enabled (popups, `/feedback`,
-    /// ratings). Gated by `GROK_FEEDBACK_ENABLED`.
+    /// Whether user-facing feedback features are enabled (popups, `/feedback`, ratings).
+    /// Gated by `GROK_FEEDBACK_ENABLED`.
     pub feedback_enabled: bool,
     /// Whether session analytics (signal sync, turn deltas) are enabled.
-    /// Gated by `GROK_TELEMETRY_ENABLED`. These are analytics data that
-    /// flow continuously without user action.
+    /// Gated by `GROK_TELEMETRY_ENABLED`.
+    /// These are analytics data that flow continuously without user action.
     pub telemetry_enabled: bool,
-    /// Client type (Agent, Tui, Web, Extension)
     pub client_type: ClientType,
     /// Whether LOC attribution tracking is enabled for this session.
-    /// Propagated into every `SessionTurnDelta` so the server can
-    /// distinguish "tracking off" (zeros are noise) from "tracking on,
-    /// no code changed" (zeros are real data).
+    /// Propagated into every `SessionTurnDelta`.
+    /// The server can then distinguish "tracking off" (zeros are noise) from "tracking on, no code changed" (zeros are real data).
     pub loc_tracking_enabled: bool,
-    /// Timeout for draining the upload queue on shutdown (default: 30s).
-    /// If uploads don't complete within this time, remaining items are abandoned.
+    /// Preferred timeout for draining the upload queue on shutdown (default: 30s).
+    /// Process exit clamps this under [`SHUTDOWN_DRAIN_CAP`] (or `GROK_SESSION_EXIT_DRAIN_SECS`) so a hung upload cannot exceed the agent join grace.
+    /// Abandoned durable pairs are recovered on next-session startup.
     pub drain_timeout: Duration,
+    pub user: Option<crate::agent::config::FeedbackUserConfig>,
 }
 
 impl Default for FeedbackManagerConfig {
@@ -215,35 +276,93 @@ impl Default for FeedbackManagerConfig {
             client_type: ClientType::Agent,
             loc_tracking_enabled: false,
             drain_timeout: Duration::from_secs(30),
+            user: None,
         }
     }
 }
 
 /// Manages feedback collection for a single session.
 pub struct FeedbackManager {
-    /// Session ID
     session_id: String,
     /// Handle for sending signals (cheap to clone)
     signals_handle: SessionSignalsHandle,
-    /// Feedback heuristics evaluator
     heuristics: Arc<RwLock<FeedbackHeuristics>>,
     /// REST client for the feedback/analytics backend
     feedback_client: Option<FeedbackClient>,
-    /// Configuration
     config: FeedbackManagerConfig,
-    /// Whether config has been loaded from server
     config_loaded: Arc<AtomicBool>,
     /// GCS upload queue stats for periodic snapshots into signals.
     /// Set once after the first upload queue is created via `set_upload_queue_stats()`.
     /// `OnceLock` because `FeedbackManager` is behind `Arc` and this is set after construction.
     upload_queue_stats: std::sync::OnceLock<Arc<xai_file_utils::queue::UploadQueueStats>>,
+    /// Turn deltas post from one worker in send order, so the backend's append-only rows arrive
+    /// in turn order and [`Self::shutdown`] can wait for an exit cancel's row. `None` without a client.
+    turn_delta_tx: Option<mpsc::Sender<TurnDeltaJob>>,
+}
+
+/// Queued for the turn-delta worker. Bounded at [`TURN_DELTA_QUEUE_CAPACITY`]: a stalled backend
+/// drops the newest deltas (logged) instead of growing without limit.
+enum TurnDeltaJob {
+    Post(Box<SessionTurnDelta>),
+    /// Answered once every job queued before it has posted.
+    Barrier(oneshot::Sender<()>),
+}
+
+/// One delta per turn, so this only fills when the backend is unreachable for many turns.
+const TURN_DELTA_QUEUE_CAPACITY: usize = 64;
+
+/// The shared HTTP client bounds only connection setup; without this a stalled response would
+/// hold every later row behind it.
+const TURN_DELTA_POST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Post queued turn deltas in order until every sender is dropped.
+fn spawn_turn_delta_worker(
+    session_id: String,
+    client: FeedbackClient,
+) -> mpsc::Sender<TurnDeltaJob> {
+    let (tx, mut rx) = mpsc::channel(TURN_DELTA_QUEUE_CAPACITY);
+    tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            match job {
+                TurnDeltaJob::Post(delta) => {
+                    let result = tokio::time::timeout(
+                        TURN_DELTA_POST_TIMEOUT,
+                        with_one_shot_auth_retry(&client, || {
+                            client.send_turn_delta(&session_id, &delta)
+                        }),
+                    )
+                    .await;
+                    match result {
+                        Ok(Ok(_)) => tracing::debug!(
+                            session_id = %session_id,
+                            turn = delta.turn_number,
+                            "Turn delta sent to analytics backend"
+                        ),
+                        Ok(Err(e)) => tracing::warn!(
+                            session_id = %session_id,
+                            turn = delta.turn_number,
+                            error = %e,
+                            "Failed to send turn delta (non-fatal)"
+                        ),
+                        Err(_) => tracing::warn!(
+                            session_id = %session_id,
+                            turn = delta.turn_number,
+                            timeout_secs = TURN_DELTA_POST_TIMEOUT.as_secs(),
+                            "Turn delta post timed out (non-fatal)"
+                        ),
+                    }
+                }
+                TurnDeltaJob::Barrier(reached) => {
+                    let _ = reached.send(());
+                }
+            }
+        }
+    });
+    tx
 }
 
 impl FeedbackManager {
-    /// Create a new feedback manager for a session.
-    ///
-    /// If `feedback_client` is None, signal syncing is disabled but local
-    /// tracking and heuristics evaluation still work.
+    /// If `feedback_client` is None, signal syncing is disabled but local tracking and heuristics evaluation still work.
     pub fn new(
         session_id: impl Into<String>,
         feedback_client: Option<FeedbackClient>,
@@ -251,11 +370,13 @@ impl FeedbackManager {
     ) -> Self {
         let (signals_handle, actor) = SessionSignalsActor::with_sync_interval(config.sync_interval);
 
-        // Spawn the signals actor
         tokio::spawn(actor.run());
 
         let session_id = session_id.into();
         let feedback_client = feedback_client.map(|c| c.with_session_id(session_id.clone()));
+        let turn_delta_tx = feedback_client
+            .as_ref()
+            .map(|client| spawn_turn_delta_worker(session_id.clone(), client.clone()));
         tracing::info!(
             session_id = %session_id,
             feedback_enabled = config.feedback_enabled,
@@ -272,44 +393,37 @@ impl FeedbackManager {
             config,
             config_loaded: Arc::new(AtomicBool::new(false)),
             upload_queue_stats: std::sync::OnceLock::new(),
+            turn_delta_tx,
         }
     }
 
-    /// Create a feedback manager without a REST client (local tracking only).
     pub fn local_only(session_id: impl Into<String>) -> Self {
         Self::new(session_id, None, FeedbackManagerConfig::default())
     }
 
-    /// Attach GCS upload queue stats for periodic snapshotting into signals.
-    ///
-    /// Called once after the first upload queue is created. The Arc is stored
-    /// and read (via atomic loads) before each signal sync to populate GCS
-    /// queue metrics. Safe to call from `&self` (behind Arc) via OnceLock.
-    pub fn set_upload_queue_stats(&self, stats: Arc<xai_file_utils::queue::UploadQueueStats>) {
+    pub(crate) fn set_upload_queue_stats(
+        &self,
+        stats: Arc<xai_file_utils::queue::UploadQueueStats>,
+    ) {
         let _ = self.upload_queue_stats.set(stats);
     }
 
-    /// Get a clone of the signals handle for tracking events.
     pub fn signals_handle(&self) -> SessionSignalsHandle {
         self.signals_handle.clone()
     }
 
-    /// Get the session ID.
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
 
-    /// Check if feedback collection is enabled.
     pub fn is_enabled(&self) -> bool {
         self.config.feedback_enabled
     }
 
-    /// REST client for the feedback/analytics backend, if configured.
     pub fn feedback_client(&self) -> Option<&FeedbackClient> {
         self.feedback_client.as_ref()
     }
 
-    /// Client type for this session (Agent, Tui, Web, etc.).
     pub fn client_type(&self) -> prod_mc_cli_chat_proxy_types::feedback_types::ClientType {
         self.config.client_type
     }
@@ -353,40 +467,25 @@ impl FeedbackManager {
         submission.context_window_tokens = Some(signals.context_window_tokens);
         submission.client_version = session_data.client_version;
 
-        // Point to the per-turn unified log already uploaded by
-        // complete_prompt_trace. Only set when trace uploads are active
-        // Stats are set inside get_or_init; presence implies the queue exists.
-        // The session actor has no agent config; use the compiled-in default
-        // bucket. The ACP feedback extension path resolves the runtime bucket.
-        if submission.unified_log_url.is_none() && self.upload_queue_stats.get().is_some() {
-            submission.unified_log_url =
-                crate::upload::gcs::unified_log_url(None, &self.session_id, turn_number);
-        }
-
-        if let Some(user_meta) =
-            crate::agent::mvp_agent::parse_json_object_env("GROK_USER_METADATA")
-        {
-            submission.merge_metadata(user_meta);
-        }
+        let author_identity =
+            crate::util::user_identity::cached_identity(self.config.user.as_ref()).await;
 
         submit_feedback_workflow(
             &mut submission,
             self.feedback_client.as_ref(),
             persistence_tx,
-            false, // solicited: slash command isn't responding to a request
-            telemetry_enabled,
+            SubmitFeedbackOptions {
+                solicited: false,
+                telemetry_enabled,
+                author_identity,
+            },
         )
         .await
     }
 
-    /// Check if config has been loaded from the server.
-    pub fn is_config_loaded(&self) -> bool {
-        self.config_loaded.load(Ordering::Relaxed)
-    }
-
     /// Load feedback heuristics config from the backend.
     /// This is called automatically in run_sync_loop but can be called manually.
-    /// Does not block - errors are logged and defaults are used.
+    /// Does not block: errors are logged and defaults are used.
     #[tracing::instrument(name = "feedback.load_config", skip_all, fields(
         session_id = %self.session_id,
     ))]
@@ -421,15 +520,8 @@ impl FeedbackManager {
     }
 
     /// Evaluate heuristics and return a FeedbackRequest if one should be sent.
-    ///
     /// Call this after each turn to check if feedback should be requested.
-    /// Returns None if:
-    /// - No tier criteria are met
-    /// - The tier was already triggered this session
-    /// - Probabilistic sampling says no
-    ///
-    /// When a request is triggered, this method also creates a record via the
-    /// feedback API for tracking and analytics.
+    /// The tier was already triggered this session.
     #[tracing::instrument(name = "feedback.maybe_request_feedback", skip_all, fields(
         session_id = %self.session_id,
     ))]
@@ -455,7 +547,6 @@ impl FeedbackManager {
             (eval.should_request, eval.trigger_condition.as_ref())
         {
             let tier = trigger_condition.tier;
-            // Use the feedback mode configured for this tier
             let feedback_mode = heuristics.feedback_mode(tier);
             let dismissible = heuristics.dismissible(tier);
             let prompt = heuristics.prompt(tier);
@@ -483,38 +574,19 @@ impl FeedbackManager {
         None
     }
 
-    /// Force check heuristics without sampling (for testing).
-    /// Returns the evaluation result.
-    pub async fn evaluate_heuristics(&self) -> Option<FeedbackEvaluation> {
-        let signals = self.signals_handle.snapshot().await?;
-        let mut heuristics = self.heuristics.write().await;
-        Some(heuristics.evaluate(&signals))
-    }
-
-    /// Force-generate a feedback request for local testing, bypassing all
-    /// heuristics, sampling, cooldown, and enabled checks.
-    ///
-    /// Engineers developing clients can call this via the
-    /// `x.ai/debug/trigger_feedback` ACP extension method to exercise
-    /// the full feedback notification ↔ response flow without needing a
-    /// real session that meets tier criteria.
-    ///
-    /// When a `feedback_client` is configured, the request is also recorded
-    /// via the feedback API — exactly like a real trigger — so that the
-    /// subsequent `complete_request` / `dismiss_request` round-trip from the
-    /// client works end-to-end.
+    /// Engineers developing clients can call this via the `x.ai/debug/trigger_feedback` ACP extension method.
+    /// When a `feedback_client` is configured, the request is also recorded via the feedback API, exactly like a real trigger.
+    /// The subsequent `complete_request` / `dismiss_request` round-trip from the client then works end-to-end.
     #[tracing::instrument(name = "feedback.force_feedback_request", skip_all, fields(
         session_id = %self.session_id,
     ))]
-    pub async fn force_feedback_request(
+    pub(crate) async fn force_feedback_request(
         &self,
         tier: FeedbackTier,
         mode: FeedbackMode,
     ) -> FeedbackRequest {
         use crate::session::feedback::TriggerSignalSnapshot;
 
-        // Build a synthetic trigger condition that makes it obvious this was
-        // manually triggered for testing purposes.
         let condition = TriggerCondition {
             tier,
             condition: "debug/trigger_feedback (manual test trigger)".to_string(),
@@ -528,8 +600,7 @@ impl FeedbackManager {
             },
         };
 
-        // Manual/debug triggers are always dismissible regardless of tier config,
-        // since they exist for developer testing, not real user feedback collection.
+        // Manual/debug triggers are always dismissible regardless of tier config
         let request = FeedbackRequest::with_mode(
             self.session_id.clone(),
             condition.clone(),
@@ -544,10 +615,7 @@ impl FeedbackManager {
         request
     }
 
-    /// Record a feedback request via the feedback API.
-    ///
-    /// This is a best-effort operation — errors are logged but do not
-    /// prevent the request from being sent to the client.
+    /// This is a best-effort operation: errors are logged but do not prevent the request from being sent to the client.
     #[tracing::instrument(name = "feedback.record_feedback_request", skip_all, fields(
         session_id = %self.session_id,
     ))]
@@ -596,31 +664,16 @@ impl FeedbackManager {
         }
     }
 
-    /// Capture a turn-end snapshot and send the delta to the analytics backend.
-    ///
-    /// Call this once per user turn, after the agent has finished all tool-call
-    /// rounds and produced a final response (i.e. alongside `record_turn_complete`).
-    /// Intermediate tool-call steps within the same turn do NOT need their own
-    /// call — the signals actor accumulates tool calls, errors, and latency
-    /// continuously, so the single snapshot at turn end captures the full diff.
-    ///
-    /// The caller provides a pre-captured `TurnDeltaSnapshot` (taken exactly
-    /// once inside the session actor). This avoids double-advancing the delta
-    /// baseline.  If the snapshot is `None` (e.g. the signals actor was shut
-    /// down), this is a no-op.
-    ///
-    /// The delta is converted and sent asynchronously to the backend. Errors
-    /// are logged but never block the turn flow.
-    ///
-    /// `request_id` is the prompt/request identifier for the turn.
+    /// The signals actor accumulates tool calls, errors, and latency continuously, so the snapshot captures the full diff since the previous turn's.
+    /// The caller provides the `TurnDeltaSnapshot` it took (each take advances the delta baseline), so this never advances it again.
+    /// The POST runs on the turn-delta worker; errors are logged and never block the turn flow.
     #[tracing::instrument(skip_all, fields(session_id = %self.session_id))]
-    pub async fn send_turn_delta_with_snapshot(
+    pub(crate) async fn send_turn_delta_with_snapshot(
         &self,
-        snapshot: Option<TurnDeltaSnapshot>,
+        snapshot: Option<&TurnDeltaSnapshot>,
         request_id: Option<String>,
         turn_duration_ms: Option<i64>,
-        turn_outcome: Option<String>,
-        model_fingerprint: Option<String>,
+        turn_outcome: TurnOutcome,
     ) {
         if !self.config.telemetry_enabled {
             tracing::debug!("Turn delta skipped: telemetry is disabled");
@@ -629,13 +682,16 @@ impl FeedbackManager {
 
         tracing::debug!("Turn delta: sending pre-captured snapshot");
 
-        let Some(client) = &self.feedback_client else {
+        let Some(turn_delta_tx) = &self.turn_delta_tx else {
             tracing::debug!("Turn delta skipped: no feedback client configured");
             return;
         };
 
         let Some(snapshot) = snapshot else {
-            tracing::debug!("Turn delta skipped: no snapshot available (signals actor shut down)");
+            tracing::debug!(
+                ?turn_outcome,
+                "Turn delta skipped: no snapshot (signals actor shut down)"
+            );
             return;
         };
 
@@ -644,7 +700,7 @@ impl FeedbackManager {
             (h.requests_sent(), h.last_request_at())
         };
         let delta = snapshot_to_turn_delta(
-            &snapshot,
+            snapshot,
             self.config.client_type,
             request_id,
             fb_requests_sent,
@@ -652,37 +708,42 @@ impl FeedbackManager {
             self.config.loc_tracking_enabled,
             turn_duration_ms,
             turn_outcome,
-            model_fingerprint,
         );
 
-        let session_id = self.session_id.clone();
-        let client = client.clone();
-        // Fire-and-forget: send in background so we never block the turn.
-        tokio::spawn(async move {
-            let result =
-                with_one_shot_auth_retry(&client, || client.send_turn_delta(&session_id, &delta))
-                    .await;
-            match result {
-                Ok(_) => {
-                    tracing::debug!(
-                        session_id = %session_id,
-                        turn = delta.turn_number,
-                        "Turn delta sent to analytics backend"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        turn = delta.turn_number,
-                        error = %e,
-                        "Failed to send turn delta (non-fatal)"
-                    );
-                }
-            }
-        });
+        let turn = delta.turn_number;
+        if let Err(err) = turn_delta_tx.try_send(TurnDeltaJob::Post(Box::new(delta))) {
+            tracing::warn!(
+                session_id = %self.session_id,
+                turn,
+                capacity = TURN_DELTA_QUEUE_CAPACITY,
+                error = %err,
+                "Turn delta dropped: the post queue is full or its worker is gone"
+            );
+        }
     }
 
-    /// Sync current signals to the analytics backend.
+    /// Wait until every turn delta queued so far has posted, or `deadline` passes.
+    async fn flush_turn_deltas(&self, deadline: tokio::time::Instant) {
+        let Some(turn_delta_tx) = &self.turn_delta_tx else {
+            return;
+        };
+        let (reached, wait) = oneshot::channel();
+        let flushed = tokio::time::timeout_at(deadline, async {
+            turn_delta_tx
+                .send(TurnDeltaJob::Barrier(reached))
+                .await
+                .ok()?;
+            wait.await.ok()
+        })
+        .await;
+        if flushed.is_err() {
+            tracing::warn!(
+                session_id = %self.session_id,
+                "Turn deltas still posting at exit; not waiting for them"
+            );
+        }
+    }
+
     /// Returns Ok(()) if sync succeeded or was skipped (no client).
     pub async fn sync_signals(&self) -> anyhow::Result<()> {
         self.sync_signals_inner(false).await
@@ -690,34 +751,41 @@ impl FeedbackManager {
 
     /// Force-sync current signals to the analytics backend, bypassing the cooldown check.
     /// Used for the final sync on shutdown to ensure no data is lost.
-    pub async fn force_sync_signals(&self) -> anyhow::Result<()> {
+    pub(crate) async fn force_sync_signals(&self) -> anyhow::Result<()> {
         self.sync_signals_inner(true).await
     }
 
-    /// Inner sync implementation with optional cooldown bypass.
+    /// On `force` (the process-exit final sync), skip the HTTP POST when the session has no turns or tool calls, so exit cannot hang on slow egress.
+    /// Periodic sync (`force=false`) still may send empty snapshots.
     async fn sync_signals_inner(&self, force: bool) -> anyhow::Result<()> {
         if !self.config.telemetry_enabled {
             return Ok(());
         }
 
         let Some(client) = &self.feedback_client else {
-            return Ok(()); // No client, skip sync
+            return Ok(());
         };
 
-        // Check if sync is needed (skip cooldown check if forced)
         if !force && !self.signals_handle.check_and_mark_sync().await {
-            return Ok(()); // Not time to sync yet
+            return Ok(());
         }
 
-        // Snapshot GCS upload queue stats into signals before taking the snapshot.
-        // This ensures the sync payload includes the latest queue metrics.
         if let Some(stats) = self.upload_queue_stats.get() {
             self.signals_handle.snapshot_gcs_queue(stats);
         }
 
         let Some(signals) = self.signals_handle.snapshot().await else {
-            return Ok(()); // Actor shut down
+            return Ok(());
         };
+
+        // Empty session at exit: no reportable activity, so skip the analytics POST
+        if force && !signals_are_reportable(&signals) {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "Skipping final signal sync on empty session"
+            );
+            return Ok(());
+        }
 
         let update = signals_to_update(&signals, self.config.client_type);
 
@@ -743,11 +811,7 @@ impl FeedbackManager {
 
     /// Attempt OIDC token refresh after a 401 and retry the signal sync once.
     /// Returns the classified outcome for `handle_auth_outcome` to act on.
-    ///
-    /// Prefers waiting for the proactive-refresh task or main-request-path
-    /// recovery over driving a `ServerRejected` refresh itself.  This
-    /// prevents the signals loop from amplifying 401 bursts at the API
-    /// during token-expiry windows.
+    /// Prefers waiting for the proactive-refresh task or main-request-path recovery over driving a `ServerRejected` refresh itself.
     async fn try_refresh_and_retry_sync(&self) -> SyncAuthOutcome {
         let Some(client) = &self.feedback_client else {
             return SyncAuthOutcome::Unrecoverable;
@@ -755,8 +819,7 @@ impl FeedbackManager {
         if !client.has_token_refresher() {
             return SyncAuthOutcome::Unrecoverable;
         }
-        // 1. Wait briefly for the proactive refresh or main-path recovery
-        //    to land a fresh token before driving our own ServerRejected.
+        // 1. Wait briefly for the proactive refresh or main-path recovery to land a fresh token before driving our own ServerRejected.
         let refreshed = client.wait_for_token_refresh(Duration::from_secs(3)).await;
         // 2. If nobody refreshed, drive our own recovery as fallback.
         if !refreshed && !client.try_refresh_credentials().await {
@@ -765,11 +828,9 @@ impl FeedbackManager {
             }
             return SyncAuthOutcome::Transient;
         }
-        // Retry with fresh token. Any error after a successful refresh
-        // counts as a transient signals-failed-to-land tick: this keeps
-        // the safety net alive on a pathological `401 → refresh OK → 5xx`
-        // flap and on the rare sibling-rotation race where the IdP cache
-        // got re-set between our refresh and our retry.
+        // Any error after a successful refresh counts as a transient tick, so the consecutive-failure cap stays in effect
+        // That covers a pathological flap (401, then refresh OK, then 5xx)
+        // It also covers the rare sibling-rotation race where the IdP cache got re-set between our refresh and our retry
         match self.sync_signals().await {
             Ok(_) => SyncAuthOutcome::Recovered,
             Err(e) if client.is_auth_permanently_failed() => {
@@ -791,12 +852,10 @@ impl FeedbackManager {
         }
     }
 
-    /// Run a background loop that periodically syncs signals.
-    /// Also loads feedback heuristics config on startup.
+    /// Loads feedback heuristics config on startup.
     /// This should be spawned as a background task.
-    #[tracing::instrument(skip_all, fields(session_id = %self.session_id))]
+    #[tracing::instrument(skip_all, parent = None, fields(session_id = %self.session_id))]
     pub async fn run_sync_loop(self: Arc<Self>, cancel: tokio_util::sync::CancellationToken) {
-        // Load config in background (non-blocking, errors logged)
         self.load_config().await;
 
         let mut interval = tokio::time::interval(self.config.sync_interval);
@@ -807,9 +866,9 @@ impl FeedbackManager {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
+                    // Exit paths that need a final sync call `FeedbackManager::shutdown`, which owns the budgeted force-sync and drain
+                    // Cancel alone must not double-POST or hang on a dead analytics endpoint
                     tracing::debug!("Feedback sync loop cancelled");
-                    // Final sync before exiting — force-bypass cooldown to ensure latest signals are persisted
-                    let _ = self.force_sync_signals().await;
                     break;
                 }
                 _ = interval.tick() => {
@@ -856,48 +915,120 @@ impl FeedbackManager {
         }
     }
 
-    /// Shutdown the manager, performing a final sync and draining the upload queue.
-    ///
-    /// This ensures:
-    /// 1. Final signal sync to the analytics backend (bypass cooldown)
-    /// 2. Upload queue is drained (pending uploads complete before exit)
-    /// 3. Signals actor is shut down
-    ///
-    /// The drain uses a configurable timeout (`config.drain_timeout`) to avoid
-    /// hanging indefinitely on stuck uploads. Items not uploaded within the
-    /// timeout are abandoned with a warning log.
-    ///
-    /// The caller passes the upload queue from `SessionHandle` — the
-    /// `FeedbackManager` no longer owns the queue.
-    pub async fn shutdown(&self, queue: Option<&xai_file_utils::queue::UploadQueue>) {
-        // Final sync — force-bypass cooldown
-        let _ = self.force_sync_signals().await;
-
-        // Drain the upload queue to ensure pending uploads complete before exit.
-        // Uses configurable timeout to avoid hanging indefinitely on stuck uploads.
-        if let Some(queue) = queue {
-            let remaining = queue.drain(self.config.drain_timeout).await;
-            if remaining > 0 {
-                let pending_bytes = queue.stats().pending_bytes.load(Ordering::Relaxed);
+    /// Force-sync with [`SHUTDOWN_SIGNAL_SYNC_TIMEOUT`].
+    /// Empty sessions and telemetry-off are no-ops inside [`Self::sync_signals_inner`].
+    async fn bounded_final_sync(&self, deadline: tokio::time::Instant) {
+        match tokio::time::timeout_at(deadline, self.force_sync_signals()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
                 tracing::warn!(
                     session_id = %self.session_id,
-                    remaining,
-                    pending_bytes,
-                    "Upload queue drain incomplete, {} items abandoned ({} bytes pending)",
-                    remaining,
-                    pending_bytes
+                    error = %e,
+                    "Final signal sync failed during exit"
                 );
-            } else {
-                tracing::debug!(
+            }
+            Err(_) => {
+                tracing::warn!(
                     session_id = %self.session_id,
-                    "Upload queue drained successfully"
+                    timeout_ms = SHUTDOWN_SIGNAL_SYNC_TIMEOUT.as_millis() as u64,
+                    "Final signal sync timed out during exit; continuing"
                 );
             }
         }
+    }
 
-        // Shutdown the signals actor
+    /// Shutdown: turn-delta flush and final signal sync (one shared budget), optional upload drain, then signals actor stop.
+    /// For an empty session (no turns or tool calls), `sync_signals_inner(force)` skips the analytics POST; drain is skipped when pending is also 0.
+    /// Non-empty drains use `min(config.drain_timeout, cap)` (default cap 5s, `GROK_SESSION_EXIT_DRAIN_SECS` up to hard max 7s).
+    pub async fn shutdown(&self, queue: Option<&xai_file_utils::queue::UploadQueue>) {
+        let pending = queue
+            .map(|q| q.stats().pending.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        // Snapshot before final sync/shutdown so drain can still see activity after the signals actor is torn down later
+        let reportable = match self.signals_handle.snapshot().await {
+            Some(s) => signals_are_reportable(&s),
+            None => false,
+        };
+
+        // (1) Queued turn deltas (an exit cancel's row is the last one), then the final force-sync,
+        // under one budget so exit stays inside the agent join grace.
+        // The telemetry-off and empty-session checks live in sync_signals_inner.
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_SIGNAL_SYNC_TIMEOUT;
+        self.flush_turn_deltas(deadline).await;
+        self.bounded_final_sync(deadline).await;
+
+        // (2) Drain only when needed: an empty session with zero pending is skipped
+        if let Some(queue) = queue {
+            if pending == 0 && !reportable {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    "Skipping upload drain on empty session with nothing pending"
+                );
+            } else {
+                let budget = if pending == 0 {
+                    SHUTDOWN_EMPTY_DRAIN_TIMEOUT
+                } else {
+                    nonempty_drain_budget(self.config.drain_timeout)
+                };
+                let remaining = queue.drain(budget).await;
+                if remaining > 0 {
+                    let pending_bytes = queue.stats().pending_bytes.load(Ordering::Relaxed);
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        remaining,
+                        pending_bytes,
+                        budget_ms = budget.as_millis() as u64,
+                        "Upload queue drain incomplete, {} items deferred to next-session recovery ({} bytes pending)",
+                        remaining,
+                        pending_bytes
+                    );
+                } else {
+                    tracing::debug!(
+                        session_id = %self.session_id,
+                        "Upload queue drained successfully"
+                    );
+                }
+            }
+        }
+
         self.signals_handle.shutdown();
     }
+}
+
+/// Bound on the final signals POST at process exit.
+/// Prefer a fast exit over waiting out a hung analytics endpoint; session metrics are best-effort.
+pub(crate) const SHUTDOWN_SIGNAL_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Default ceiling on non-empty upload-queue drain at process exit.
+/// Keeps sync and drain under [`crate::agent::activity::SESSION_FLUSH_GRACE`] with residual time for hooks/memory.
+/// Override with `GROK_SESSION_EXIT_DRAIN_SECS` (still hard-capped by [`SHUTDOWN_DRAIN_HARD_MAX`]).
+const SHUTDOWN_DRAIN_CAP: Duration = Duration::from_secs(5);
+
+/// Absolute max non-empty drain at process exit.
+/// The 10s flush grace, less the 2s signal-sync budget and the turn-end queue's two 250ms waits, leaves 7.5s; held at 7s for residual.
+pub(crate) const SHUTDOWN_DRAIN_HARD_MAX: Duration = Duration::from_secs(7);
+
+/// When nothing is pending, only wait this long for the upload worker to exit after the shutdown signal; in practice this takes milliseconds.
+const SHUTDOWN_EMPTY_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Non-empty drain wait: honor config (tests / shorter defaults) but never exceed the process-exit cap.
+/// Fleets on slow networks may raise it with `GROK_SESSION_EXIT_DRAIN_SECS`, up to [`SHUTDOWN_DRAIN_HARD_MAX`].
+/// Raising it does not slow the empty-session fast path.
+fn nonempty_drain_budget(config_timeout: Duration) -> Duration {
+    let cap = std::env::var("GROK_SESSION_EXIT_DRAIN_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(SHUTDOWN_DRAIN_CAP)
+        .min(SHUTDOWN_DRAIN_HARD_MAX)
+        // A zero or garbage env value must not skip the drain entirely
+        .max(Duration::from_secs(1));
+    config_timeout.min(cap)
+}
+
+/// Used to skip the exit force_sync POST and the empty upload drain when a session exits with nothing to report.
+fn signals_are_reportable(s: &crate::session::signals::SessionSignals) -> bool {
+    s.turn_count > 0 || s.tool_call_count > 0
 }
 
 // Auth outcome handler used by run_sync_loop on 401.
@@ -906,8 +1037,8 @@ impl FeedbackManager {
 /// ~10 minutes at the default 60s interval.
 const MAX_CONSECUTIVE_AUTH_FAILURES: u8 = 10;
 
-/// telemetry `reason` discriminators on the `signals sync loop stopped permanently`
-/// event. Pinned because alerts filter on these strings.
+/// Telemetry `reason` discriminators on the `signals sync loop stopped permanently` event.
+/// Pinned because alerts filter on these strings.
 const REASON_AUTH_PERMANENT_FAILURE: &str = "auth_permanent_failure";
 const REASON_NO_CLIENT_OR_REFRESHER: &str = "no_client_or_refresher";
 
@@ -917,15 +1048,15 @@ const LOG_TITLE_STOPPED_PERMANENTLY: &str = "signals sync loop stopped permanent
 /// Classification of one 401-recovery attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SyncAuthOutcome {
-    /// Refresh + retry succeeded.
+    /// Refresh and retry succeeded.
     Recovered,
-    /// Refresh or retry failed transiently (lock timeout, network, sibling
-    /// race, post-refresh 5xx). Increment the counter and retry next tick.
+    /// Refresh or retry failed transiently (lock timeout, network, sibling race, post-refresh 5xx).
+    /// Increment the counter and retry next tick.
     Transient,
     /// IdP confirmed a terminal failure (`invalid_grant` / `invalid_client`).
     /// Only re-login will recover.
     Permanent,
-    /// No client or no refresher configured — nothing to retry.
+    /// No client or no refresher configured, so nothing to retry.
     Unrecoverable,
 }
 
@@ -1008,9 +1139,7 @@ fn handle_auth_outcome(
 }
 
 /// Check if an error is an HTTP 401 Unauthorized response.
-///
-/// Uses typed downcast on [`FeedbackApiError`] instead of string matching,
-/// so it stays correct even if error messages change.
+/// Uses typed downcast on [`FeedbackApiError`] instead of string matching, so it stays correct even if error messages change.
 fn is_auth_error(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<FeedbackApiError>()
@@ -1018,20 +1147,16 @@ fn is_auth_error(error: &anyhow::Error) -> bool {
 }
 
 /// Check if an error is an HTTP 403 Forbidden response.
-///
-/// 403 from the signals endpoint means the session does not belong to the
-/// current user — a permanent condition that will never self-resolve.
+/// 403 from the signals endpoint means the session does not belong to the current user, a permanent condition that will never self-resolve.
 fn is_forbidden_error(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<FeedbackApiError>()
         .is_some_and(|e| e.is_forbidden())
 }
 
-/// Run `op` once; on 401, wait for an in-flight refresh to land, then
-/// retry once.  Prefers waiting for the proactive-refresh task or
-/// main-request-path recovery over driving a `ServerRejected` refresh
-/// itself, avoiding the 401-amplification pattern during token-expiry
-/// windows.
+/// Run `op` once; on 401, wait for an in-flight refresh to land, then retry once.
+/// Prefers waiting for the proactive-refresh task or main-request-path recovery over driving a `ServerRejected` refresh itself.
+/// That avoids amplifying 401 bursts during token-expiry windows.
 async fn with_one_shot_auth_retry<T, F, Fut>(
     client: &FeedbackClient,
     mut op: F,
@@ -1043,8 +1168,7 @@ where
     match op().await {
         Ok(v) => Ok(v),
         Err(e) if is_auth_error(&e) => {
-            // 1. Wait briefly for the proactive refresh or main-path
-            //    recovery to land a fresh token.
+            // 1. Wait briefly for the proactive refresh or main-path recovery to land a fresh token.
             let refreshed = client.wait_for_token_refresh(Duration::from_secs(3)).await;
             // 2. If nobody refreshed, drive our own recovery as fallback.
             if refreshed || client.try_refresh_credentials().await {
@@ -1057,7 +1181,7 @@ where
     }
 }
 
-/// Convert a FeedbackTier to a priority value (1-10, higher = more important).
+/// Convert a FeedbackTier to a priority value (1-10, higher is more important).
 fn tier_to_priority(tier: crate::session::feedback::FeedbackTier) -> i32 {
     use crate::session::feedback::FeedbackTier;
     match tier {
@@ -1067,6 +1191,7 @@ fn tier_to_priority(tier: crate::session::feedback::FeedbackTier) -> i32 {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // test clients hit localhost mocks
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1096,8 +1221,7 @@ mod tests {
         assert_eq!(snapshot.tool_call_count, 5);
         assert_eq!(snapshot.compaction_count, 2);
 
-        // Evaluate heuristics - should trigger Tier 1
-        let eval = manager.evaluate_heuristics().await.unwrap();
+        let eval = manager.heuristics.write().await.evaluate(&snapshot);
         assert!(eval.trigger_condition.is_some());
         assert_eq!(
             eval.trigger_condition.as_ref().unwrap().tier,
@@ -1173,8 +1297,7 @@ mod tests {
     #[test]
     fn test_is_auth_error_works_through_anyhow_conversion() {
         use crate::agent::feedback_client::FeedbackApiError;
-        // Verify the FeedbackApiError survives anyhow::Error round-trip
-        // (this is the actual path: send_json returns FeedbackApiError.into())
+        // Verify the FeedbackApiError survives anyhow::Error round-trip (this is the actual path: send_json returns FeedbackApiError.into())
         let api_err = FeedbackApiError {
             status: reqwest::StatusCode::UNAUTHORIZED,
             context: "Signals update",
@@ -1207,14 +1330,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_shutdown_without_upload_queue_completes() {
-        // Verify that shutdown() completes successfully when no upload queue is set.
         // This tests the None path in the drain logic.
         let manager = FeedbackManager::local_only("test-session-no-queue");
 
-        // Shutdown should complete without errors even without an upload queue
         manager.shutdown(None).await;
 
-        // Verify signals actor was shut down (snapshot returns None after shutdown)
         let snapshot = manager.signals_handle().snapshot().await;
         assert!(snapshot.is_none(), "Signals actor should be shut down");
     }
@@ -1225,7 +1345,6 @@ mod tests {
         use std::sync::Arc;
         use xai_file_utils::queue::{TraceExportSource, UploadQueue, UploadRetryPolicy};
 
-        // Create a mock resolver for the queue
         struct MockResolver;
         impl TraceExportSource for MockResolver {
             fn resolve(&self) -> TraceExportConfig {
@@ -1252,33 +1371,433 @@ mod tests {
 
         let manager = FeedbackManager::local_only("test-session-with-queue");
 
-        // Shutdown should complete and drain the queue
         manager.shutdown(Some(&queue)).await;
 
-        // Verify signals actor was shut down
         let snapshot = manager.signals_handle().snapshot().await;
         assert!(snapshot.is_none(), "Signals actor should be shut down");
     }
 
+    /// Exit budgets must stay under the agent join grace so hung telemetry cannot push past `SESSION_FLUSH_GRACE` again.
+    #[test]
+    #[serial_test::serial]
+    fn test_shutdown_budgets_fit_under_session_flush_grace() {
+        use crate::agent::activity::SESSION_FLUSH_GRACE;
+        // `nonempty_drain_budget` reads env; pin default regardless of CI presets.
+        let _unset = xai_grok_test_support::env::EnvGuard::unset("GROK_SESSION_EXIT_DRAIN_SECS");
+        assert!(
+            SHUTDOWN_SIGNAL_SYNC_TIMEOUT + SHUTDOWN_DRAIN_HARD_MAX <= SESSION_FLUSH_GRACE,
+            "sync + hard-max drain must fit under flush grace"
+        );
+        assert!(
+            SHUTDOWN_SIGNAL_SYNC_TIMEOUT + SHUTDOWN_DRAIN_CAP < SESSION_FLUSH_GRACE,
+            "sync + default drain cap must leave residual grace for hooks/memory"
+        );
+        assert!(
+            SHUTDOWN_EMPTY_DRAIN_TIMEOUT < SHUTDOWN_DRAIN_CAP,
+            "empty drain must be strictly shorter than the non-empty cap"
+        );
+        assert_eq!(
+            nonempty_drain_budget(Duration::from_secs(30)),
+            SHUTDOWN_DRAIN_CAP,
+            "default config 30s must clamp to the process-exit cap"
+        );
+        assert_eq!(
+            nonempty_drain_budget(Duration::from_secs(2)),
+            Duration::from_secs(2),
+            "config shorter than the cap must be honored"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_nonempty_drain_budget_env_raises_cap() {
+        {
+            let _guard =
+                xai_grok_test_support::env::EnvGuard::set("GROK_SESSION_EXIT_DRAIN_SECS", "7");
+            assert_eq!(
+                nonempty_drain_budget(Duration::from_secs(30)),
+                Duration::from_secs(7),
+                "env may raise the cap for slow networks"
+            );
+        }
+        {
+            let _guard =
+                xai_grok_test_support::env::EnvGuard::set("GROK_SESSION_EXIT_DRAIN_SECS", "99");
+            assert_eq!(
+                nonempty_drain_budget(Duration::from_secs(30)),
+                SHUTDOWN_DRAIN_HARD_MAX,
+                "env must not exceed the hard max under flush grace"
+            );
+        }
+    }
+
+    /// Sync-loop cancel must return promptly once the loop is idle in `select!`.
+    /// Final force-sync is owned by `shutdown` only (cancel does not re-POST).
+    /// Uses a closed-port base URL so the immediate first tick's sync fails fast and parks on the long interval.
     #[tokio::test]
-    async fn test_drain_timeout_is_configurable() {
-        // Verify that drain_timeout can be customized via config
+    async fn test_sync_loop_cancel_returns_without_force_sync() {
+        use crate::agent::feedback_client::FeedbackClient;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .connect_timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        // Nothing listening, so the first periodic sync errors quickly
+        let client = FeedbackClient::with_client(http, "http://127.0.0.1:1", None);
         let config = FeedbackManagerConfig {
-            drain_timeout: Duration::from_secs(5), // Custom timeout
+            telemetry_enabled: true,
+            sync_interval: Duration::from_secs(3600),
             ..Default::default()
         };
-        let manager = FeedbackManager::new("test-session-custom-timeout", None, config.clone());
+        let manager = Arc::new(FeedbackManager::new(
+            "test-cancel-no-sync",
+            Some(client),
+            config,
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let loop_handle = tokio::spawn(manager.clone().run_sync_loop(cancel.clone()));
+        // First tick and failed sync, then idle waiting on the long interval
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let started = Instant::now();
+        cancel.cancel();
+        loop_handle.await.expect("sync loop join");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancel must not wait out a force-sync budget, got {elapsed:?}"
+        );
+    }
 
-        // Verify config was stored
-        assert_eq!(manager.config.drain_timeout, Duration::from_secs(5));
+    /// Helper: TCP accept that never answers (slow egress / hung analytics).
+    async fn blackhole_http_addr() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                    drop(stream);
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// An empty session (no turns or tool calls) must not wait on a hung analytics endpoint at exit; the final force_sync is skipped entirely.
+    #[tokio::test]
+    async fn test_shutdown_empty_session_skips_force_sync_on_slow_egress() {
+        use crate::agent::feedback_client::FeedbackClient;
+        use std::time::Instant;
+
+        let base = blackhole_http_addr().await;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("reqwest client");
+        let client = FeedbackClient::with_client(http, base, None);
+        let config = FeedbackManagerConfig {
+            telemetry_enabled: true,
+            ..Default::default()
+        };
+        let manager = FeedbackManager::new("test-empty-skip-sync", Some(client), config);
+        // No increment_turn / record_tool_call, so the session is empty
+
+        let started = Instant::now();
+        manager.shutdown(None).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "empty session must skip force_sync and return immediately, got {elapsed:?}"
+        );
+    }
+
+    /// Telemetry off: never hit the network on exit even with turns recorded.
+    #[tokio::test]
+    async fn test_shutdown_telemetry_off_skips_force_sync() {
+        use crate::agent::feedback_client::FeedbackClient;
+        use std::time::Instant;
+
+        let base = blackhole_http_addr().await;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("reqwest client");
+        let client = FeedbackClient::with_client(http, base, None);
+        let config = FeedbackManagerConfig {
+            telemetry_enabled: false,
+            ..Default::default()
+        };
+        let manager = FeedbackManager::new("test-telemetry-off", Some(client), config);
+        manager.signals_handle().increment_turn();
+
+        let started = Instant::now();
+        manager.shutdown(None).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "telemetry-off shutdown must not wait on the network, got {elapsed:?}"
+        );
+    }
+
+    /// A hung analytics endpoint must not hold process exit for the full HTTP client timeout when the session *does* have reportable activity.
+    /// `shutdown` wraps the final force-sync in `SHUTDOWN_SIGNAL_SYNC_TIMEOUT` (2s).
+    #[tokio::test]
+    async fn test_shutdown_force_sync_is_timeout_capped() {
+        use crate::agent::feedback_client::FeedbackClient;
+        use std::time::Instant;
+
+        let base = blackhole_http_addr().await;
+        let http = reqwest::Client::builder()
+            // Deliberately longer than the shutdown budget so the outer timeout is what fires, not the client's
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("reqwest client");
+        let client = FeedbackClient::with_client(http, base, None);
+        let config = FeedbackManagerConfig {
+            telemetry_enabled: true,
+            ..Default::default()
+        };
+        let manager = FeedbackManager::new("test-session-hung-sync", Some(client), config);
+        // Non-empty session so force_sync is not skipped.
+        manager.signals_handle().increment_turn();
+
+        let started = Instant::now();
+        manager.shutdown(None).await;
+        let elapsed = started.elapsed();
+        // Outer budget is 2s; allow generous slack for slow CI hosts, but never approach the 60s client timeout
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown must return within the signal-sync budget + slack on a hung signals POST, got {elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(1500),
+            "expected to wait most of the force_sync budget when reportable, got {elapsed:?}"
+        );
+    }
+
+    /// Turn deltas post from one worker in send order, and `shutdown` waits for the ones still
+    /// queued, so an exit cancel's row reaches the backend after the rows before it.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // test client hits a localhost mock
+    async fn test_turn_deltas_post_in_order_and_shutdown_drains_them() {
+        use crate::agent::feedback_client::FeedbackClient;
+        use axum::{Json, Router, routing::post};
+
+        // Every POST is held briefly, so the deltas are all still queued when shutdown starts.
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<i64>();
+        let router = Router::new().route(
+            "/v1/sessions/{id}/turn-deltas",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let seen_tx = seen_tx.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let _ = seen_tx.send(body["turnNumber"].as_i64().unwrap_or(-1));
+                    Json(serde_json::json!({
+                        "sessionId": "test-fifo",
+                        "turnNumber": 0,
+                        "recordedAt": chrono::Utc::now(),
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client =
+            FeedbackClient::with_client(reqwest::Client::new(), format!("http://{addr}/v1"), None);
+        let config = FeedbackManagerConfig {
+            telemetry_enabled: true,
+            ..Default::default()
+        };
+        let manager = FeedbackManager::new("test-fifo", Some(client), config);
+        let signals = manager.signals_handle();
+        for _ in 1..=5 {
+            signals.increment_turn();
+            let snapshot = signals
+                .take_turn_end_snapshot()
+                .await
+                .expect("signals actor up");
+            manager
+                .send_turn_delta_with_snapshot(
+                    Some(&snapshot),
+                    None,
+                    Some(1),
+                    TurnOutcome::Cancelled,
+                )
+                .await;
+        }
 
         manager.shutdown(None).await;
+
+        let mut seen = Vec::new();
+        while let Ok(turn) = seen_rx.try_recv() {
+            seen.push(turn);
+        }
+        assert_eq!(
+            seen,
+            vec![1, 2, 3, 4, 5],
+            "every queued delta posted, in order"
+        );
+    }
+
+    /// Empty upload queue uses the short worker-exit budget.
+    #[tokio::test]
+    async fn test_shutdown_empty_queue_uses_short_drain_budget() {
+        use crate::session::repo_changes::{TraceExportConfig, UploadMethod};
+        use std::sync::Arc;
+        use std::time::Instant;
+        use xai_file_utils::queue::{TraceExportSource, UploadQueue, UploadRetryPolicy};
+
+        struct MockResolver;
+        impl TraceExportSource for MockResolver {
+            fn resolve(&self) -> TraceExportConfig {
+                TraceExportConfig {
+                    bucket_url: Some("gs://test-bucket".to_string()),
+                    service_account_key: None,
+                    upload_method: UploadMethod::Direct {
+                        service_account_key: None,
+                    },
+                    prefix_dir: None,
+                    gcs_prefix: None,
+                    absolute_paths: false,
+                    archive_name_override: None,
+                }
+            }
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let queue = UploadQueue::spawn(
+            temp.path(),
+            Arc::new(MockResolver),
+            UploadRetryPolicy::default(),
+        );
+        let manager = FeedbackManager::local_only("test-session-empty-drain");
+
+        let started = Instant::now();
+        manager.shutdown(Some(&queue)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "empty-queue shutdown must finish well under the non-empty budget, got {elapsed:?}"
+        );
+    }
+
+    /// Non-empty queue drain is clamped to the process-exit cap (default 5s), not left open-ended at the 30s config default.
+    /// Abandoned durable-pair items stay on disk for next-session orphan recovery.
+    #[tokio::test]
+    async fn test_shutdown_nonempty_queue_clamps_drain_and_leaves_durable_pair() {
+        use crate::session::repo_changes::{TraceExportConfig, UploadMethod};
+        use axum::{Router, body::Body, http::StatusCode, response::IntoResponse, routing::post};
+        use std::sync::Arc;
+        use std::time::Instant;
+        use xai_file_utils::queue::{TraceExportSource, UploadQueue, UploadRetryPolicy};
+
+        async fn slow_handler(_body: Body) -> impl IntoResponse {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            (StatusCode::OK, "ok")
+        }
+
+        let app = Router::new().route("/v1/storage", post(slow_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        struct SlowProxyResolver {
+            base: String,
+        }
+        impl TraceExportSource for SlowProxyResolver {
+            fn resolve(&self) -> TraceExportConfig {
+                TraceExportConfig {
+                    bucket_url: Some("gs://test-bucket".to_string()),
+                    service_account_key: None,
+                    upload_method: UploadMethod::Proxy {
+                        proxy_base_url: self.base.clone(),
+                        user_token: "test-token".to_string(),
+                        deployment_key: None,
+                        alpha_test_key: None,
+                    },
+                    prefix_dir: None,
+                    gcs_prefix: None,
+                    absolute_paths: false,
+                    archive_name_override: None,
+                }
+            }
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let policy = UploadRetryPolicy {
+            max_attempts: 1,
+            ..Default::default()
+        };
+        let queue = UploadQueue::spawn_with_concurrency(
+            temp.path(),
+            Arc::new(SlowProxyResolver {
+                base: format!("http://{addr}/v1"),
+            }),
+            policy,
+            1,
+        );
+        queue
+            .enqueue(
+                b"payload",
+                "session/turn_0/slow.json",
+                "application/json",
+                "slow",
+                "sess-shutdown-clamp",
+                0,
+            )
+            .await
+            .expect("enqueue");
+        // Let the worker pick up the item so drain waits on a stuck upload.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            queue.stats().pending.load(Ordering::Relaxed) > 0,
+            "item must still be pending against the slow handler"
+        );
+
+        let manager = FeedbackManager::local_only("test-session-nonempty-drain");
+        let started = Instant::now();
+        manager.shutdown(Some(&queue)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "non-empty drain must clamp near 5s (+slack), got {elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "expected to wait most of the non-empty budget, got {elapsed:?}"
+        );
+
+        let queue_dir = temp.path().join("upload_queue");
+        let leftover: Vec<_> = std::fs::read_dir(&queue_dir)
+            .expect("queue dir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            !leftover.is_empty(),
+            "abandoned durable-pair artifacts must remain for startup recovery"
+        );
     }
 
     // ── handle_auth_outcome tests ──────────────────────────────────────────
 
-    /// 9 transient failures must NOT break, and a subsequent `Recovered`
-    /// must reset the counter to 0.
+    /// 9 transient failures must NOT break, and a subsequent `Recovered` must reset the counter to 0.
     #[test]
     fn test_sync_loop_continues_through_transient_auth_failures() {
         let mut counter: u8 = 0;
@@ -1292,8 +1811,7 @@ mod tests {
         assert_eq!(counter, 0, "Recovered must reset the counter");
     }
 
-    /// Exactly `MAX_CONSECUTIVE_AUTH_FAILURES` consecutive `Transient`
-    /// outcomes break the loop.
+    /// Exactly `MAX_CONSECUTIVE_AUTH_FAILURES` consecutive `Transient` outcomes break the loop.
     #[test]
     fn test_sync_loop_breaks_after_max_transient_auth_failures() {
         let mut counter: u8 = 0;
@@ -1305,7 +1823,7 @@ mod tests {
                 "iteration {i} should still continue"
             );
         }
-        // The 10th (== MAX_CONSECUTIVE_AUTH_FAILURES) transient breaks.
+        // The 10th transient outcome reaches MAX_CONSECUTIVE_AUTH_FAILURES and breaks
         let flow = handle_auth_outcome(SyncAuthOutcome::Transient, &mut counter, "s");
         assert_eq!(flow, ControlFlow::Break(()));
         assert_eq!(counter, MAX_CONSECUTIVE_AUTH_FAILURES);
@@ -1320,7 +1838,7 @@ mod tests {
         assert_eq!(counter, 0);
     }
 
-    /// 5 transient → 1 recovered → 5 transient must not break.
+    /// 5 transient, then 1 recovered, then 5 more transient must not break.
     #[test]
     fn test_sync_loop_counter_resets_on_successful_sync() {
         let mut counter: u8 = 0;
@@ -1354,15 +1872,14 @@ mod tests {
         assert_eq!(counter, 0);
     }
 
-    /// `FeedbackClient::is_auth_permanently_failed` reflects the attached
-    /// `AuthManager`'s `permanent_failure()` cache (record → true,
-    /// age-out → false).
+    /// `FeedbackClient::is_auth_permanently_failed` reflects the attached `AuthManager`'s `permanent_failure()` cache.
+    /// Recording a failure makes it true; the verdict aging out makes it false.
     #[tokio::test]
     async fn test_is_auth_permanently_failed_reads_auth_manager() {
         use crate::agent::feedback_client::FeedbackClient;
-        use crate::auth::error::RefreshTokenFailedReason;
-        use crate::auth::{AuthManager, GrokAuth, GrokComConfig};
         use std::sync::Arc;
+        use xai_grok_login::error::RefreshTokenFailedReason;
+        use xai_grok_login::{AuthManager, GrokAuth, GrokComConfig};
 
         let dir = tempfile::tempdir().unwrap();
         let am = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
@@ -1375,8 +1892,7 @@ mod tests {
             key: "tok".into(),
             ..GrokAuth::test_default()
         });
-        // Use a non-sticky reason: only recoverable verdicts age out (a sticky
-        // `RefreshTokenRejected` never expires), and this exercises the TTL path.
+        // Use a non-sticky reason: only recoverable verdicts age out (a sticky `RefreshTokenRejected` never expires), which exercises the TTL path
         am.record_permanent_failure("tok".to_string(), RefreshTokenFailedReason::Other.into());
         assert!(client.is_auth_permanently_failed());
 
@@ -1384,7 +1900,6 @@ mod tests {
         assert!(!client.is_auth_permanently_failed());
     }
 
-    /// With no `AuthManager` attached, `is_auth_permanently_failed` is false.
     #[test]
     fn test_is_auth_permanently_failed_without_auth_manager() {
         use crate::agent::feedback_client::FeedbackClient;
@@ -1392,23 +1907,22 @@ mod tests {
         assert!(!client.is_auth_permanently_failed());
     }
 
-    /// `has_token_refresher` requires BOTH an `AuthManager` AND a refresher
-    /// wired in. Without this, a static-deployment-key session would be
-    /// mis-classified as recoverable.
+    /// `has_token_refresher` requires BOTH an `AuthManager` AND a refresher wired in.
+    /// Otherwise a static-deployment-key session would be mis-classified as recoverable.
     #[tokio::test]
     async fn test_has_token_refresher_requires_refresher_attached() {
         use crate::agent::feedback_client::FeedbackClient;
-        use crate::auth::{AuthManager, GrokComConfig};
         use std::sync::Arc;
+        use xai_grok_login::{AuthManager, GrokComConfig};
 
         struct NoOpRefresher;
         #[async_trait::async_trait]
-        impl crate::auth::refresh::TokenRefresher for NoOpRefresher {
+        impl xai_grok_login::refresh::TokenRefresher for NoOpRefresher {
             async fn refresh(
                 &self,
-                _reason: crate::auth::refresh::RefreshReason,
-            ) -> crate::auth::refresh::RefreshOutcome {
-                crate::auth::refresh::RefreshOutcome::TransientFailure {
+                _reason: xai_grok_login::refresh::RefreshReason,
+            ) -> xai_grok_login::refresh::RefreshOutcome {
+                xai_grok_login::refresh::RefreshOutcome::TransientFailure {
                     message: "noop".into(),
                 }
             }
@@ -1428,5 +1942,323 @@ mod tests {
 
         am.set_refresher(std::sync::Arc::new(NoOpRefresher));
         assert!(with_am.has_token_refresher());
+    }
+
+    /// Outcome × envelope matrix: existing props keep their names, `outcome` is always present,
+    /// and `source`/taxonomy ride only when the envelope is present.
+    #[test]
+    fn user_feedback_event_matrix() {
+        let envelope = serde_json::json!({
+            "structured_feedback": {
+                "schema_version": 1,
+                "source": "draft",
+                "type": "bug",
+                "task_category": "debug",
+                "failure_mode": "sloppy_code",
+            }
+        });
+        let outcomes = [
+            (SubmitOutcome::Submitted, "submitted"),
+            (SubmitOutcome::LocalOnly, "local_only"),
+            (SubmitOutcome::Failed(anyhow::anyhow!("offline")), "failed"),
+        ];
+        for (outcome, wire) in &outcomes {
+            for enveloped in [false, true] {
+                let mut expected = serde_json::json!({
+                    "session_id": "sess-1",
+                    "has_feedback_text": true,
+                    "model_id": "grok-4",
+                    "is_solicited": false,
+                    "outcome": wire,
+                });
+                if enveloped {
+                    expected.as_object_mut().unwrap().extend([
+                        ("source".to_owned(), "draft".into()),
+                        ("feedback_type".to_owned(), "bug".into()),
+                        ("task_category".to_owned(), "debug".into()),
+                        ("failure_mode".to_owned(), "sloppy_code".into()),
+                    ]);
+                }
+                let mut submission = new_submission(
+                    "sess-1".to_owned(),
+                    ClientType::Tui,
+                    FeedbackContent::Text("great session".to_owned()),
+                );
+                submission.model_id = Some("grok-4".to_owned());
+                submission.metadata = enveloped.then(|| envelope.clone());
+                assert_eq!(
+                    serde_json::to_value(user_feedback_event(&submission, outcome, false)).unwrap(),
+                    expected,
+                    "{wire} enveloped={enveloped}"
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::disallowed_methods)] // test clients hit localhost mocks
+#[cfg(test)]
+mod author_identity_tests {
+    use super::*;
+    use crate::util::user_identity::ResolvedUserIdentity;
+    use axum::{Router, routing::post};
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+
+    /// Mock feedback backend: capture the POST /v1/feedback JSON body.
+    async fn start_capture_server() -> (
+        SocketAddr,
+        Arc<parking_lot::Mutex<Option<serde_json::Value>>>,
+    ) {
+        let captured = Arc::new(parking_lot::Mutex::new(None::<serde_json::Value>));
+        let captured_for_handler = captured.clone();
+        let router = Router::new().route(
+            "/v1/feedback",
+            post(move |body: axum::Json<serde_json::Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    *captured.lock() = Some(body.0);
+                    axum::Json(serde_json::json!({
+                        "feedbackId": "fb-1",
+                        "createdAt": chrono::Utc::now(),
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (addr, captured)
+    }
+
+    fn text_submission() -> FeedbackSubmission {
+        let mut s = new_submission(
+            "sess-1".to_string(),
+            ClientType::Tui,
+            FeedbackContent::Text("great session".to_string()),
+        );
+        s.model_id = Some("grok-4".to_string());
+        s
+    }
+
+    /// End-to-end: an env var (as a device-management launcher would inject) referenced by `[feedback.user]` with `$VAR` is expanded at config load.
+    /// The identity is then resolved, carried on the feedback POST alongside the rest of the submission, and retained on the local entry.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn env_var_identity_reaches_the_wire_end_to_end() {
+        let _email =
+            xai_grok_test_support::env::EnvGuard::set("GROK_TEST_WORK_EMAIL", "ada@corp.example");
+        let _name =
+            xai_grok_test_support::env::EnvGuard::set("GROK_TEST_WORK_NAME", "Ada Lovelace");
+
+        // The loader expands `$VAR` at load, exactly as a trusted config tier ships it.
+        let mut value = toml::from_str::<toml::Value>(
+            r#"
+[feedback.user]
+name = ["$GROK_TEST_WORK_NAME"]
+email = ["$GROK_TEST_WORK_EMAIL"]
+"#,
+        )
+        .unwrap();
+        crate::config::expand_env_vars_in_toml(&mut value);
+        let cfg = crate::agent::config::Config::new_from_toml_cfg(&value).unwrap();
+        let user = cfg.feedback.user.expect("[feedback.user] present");
+
+        // Resolve through the real production entry point.
+        let identity = crate::util::user_identity::cached_identity(Some(&user))
+            .await
+            .expect("identity resolved");
+        assert_eq!(identity.name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(identity.email.as_deref(), Some("ada@corp.example"));
+
+        let (addr, captured) = start_capture_server().await;
+        let client = crate::agent::feedback_client::FeedbackClient::with_client(
+            reqwest::Client::new(),
+            format!("http://{addr}/v1"),
+            Some("tok".into()),
+        );
+        let mut submission = text_submission();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = submit_feedback_workflow(
+            &mut submission,
+            Some(&client),
+            Some(&tx),
+            SubmitFeedbackOptions {
+                solicited: false,
+                telemetry_enabled: false,
+                author_identity: Some(identity),
+            },
+        )
+        .await;
+        assert!(matches!(outcome, SubmitOutcome::Submitted));
+
+        // Author identity rides on the same submission as the rest of the feedback; nothing is stripped here
+        let body = captured.lock().clone().expect("server saw the POST");
+        assert_eq!(body["authorName"], "Ada Lovelace");
+        assert_eq!(body["authorEmail"], "ada@corp.example");
+        assert_eq!(body["modelId"], "grok-4");
+        assert_eq!(body["feedbackText"], "great session");
+
+        // The local entry keeps the author fields and the full context.
+        let msg = rx.try_recv().expect("persistence entry was sent");
+        let PersistenceMsg::Feedback(LocalFeedbackEntry::UserFeedback(entry)) = msg else {
+            panic!("expected a feedback persistence entry");
+        };
+        let persisted = entry.submission.expect("submission persisted");
+        assert_eq!(persisted.author_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(persisted.author_email.as_deref(), Some("ada@corp.example"));
+        assert_eq!(persisted.model_id.as_deref(), Some("grok-4"));
+    }
+
+    /// `GROK_USER_METADATA` is merged into the submission and travels with it: onto the wire body for triage and onto the local feedback.jsonl entry.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn workflow_merges_user_metadata_into_submission() {
+        let _guard = xai_grok_test_support::env::EnvGuard::set(
+            "GROK_USER_METADATA",
+            r#"{"team": "platform-tools"}"#,
+        );
+        let (addr, captured) = start_capture_server().await;
+        let client = crate::agent::feedback_client::FeedbackClient::with_client(
+            reqwest::Client::new(),
+            format!("http://{addr}/v1"),
+            Some("tok".into()),
+        );
+        let mut submission = text_submission();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = submit_feedback_workflow(
+            &mut submission,
+            Some(&client),
+            Some(&tx),
+            SubmitFeedbackOptions {
+                solicited: false,
+                telemetry_enabled: false,
+                author_identity: None,
+            },
+        )
+        .await;
+        assert!(matches!(outcome, SubmitOutcome::Submitted));
+
+        let body = captured.lock().clone().expect("server saw the POST");
+        assert_eq!(body["metadata"]["team"], "platform-tools");
+
+        let msg = rx.try_recv().expect("persistence entry was sent");
+        let PersistenceMsg::Feedback(LocalFeedbackEntry::UserFeedback(entry)) = msg else {
+            panic!("expected a feedback persistence entry");
+        };
+        let persisted = entry.submission.expect("submission persisted");
+        assert_eq!(
+            persisted.metadata.expect("metadata merged before persist")["team"],
+            "platform-tools"
+        );
+    }
+
+    /// `metadata.structured_feedback` is the client's typed envelope: the later-wins env merge
+    /// must neither replace it nor invent it, while other env keys keep merging.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn workflow_env_metadata_cannot_touch_structured_feedback() {
+        let _guard = xai_grok_test_support::env::EnvGuard::set(
+            "GROK_USER_METADATA",
+            r#"{"team": "platform-tools", "structured_feedback": {"type": "forged"}}"#,
+        );
+        let (addr, captured) = start_capture_server().await;
+        let client = crate::agent::feedback_client::FeedbackClient::with_client(
+            reqwest::Client::new(),
+            format!("http://{addr}/v1"),
+            Some("tok".into()),
+        );
+        let envelope = serde_json::json!({
+            "schema_version": 1,
+            "source": "write",
+            "type": "bug",
+        });
+        let mut submission = text_submission();
+        submission.metadata = Some(serde_json::json!({ "structured_feedback": envelope.clone() }));
+
+        let outcome = submit_feedback_workflow(
+            &mut submission,
+            Some(&client),
+            None,
+            SubmitFeedbackOptions {
+                solicited: false,
+                telemetry_enabled: false,
+                author_identity: None,
+            },
+        )
+        .await;
+        assert!(matches!(outcome, SubmitOutcome::Submitted));
+
+        let body = captured.lock().clone().expect("server saw the POST");
+        assert_eq!(body["metadata"]["structured_feedback"], envelope);
+        assert_eq!(body["metadata"]["team"], "platform-tools");
+
+        // A report without the envelope must not grow one from the environment either.
+        *captured.lock() = None;
+        let mut submission = text_submission();
+        let outcome = submit_feedback_workflow(
+            &mut submission,
+            Some(&client),
+            None,
+            SubmitFeedbackOptions {
+                solicited: false,
+                telemetry_enabled: false,
+                author_identity: None,
+            },
+        )
+        .await;
+        assert!(matches!(outcome, SubmitOutcome::Submitted));
+        let body = captured.lock().clone().expect("server saw the POST");
+        assert!(body["metadata"].get("structured_feedback").is_none());
+        assert_eq!(body["metadata"]["team"], "platform-tools");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn workflow_without_identity_omits_author_fields() {
+        let (addr, captured) = start_capture_server().await;
+        let client = crate::agent::feedback_client::FeedbackClient::with_client(
+            reqwest::Client::new(),
+            format!("http://{addr}/v1"),
+            Some("tok".into()),
+        );
+
+        // Both no opt-in and an unresolved opt-in must leave the author keys out of the body and the local entry
+        for (case, author_identity) in [
+            ("no opt-in", None),
+            ("unresolved", Some(ResolvedUserIdentity::default())),
+        ] {
+            // Reset so this case can't pass on the previous case's body.
+            *captured.lock() = None;
+            let mut submission = text_submission();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let outcome = submit_feedback_workflow(
+                &mut submission,
+                Some(&client),
+                Some(&tx),
+                SubmitFeedbackOptions {
+                    solicited: false,
+                    telemetry_enabled: false,
+                    author_identity,
+                },
+            )
+            .await;
+            assert!(matches!(outcome, SubmitOutcome::Submitted), "{case}");
+
+            let body = captured.lock().clone().expect("server saw the POST");
+            assert!(body.get("authorName").is_none(), "{case}: {body}");
+            assert!(body.get("authorEmail").is_none(), "{case}: {body}");
+
+            let msg = rx.try_recv().expect("persistence entry was sent");
+            let PersistenceMsg::Feedback(LocalFeedbackEntry::UserFeedback(entry)) = msg else {
+                panic!("expected a feedback persistence entry");
+            };
+            let persisted = entry.submission.expect("submission persisted");
+            assert_eq!(persisted.author_name, None, "{case}");
+            assert_eq!(persisted.author_email, None, "{case}");
+        }
     }
 }

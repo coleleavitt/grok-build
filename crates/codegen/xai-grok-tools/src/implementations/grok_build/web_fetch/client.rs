@@ -67,12 +67,9 @@ impl WebFetchClient {
         })
     }
 
-    /// Fetch a URL and return its content as markdown.
-    ///
-    /// Handles: validation, HTTPS upgrade, SSRF check, HTTP fetch with
-    /// same-host redirects, HTML-to-markdown conversion, truncation, and
-    /// caching. On transport errors, the HTTP client is invalidated so
-    /// the next call gets a fresh connection pool (see [`HttpClient`]).
+    /// Fetch a URL and return its content as markdown. Handles: validation, HTTPS upgrade, SSRF check, HTTP fetch with
+    /// same-host redirects, HTML-to-markdown conversion, truncation, and caching. On transport errors, the HTTP client is
+    /// invalidated so the next call gets a fresh connection pool (see [`HttpClient`]).
     pub async fn fetch(
         &self,
         raw_url: &str,
@@ -94,12 +91,20 @@ impl WebFetchClient {
             }
         }
 
-        // SSRF check.
-        ssrf::check_ssrf(&url).await?;
+        // SSRF check (policy from tool params — not process env at call time).
+        ssrf::check_ssrf(&url, self.params.allow_local()).await?;
 
         // Make request and build output.
         let http = self.http.get_or_rebuild()?;
-        let result = match fetch_url(&http, &url, self.params.max_content_length()).await {
+        let http_span = tracing::info_span!("web_fetch.http", bytes = tracing::field::Empty);
+        let result = match fetch_url(
+            &http,
+            &url,
+            self.params.max_content_length(),
+            self.params.allow_local(),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(e @ WebFetchError::HttpRequest(_)) => {
                 self.http.invalidate();
@@ -125,6 +130,8 @@ impl WebFetchClient {
                 });
             }
         };
+        http_span.record("bytes", body.len() as i64);
+        drop(http_span);
 
         // PDF: save raw bytes to disk instead of lossy UTF-8 conversion.
         if is_pdf(&content_type) {
@@ -193,6 +200,7 @@ impl WebFetchClient {
             });
         }
 
+        let render_span = tracing::info_span!("web_fetch.render", bytes = tracing::field::Empty);
         let processed = self
             .process_text_content(
                 &body,
@@ -204,6 +212,8 @@ impl WebFetchClient {
                 },
             )
             .await;
+        render_span.record("bytes", processed.bytes as i64);
+        drop(render_span);
         let was_truncated = processed.was_truncated;
 
         let output = WebFetchOutput::Content(WebFetchContent {
@@ -301,6 +311,9 @@ fn validate_url(raw: &str) -> Result<Url, WebFetchError> {
 
     if let Some(host) = parsed.host_str()
         && host.split('.').count() < 2
+        // `localhost` is a single-label name; SSRF still requires
+        // allow_local for explicit local hosts.
+        && !ssrf::is_explicit_local_host(host)
     {
         return Err(WebFetchError::SingleLabelHost {
             host: host.to_string(),
@@ -310,11 +323,19 @@ fn validate_url(raw: &str) -> Result<Url, WebFetchError> {
     Ok(parsed)
 }
 
-/// Upgrade `http://` to `https://`.
+/// Upgrade `http://` to `https://`, except for explicit loopback hosts. Local dev servers almost
+/// always speak plain HTTP; forcing TLS would break `http://127.0.0.1` / `http://localhost` when
+/// local binding is opted in.
 fn upgrade_to_https(url: &mut Url) {
-    if url.scheme() == "http" {
-        let _ = url.set_scheme("https");
+    if url.scheme() != "http" {
+        return;
     }
+    if let Some(host) = url.host_str()
+        && ssrf::is_explicit_local_host(host)
+    {
+        return;
+    }
+    let _ = url.set_scheme("https");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -334,17 +355,24 @@ enum FetchResult {
     },
 }
 
-/// Fetch a URL with manual same-host redirect handling.
+/// Fetch a URL with manual same-host redirect handling. Re-runs SSRF checks on every hop so DNS
+/// rebinding between redirects cannot sneak a previously-blocked address past the initial check
+/// (partial TOCTOU mitigation; peer IP on the live TCP connection is not available from reqwest).
 async fn fetch_url(
     client: &reqwest::Client,
     url: &Url,
     max_content_length: usize,
+    allow_local: bool,
 ) -> Result<FetchResult, WebFetchError> {
     let mut current_url = url.clone();
     let mut hops = 0;
 
     // Loop to follow redirects under the same host.
     loop {
+        // Re-check on every hop (including the first) so a rebinding name that
+        // was public at the pre-fetch check cannot become loopback/private here.
+        ssrf::check_ssrf(&current_url, allow_local).await?;
+
         let resp = client
             .get(current_url.as_str())
             .header(USER_AGENT, USER_AGENT_STRING)
@@ -367,10 +395,15 @@ async fn fetch_url(
             // Follow same host; break on cross-host.
             if let Some(location) = resp.headers().get("location") {
                 let location_str = location.to_str().unwrap_or("");
-                let next_url = current_url
+                let mut next_url = current_url
                     .join(location_str)
                     .map_err(|e| WebFetchError::InvalidRedirect(format!("{e}")))?;
                 if is_same_host(&current_url, &next_url) {
+                    // Re-apply https upgrade on every hop: Location may be
+                    // absolute `http://…` and would otherwise silently
+                    // downgrade an https fetch. Local hosts still skip TLS.
+                    upgrade_to_https(&mut next_url);
+                    // check_ssrf runs at the top of the next loop iteration.
                     current_url = next_url;
                     continue;
                 }
@@ -407,13 +440,11 @@ async fn fetch_url(
     }
 }
 
+/// Exact host equality — no `www.` stripping. Distinct DNS labels (even when
+/// one is a `www` subdomain of the other) have independent A records and must
+/// surface as cross-host redirects rather than auto-follow.
 fn is_same_host(a: &Url, b: &Url) -> bool {
-    fn strip_www(h: &str) -> &str {
-        h.strip_prefix("www.").unwrap_or(h)
-    }
-    let host_a = a.host_str().unwrap_or("");
-    let host_b = b.host_str().unwrap_or("");
-    strip_www(host_a) == strip_www(host_b)
+    a.host_str() == b.host_str()
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -503,10 +534,9 @@ fn media_extension(content_type: &str) -> &'static str {
     }
 }
 
-/// Returns `true` for content types that are binary and would produce garbage
-/// through `String::from_utf8_lossy`. Text-like types (`text/*`,
-/// `application/json`, `application/xml`, `application/javascript`, etc.)
-/// return `false`.
+/// Returns `true` for content types that are binary and would produce garbage through
+/// `String::from_utf8_lossy`. Text-like types (`text/*`, `application/json`, `application/xml`,
+/// `application/javascript`, etc.) return `false`.
 fn is_binary_content_type(content_type: &str) -> bool {
     let mime = content_type
         .split(';')
@@ -730,10 +760,8 @@ fn clean_html(html: &str) -> String {
     document.html()
 }
 
-/// Strip base64 data URIs from content to prevent token bloat.
-///
-/// Uses manual scanning (`find` + byte matching) instead of regex for
-/// lower overhead — no compilation cost and O(n) linear scanning.
+/// Strip base64 data URIs from content to prevent token bloat. Uses manual scanning (`find` + byte
+/// matching) instead of regex for lower overhead — no compilation cost and O(n) linear scanning.
 fn strip_base64_data_uris(content: String) -> String {
     // A valid base64 quantum is 4 characters; anything shorter is noise.
     const MIN_BASE64_PAYLOAD: usize = 4;
@@ -877,9 +905,26 @@ mod tests {
 
     #[test]
     fn validate_url_rejects_single_label_hosts() {
-        assert!(validate_url("http://localhost:8080/foo").is_err());
+        // localhost is an explicit local host; SSRF still blocks it unless
+        // allow_local is set on tool params.
+        assert!(validate_url("http://localhost:8080/foo").is_ok());
         assert!(validate_url("http://intranet/foo").is_err());
         assert!(validate_url("http://metadata/computeMetadata").is_err());
+    }
+
+    #[test]
+    fn upgrade_to_https_skips_explicit_local_hosts() {
+        let mut local = Url::parse("http://127.0.0.1:8080/").unwrap();
+        upgrade_to_https(&mut local);
+        assert_eq!(local.scheme(), "http");
+
+        let mut localhost = Url::parse("http://localhost:3000/").unwrap();
+        upgrade_to_https(&mut localhost);
+        assert_eq!(localhost.scheme(), "http");
+
+        let mut public = Url::parse("http://example.com/").unwrap();
+        upgrade_to_https(&mut public);
+        assert_eq!(public.scheme(), "https");
     }
 
     #[test]
@@ -931,11 +976,11 @@ mod tests {
     }
 
     #[test]
-    fn same_host_www_stripping() {
+    fn www_subdomain_is_cross_host() {
         let a = Url::parse("https://example.com/a").unwrap();
         let c = Url::parse("https://www.example.com/a").unwrap();
-        assert!(is_same_host(&a, &c));
-        assert!(is_same_host(&c, &a));
+        assert!(!is_same_host(&a, &c));
+        assert!(!is_same_host(&c, &a));
     }
 
     #[test]
@@ -943,6 +988,19 @@ mod tests {
         let a = Url::parse("https://example.com/a").unwrap();
         let d = Url::parse("https://other.com/a").unwrap();
         assert!(!is_same_host(&a, &d));
+    }
+
+    #[test]
+    fn same_host_redirect_location_reupgrades_http() {
+        // Absolute http Location on an https origin must not stay http when
+        // followed as a same-host hop (upgrade_to_https reapplied each hop).
+        let origin = Url::parse("https://example.com/start").unwrap();
+        let mut next = origin.join("http://example.com/next").unwrap();
+        assert_eq!(next.scheme(), "http");
+        assert!(is_same_host(&origin, &next));
+        upgrade_to_https(&mut next);
+        assert_eq!(next.scheme(), "https");
+        assert_eq!(next.as_str(), "https://example.com/next");
     }
 
     // ── Content type detection ──────────────────────────────────────────
@@ -1229,10 +1287,9 @@ mod tests {
         .into_owned()
     }
 
-    /// Both implementations must produce identical output on all realistic
-    /// inputs. Covers: markdown images, standalone URIs, multiple URIs,
-    /// normal URLs, non-base64 data URIs, HTML/CSS contexts, various
-    /// positions, and real-world payloads.
+    /// Both implementations must produce identical output on all realistic inputs. Covers: markdown
+    /// images, standalone URIs, multiple URIs, normal URLs, non-base64 data URIs, HTML/CSS
+    /// contexts, various positions, and real-world payloads.
     #[test]
     fn strip_base64_equivalence_with_regex() {
         let cases: &[&str] = &[

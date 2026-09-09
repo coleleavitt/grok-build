@@ -162,6 +162,32 @@ impl Demux {
         self.sessions.remove(session_id).map(|(_, sender)| sender)
     }
 
+    /// Remove the inbox only if it is still the same channel as `expected`.
+    ///
+    /// Prevents a late untrack→unregister from clobbering a peer harness that
+    /// rebound the same session in between (identity, not key-only).
+    pub fn unregister_session_inbox_if(
+        &self,
+        session_id: &SessionId,
+        expected: &tokio::sync::mpsc::Sender<InboundFrame>,
+    ) -> Option<tokio::sync::mpsc::Sender<InboundFrame>> {
+        self.sessions
+            .remove_if(session_id, |_, sender| sender.same_channel(expected))
+            .map(|(_, sender)| sender)
+    }
+
+    /// Like [`Self::unregister_session_inbox_if`], but compares via a
+    /// [`tokio::sync::mpsc::WeakSender`] so callers need not hold a strong
+    /// sender (which would pin the channel open after demux replacement).
+    pub fn unregister_session_inbox_if_weak(
+        &self,
+        session_id: &SessionId,
+        expected: &tokio::sync::mpsc::WeakSender<InboundFrame>,
+    ) -> Option<tokio::sync::mpsc::Sender<InboundFrame>> {
+        let expected_strong = expected.upgrade()?;
+        self.unregister_session_inbox_if(session_id, &expected_strong)
+    }
+
     /// Park a oneshot waiter for `request_id`. Crate-internal: only
     /// the connection actor allocates request ids.
     pub(crate) fn register_response_waiter(
@@ -667,6 +693,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unregister_session_inbox_if_is_identity_guarded() {
+        let demux = Demux::new();
+        let session = SessionId::new("id-guard").expect("valid");
+        let (old_tx, _old_rx) = mpsc::channel(1);
+        let (new_tx, _new_rx) = mpsc::channel(1);
+        demux.register_session_inbox(session.clone(), old_tx.clone());
+        demux.register_session_inbox(session.clone(), new_tx.clone());
+        // Stale teardown with old sender must not remove the peer's inbox.
+        assert!(
+            demux
+                .unregister_session_inbox_if(&session, &old_tx)
+                .is_none()
+        );
+        assert!(demux.sessions.get(&session).is_some());
+        // Matching sender removes.
+        assert!(
+            demux
+                .unregister_session_inbox_if(&session, &new_tx)
+                .is_some()
+        );
+        assert!(demux.sessions.get(&session).is_none());
+    }
+
+    #[tokio::test]
     async fn dropped_receiver_returns_session_dropped() {
         let demux = Demux::new();
         let session = SessionId::new("gone").expect("valid");
@@ -781,27 +831,6 @@ mod tests {
             out_rx.try_recv().is_err(),
             "notifications must not synthesize an outbound response"
         );
-    }
-
-    #[tokio::test]
-    async fn inbox_full_request_without_outbound_does_not_panic() {
-        // A bare demux (no outbound, e.g. unit context) must still report
-        // InboxFull cleanly when it cannot synthesize a rejection.
-        let demux = Demux::new();
-        let session = SessionId::new("no_out").expect("valid");
-        let (tx, _rx) = mpsc::channel(1);
-        demux.register_session_inbox(session.clone(), tx);
-        let frame = || {
-            json!({
-                "jsonrpc": "2.0",
-                "id": "x",
-                "session_id": "no_out",
-                "method": "tool_call_request",
-                "params": {},
-            })
-        };
-        assert_eq!(demux.route(frame()), RouteOutcome::Session);
-        assert_eq!(demux.route(frame()), RouteOutcome::InboxFull);
     }
 
     #[tokio::test]

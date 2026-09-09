@@ -1,10 +1,8 @@
-//! Combined tasks pane — unified overlay panel showing both background tasks
-//! and subagents in a single interleaved list.
+//! Unified overlay panel showing both background tasks and subagents in a single interleaved list.
 //!
-//! Replaces the separate `BgTaskPane` and `SubagentPane`. Items are sorted
-//! running-first, then by start time (newest first). Each entry dispatches
-//! to the correct action type (kill task vs kill agent, view output vs view
-//! session) based on its variant.
+//! It replaces the separate `BgTaskPane` and `SubagentPane`.
+//! Items are sorted running-first, then by start time (newest first).
+//! Each entry dispatches to the correct action type (kill task vs kill agent, view output vs view session) based on its variant.
 
 use crossterm::event::{KeyEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
@@ -41,10 +39,8 @@ const SPINNER_DIVISOR: u64 = 4;
 // Shell command syntax highlighting (used by other modules too)
 // ---------------------------------------------------------------------------
 
-/// Highlight a shell command string into styled spans.
-///
-/// Uses syntect with the best available grammar for the platform: tries
-/// "powershell" first on Windows, falls back to "bash". Returns plain
+/// Highlight a shell command string into styled spans. Uses syntect with the best available grammar
+/// for the platform: tries "powershell" first on Windows, falls back to "bash". Returns plain
 /// `theme.command` color if no grammar matches. Results should be cached.
 pub fn highlight_bash_command(command: &str) -> Vec<Span<'static>> {
     let syntect = get_syntect();
@@ -72,8 +68,7 @@ pub fn highlight_bash_command(command: &str) -> Vec<Span<'static>> {
                 if text.is_empty() {
                     continue;
                 }
-                // Raw syntect RGB here used to bypass quantization and leak
-                // polarity-tuned tmTheme colors into minimal.
+                // Raw syntect RGB here used to bypass quantization and leak polarity-tuned tmTheme colors into minimal
                 spans.push(Span::styled(
                     text,
                     crate::syntax::syntect_to_ratatui_fg(style),
@@ -120,24 +115,9 @@ fn dim_spans(spans: &[Span<'static>], blend_factor: f32) -> Vec<Span<'static>> {
 // Line count badge formatting
 // ---------------------------------------------------------------------------
 
-/// Format an stdout line count as a compact `(N)` badge with SI scaling.
-///
-/// Returns an empty string for `0` so callers can treat that as "no badge".
-/// Truncation (not rounding) is used throughout so the badge never
-/// overstates the count — e.g. `1999` renders as `(1.9k)` (not `(2.0k)`),
-/// `999_999` renders as `(999k)` (not `(1.0M)`), and `9_999_999` renders as
-/// `(9.9M)` (not `(10M)`). Each branch boundary is exact: `1_000_000` is the
-/// first count to render with an `M` suffix.
-///
-/// When `truncated` is `true`, a `+` is inserted before the closing paren
-/// (`(2.0k+)`) to signal "at least this many" — the rolling buffer has
-/// dropped data so the real total is larger than `count`.
-///
-/// - `<1000`:   `(42)`, `(999)`
-/// - `<10_000`: `(1.0k)`, `(9.9k)`     — one decimal
-/// - `<1M`:     `(10k)`, `(999k)`      — whole thousands
-/// - `<10M`:    `(1.0M)`, `(9.9M)`     — one decimal
-/// - `≥10M`:    `(10M)`, `(999M)`      — whole millions
+/// Format an stdout line count as a compact `(N)` badge with SI scaling. Truncation (not rounding)
+/// is used throughout so the badge never overstates the count. When `truncated` is `true`, a `+` is
+/// inserted before the closing paren (`(2.0k+)`) to signal "at least this many".
 fn format_line_count_badge(count: usize, truncated: bool) -> String {
     if count == 0 {
         return String::new();
@@ -161,7 +141,7 @@ fn format_line_count_badge(count: usize, truncated: bool) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// TaskEntryId — identifies which entry a button belongs to
+// TaskEntryId: identifies which entry a button belongs to
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,42 +149,46 @@ pub enum TaskEntryId {
     BgTask(String),
     Agent(String),
     Scheduled(String),
+    Workflow(String),
 }
 
-/// Logical group a [`TaskEntry`] belongs to. Drives both the sort order (so
-/// each kind is contiguous) and the collapsible group headers.
+/// Logical group a [`TaskEntry`] belongs to.
+/// Drives both the sort order (so each kind is contiguous) and the collapsible group headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GroupKind {
+    Workflows,
     Subagents,
     Tasks,
-    /// Recurring background processes: `monitor` tasks and `/loop` scheduled
-    /// tasks share one section. They stay contiguous (monitors first, then
-    /// loops) via [`TaskEntry::type_order`].
+    /// Recurring background processes: `monitor` tasks and `/loop` scheduled tasks share one section.
+    /// They stay contiguous (monitors first, then loops) via [`TaskEntry::type_order`].
     Watchers,
 }
+
+const GROUP_KIND_COUNT: usize = 4;
 
 impl GroupKind {
     /// Display label shown in the group header.
     fn label(self) -> &'static str {
         match self {
+            GroupKind::Workflows => "Workflows",
             GroupKind::Subagents => "Subagents",
             GroupKind::Tasks => "Tasks",
             GroupKind::Watchers => "Watchers",
         }
     }
 
-    /// Sort/render order: subagents → tasks → watchers (monitors + loops).
     fn order(self) -> u8 {
         match self {
-            GroupKind::Subagents => 0,
-            GroupKind::Tasks => 1,
-            GroupKind::Watchers => 2,
+            GroupKind::Workflows => 0,
+            GroupKind::Subagents => 1,
+            GroupKind::Tasks => 2,
+            GroupKind::Watchers => 3,
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// TaskEntry — unified entry for the combined list
+// TaskEntry: unified entry for the combined list
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -216,8 +200,7 @@ pub enum TaskEntry {
         styled: Line<'static>,
         running: bool,
         start_time: SystemTime,
-        /// True for `monitor` tool tasks. Used to sort monitors into their
-        /// own contiguous group (separate from one-shot bg commands).
+        /// True for `monitor` tool tasks, which sort into their own contiguous group (separate from one-shot bg commands).
         is_monitor: bool,
     },
     Agent {
@@ -228,8 +211,8 @@ pub enum TaskEntry {
         styled: Line<'static>,
         running: bool,
         started_at: Instant,
-        /// Capitalized agent-type / persona label (e.g. `Explore`, `Plan`,
-        /// `General`). Used to order subagents by type within their group.
+        /// Capitalized agent-type / persona label (e.g. `Explore`, `Plan`, `General`).
+        /// Used to order subagents by type within their group.
         type_label: String,
     },
     Scheduled {
@@ -238,10 +221,19 @@ pub enum TaskEntry {
         label: String,
         styled: Line<'static>,
         started_at: Instant,
+        linked_subagent: Option<String>,
     },
-    /// Collapsible group header row (e.g. `▾ Subagents 2`). Not a task —
-    /// selecting it and pressing Enter (or clicking it) toggles the group's
-    /// collapse state.
+    Workflow {
+        id: u64,
+        name: String,
+        label: String,
+        styled: Line<'static>,
+        running: bool,
+        stoppable: bool,
+        started_at: Instant,
+    },
+    /// Collapsible group header row (e.g. `▾ Subagents 2`).
+    /// Not a task: selecting it and pressing Enter (or clicking it) toggles the group's collapse state.
     Header {
         group: GroupKind,
         styled: Line<'static>,
@@ -253,9 +245,8 @@ impl TaskEntry {
         task: &BgTaskState,
         highlight_cache: &mut HashMap<String, Vec<Span<'static>>>,
     ) -> Self {
-        // Prefer the tool call's description over the raw command for the
-        // pane label. The full command is always available via the block
-        // viewer (preamble of the BgTaskBlock).
+        // Prefer the tool call's description over the raw command for the pane label
+        // The full command is always available via the block viewer (preamble of the BgTaskBlock)
         let description = task
             .description
             .as_deref()
@@ -264,10 +255,9 @@ impl TaskEntry {
 
         let running = task.status == BgTaskStatus::Running;
         let (label, styled) = if task.is_monitor {
-            // Monitor: blue "Monitor" tag + neutral description, mirroring
-            // scheduled `/loop` rows. Falls back to the command if the
-            // description is somehow empty. The description (not the raw
-            // command) is what we show, so it never gets bash-highlighted.
+            // Monitor: blue "Monitor" tag and neutral description, mirroring scheduled `/loop` rows
+            // Falls back to the command if the description is somehow empty
+            // The description (not the raw command) is what we show, so it never gets bash-highlighted
             let theme = Theme::current();
             let text = description
                 .map(|d| d.replace('\n', " "))
@@ -288,11 +278,9 @@ impl TaskEntry {
             // Collapse newlines so multi-line descriptions render on one row.
             let one_line = desc.replace('\n', " ");
             let theme = Theme::current();
-            // Prefix the description with a constant `Task` tag in the
-            // theme's secondary text color so the entry type is identifiable
-            // at a glance, the same way subagent rows lead with their
-            // persona/role label. The prefix is included in `label` so it
-            // is searchable (the tasks-pane filter matches against `label`).
+            // Prefix the description with a constant `Task` tag in the theme's secondary text color
+            // The tag makes the entry type identifiable at a glance, the same way subagent rows lead with their persona/role label
+            // The prefix is included in `label` so it is searchable (the tasks-pane filter matches against `label`)
             const PREFIX: &str = "Task ";
             let desc_style = if running {
                 Style::default().fg(theme.text_primary)
@@ -345,30 +333,29 @@ impl TaskEntry {
     fn from_subagent(info: &SubagentInfo) -> Self {
         let theme = Theme::current();
 
-        // Single consolidated label (persona > role > subagent_type > tag >
-        // "general") plus description with any `[tag]` prefix stripped.
+        // Single consolidated label (persona > role > subagent_type > tag > "general") plus description with any `[tag]` prefix stripped
         let (type_label, description) = format_subagent_label(info);
         let model_suffix = info
+            .attempt
             .model
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("");
 
-        // Label color is state-driven: pending_kill / running stay vivid;
-        // completed / failed keep their hue (green / red) but blend toward
-        // the background so finished entries recede without losing their
-        // success-vs-failure signal.
-        let raw_type_color = if info.pending_kill {
+        // Label color is state-driven: pending_kill / running stay vivid
+        // Completed / failed keep their hue (green / red) but blend toward the background
+        // Finished entries recede without losing the success-vs-failure signal
+        let raw_type_color = if info.attempt.pending_kill {
             theme.accent_error
         } else if info.is_running() {
             theme.accent_running
-        } else if info.status.as_deref() == Some("completed") {
+        } else if info.attempt.status.as_deref() == Some("completed") {
             theme.accent_success
         } else {
             theme.accent_error
         };
-        let type_color = if info.is_running() || info.pending_kill {
+        let type_color = if info.is_running() || info.attempt.pending_kill {
             raw_type_color
         } else {
             crate::render::color::blend_color(theme.bg_base, raw_type_color, 0.45)
@@ -381,14 +368,13 @@ impl TaskEntry {
             Style::default().fg(theme.gray_bright)
         };
 
-        // Live activity suffix, running rows only. The description is capped
-        // so the live part survives typical pane widths (the right overlay's
-        // end-truncation remains the final safety net); the suffix stays out
-        // of `label` so filter matches don't flicker as activity changes.
+        // Live activity suffix, running rows only
+        // The description is capped so the live part survives typical pane widths (the right overlay's end-truncation remains the final safety net)
+        // The suffix stays out of `label` so filter matches don't flicker as activity changes
         const ACTIVITY_DESC_MAX_WIDTH: usize = 40;
         let activity = info
             .is_running()
-            .then_some(info.activity_label.as_deref())
+            .then_some(info.attempt.activity_label.as_deref())
             .flatten()
             .map(str::trim)
             .filter(|s| !s.is_empty());
@@ -399,13 +385,7 @@ impl TaskEntry {
             None => description.clone(),
         };
 
-        // Skip the trailing-space separator when the cleaned description is
-        // empty (reachable when `info.description == "[tag]"`); otherwise we
-        // render `"Tag "` with a stray trailing space.
-        //
-        // The model is NOT rendered inline here — it's drawn right-aligned in
-        // the overlay (just to the left of the elapsed/duration). The label
-        // string below still includes the model so it remains searchable.
+        // Otherwise we render `"Tag "` with a stray trailing space.
         let type_sep = if description.is_empty() { "" } else { " " };
         let mut spans = vec![
             Span::styled(format!("{type_label}{type_sep}"), type_style),
@@ -413,7 +393,7 @@ impl TaskEntry {
         ];
         if let Some(activity) = activity {
             spans.push(Span::styled(
-                format!(" \u{2014} {activity}"),
+                format!(" \u{00b7} {activity}"),
                 Style::default().fg(theme.gray),
             ));
         }
@@ -439,16 +419,89 @@ impl TaskEntry {
             label,
             styled,
             running: info.is_running(),
-            started_at: info.started_at,
+            started_at: info.attempt.started_at,
             type_label,
         }
     }
 
-    fn from_scheduled(
-        info: &ScheduledTaskInfo,
-        current_cron: Option<&str>,
-        is_queued: bool,
-    ) -> Self {
+    fn from_workflow_run(run: &crate::views::workflows::WorkflowRunSnapshot) -> Self {
+        let theme = Theme::current();
+        let running = run.is_active();
+
+        let raw_tag_color = if running {
+            theme.accent_running
+        } else if run.status == "complete" {
+            theme.accent_success
+        } else if run.is_terminal() {
+            theme.accent_error
+        } else {
+            theme.warning
+        };
+        let tag_color = if running {
+            raw_tag_color
+        } else {
+            crate::render::color::blend_color(theme.bg_base, raw_tag_color, 0.45)
+                .unwrap_or(raw_tag_color)
+        };
+        let name_style = if running {
+            Style::default().fg(theme.text_primary)
+        } else {
+            Style::default().fg(theme.gray_bright)
+        };
+
+        let suffix = if running {
+            let phase = run
+                .current_phase
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty());
+            let agents = match run.agents.iter().filter(|a| a.state == "running").count() {
+                0 => None,
+                1 => Some("1 agent".to_string()),
+                n => Some(format!("{n} agents")),
+            };
+            match (phase, agents) {
+                (Some(p), Some(a)) => format!("{p} · {a}"),
+                (Some(p), None) => p.to_string(),
+                (None, Some(a)) => a,
+                (None, None) => "running".to_string(),
+            }
+        } else {
+            run.status.replace('_', " ")
+        };
+
+        let mut spans = vec![
+            Span::styled("Workflow ".to_string(), Style::default().fg(tag_color)),
+            Span::styled(run.name.clone(), name_style),
+        ];
+        if !suffix.is_empty() {
+            spans.push(Span::styled(
+                format!(" \u{00b7} {suffix}"),
+                Style::default().fg(theme.gray),
+            ));
+        }
+
+        let label = format!("Workflow {} {suffix}", run.name);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        "workflow:".hash(&mut hasher);
+        run.run_id.hash(&mut hasher);
+        let id = hasher.finish();
+
+        TaskEntry::Workflow {
+            id,
+            name: run.name.clone(),
+            label,
+            styled: Line::from(spans),
+            running,
+            stoppable: run.can_stop(),
+            started_at: Instant::now()
+                .checked_sub(std::time::Duration::from_millis(run.live_elapsed_ms()))
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    fn from_scheduled(info: &ScheduledTaskInfo, linked: Option<(String, bool)>) -> Self {
+        let linked_running = linked.as_ref().is_some_and(|(_, running)| *running);
         let theme = Theme::current();
         let prompt_preview = if info.prompt.chars().count() > 60 {
             info.prompt.chars().take(57).collect::<String>() + "..."
@@ -469,10 +522,8 @@ impl TaskEntry {
             }
         };
         let is_provisional = info.task_id.starts_with("provisional-");
-        let suffix = if current_cron == Some(&info.task_id) {
+        let suffix = if linked_running {
             " (running)".to_string()
-        } else if is_queued {
-            " (queued)".to_string()
         } else if is_provisional {
             " (starting)".to_string()
         } else if let Some(n) = &info.next_fire_at {
@@ -491,8 +542,7 @@ impl TaskEntry {
         } else {
             countdown(&info.human_schedule, info.created_at)
         };
-        // Capitalize the tag for display (`loop` → `Loop`) so it reads as a
-        // proper label, matching the monitor row's `Monitor` tag.
+        // Capitalize the tag for display (`loop` becomes `Loop`) so it reads as a proper label, matching the monitor row's `Monitor` tag
         let tag_display = {
             let mut chars = info.tag.chars();
             match chars.next() {
@@ -501,20 +551,18 @@ impl TaskEntry {
             }
         };
         let label = format!(
-            "{}  {}  {}{}",
+            "{} {} \u{b7} {}{}",
             tag_display, info.human_schedule, &prompt_preview, &suffix
         );
 
-        // Only the tag (e.g. `Loop`) carries color — the blue system accent.
-        // The schedule, prompt preview, and status suffix all render in the
-        // neutral secondary text color so the row reads calmly with a single
-        // point of color. No surrounding `[ ]` brackets: the color alone
-        // sets the tag apart from the schedule that follows it.
-        let schedule_style = format!("{}  ", info.human_schedule);
+        // Only the tag (e.g. `Loop`) carries color, the blue system accent.
+        // The schedule, prompt preview, and status suffix all render in the neutral secondary text color, so the row has a single point of color
+        // No surrounding `[ ]` brackets: the color alone sets the tag apart from the schedule that follows it
+        let schedule_style = format!("{} \u{b7} ", info.human_schedule);
         let neutral = Style::default().fg(theme.text_secondary);
         let styled = Line::from(vec![
             Span::styled(
-                format!("{}  ", tag_display),
+                format!("{} ", tag_display),
                 Style::default().fg(theme.accent_system),
             ),
             Span::styled(schedule_style, neutral),
@@ -537,13 +585,13 @@ impl TaskEntry {
             label,
             styled,
             started_at: info.created_at,
+            linked_subagent: linked.map(|(sid, _)| sid),
         }
     }
 
-    /// Build a collapsible group header row, e.g. `▾ Subagents 2` (expanded)
-    /// or `▸ Subagents 2` (collapsed). The chevron + count are baked into the
-    /// styled line; the label aligns with item labels (the `chevron + space`
-    /// prefix is the same width as an item's 2-space indent).
+    /// Build a collapsible group header row, e.g. `▾ Subagents 2` (expanded) or `▸ Subagents 2` (collapsed).
+    /// The chevron and count are baked into the styled line.
+    /// The label aligns with item labels (chevron plus space is the same width as an item's 2-space indent).
     fn header(group: GroupKind, count: usize, collapsed: bool) -> Self {
         let theme = Theme::current();
         let chevron = if collapsed { "\u{25B8} " } else { "\u{25BE} " };
@@ -571,35 +619,36 @@ impl TaskEntry {
                 is_monitor: true, ..
             } => GroupKind::Watchers,
             TaskEntry::Scheduled { .. } => GroupKind::Watchers,
+            TaskEntry::Workflow { .. } => GroupKind::Workflows,
             TaskEntry::Header { group, .. } => *group,
         }
     }
 
     fn is_running(&self) -> bool {
         match self {
-            TaskEntry::BgTask { running, .. } | TaskEntry::Agent { running, .. } => *running,
+            TaskEntry::BgTask { running, .. }
+            | TaskEntry::Agent { running, .. }
+            | TaskEntry::Workflow { running, .. } => *running,
             TaskEntry::Scheduled { .. } => true,
             TaskEntry::Header { .. } => false,
         }
     }
 
-    /// Fine-grained sort rank, distinct per task kind so each renders as a
-    /// contiguous block: subagents (0) → one-shot bg tasks (1) → monitors
-    /// (2) → scheduled/loops (3). Monitors and loops share the `Watchers`
-    /// group/header but keep distinct ranks so monitors always sort before
-    /// loops within that section.
+    /// Fine-grained sort rank, distinct per task kind so each renders as a contiguous block.
+    /// The order is subagents (0), one-shot bg tasks (1), monitors (2), scheduled/loops (3).
+    /// Monitors and loops share the `Watchers` group/header but keep distinct ranks so monitors always sort before loops within that section.
     fn type_order(&self) -> u8 {
         match self {
-            TaskEntry::Agent { .. } => 0,
+            TaskEntry::Workflow { .. } => 0,
+            TaskEntry::Agent { .. } => 1,
             TaskEntry::BgTask {
                 is_monitor: false, ..
-            } => 1,
+            } => 2,
             TaskEntry::BgTask {
                 is_monitor: true, ..
-            } => 2,
-            TaskEntry::Scheduled { .. } => 3,
-            // Headers never appear in the sorted `items` list; fall back to
-            // the group's coarse order for completeness.
+            } => 3,
+            TaskEntry::Scheduled { .. } => 4,
+            // Headers never appear in the sorted `items` list; fall back to the group's coarse order for completeness
             TaskEntry::Header { group, .. } => group.order(),
         }
     }
@@ -611,14 +660,14 @@ impl ListItem for TaskEntry {
             TaskEntry::BgTask { styled, .. }
             | TaskEntry::Agent { styled, .. }
             | TaskEntry::Scheduled { styled, .. }
+            | TaskEntry::Workflow { styled, .. }
             | TaskEntry::Header { styled, .. } => styled,
         }
     }
 
     fn prefix(&self) -> Option<Line<'_>> {
         match self {
-            // Headers sit flush-left; their chevron occupies the same two
-            // columns as an item's indent, so labels still line up.
+            // Headers sit flush-left; their chevron occupies the same two columns as an item's indent, so labels still line up
             TaskEntry::Header { .. } => None,
             _ => Some(Line::from(Span::raw("  "))),
         }
@@ -628,7 +677,8 @@ impl ListItem for TaskEntry {
         match self {
             TaskEntry::BgTask { id, .. }
             | TaskEntry::Agent { id, .. }
-            | TaskEntry::Scheduled { id, .. } => *id,
+            | TaskEntry::Scheduled { id, .. }
+            | TaskEntry::Workflow { id, .. } => *id,
             TaskEntry::Header { group, .. } => {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 "header:".hash(&mut hasher);
@@ -646,7 +696,8 @@ impl ListItem for TaskEntry {
         match self {
             TaskEntry::BgTask { label, .. }
             | TaskEntry::Agent { label, .. }
-            | TaskEntry::Scheduled { label, .. } => label,
+            | TaskEntry::Scheduled { label, .. }
+            | TaskEntry::Workflow { label, .. } => label,
             TaskEntry::Header { group, .. } => group.label(),
         }
     }
@@ -660,19 +711,26 @@ impl ListItem for TaskEntry {
 enum OverlayEntryData {
     BgTask(String),
     Agent(String, String),
-    Scheduled(String),
+    Scheduled(String, Option<String>),
+    Workflow(String),
 }
 
 const MAX_TASKS_HEIGHT: u16 = 8;
 const MAX_TASKS_FRACTION: f32 = 0.15;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TaskStatusCounts {
+    pub(crate) running: usize,
+    pub(crate) paused_workflows: usize,
+}
+
 pub struct TasksPane {
-    /// Display list: sorted `items` with group headers inserted and
-    /// collapsed groups' items removed. This is what the `ListPane` renders.
+    /// Display list: sorted `items` with group headers inserted and collapsed groups' items removed.
+    /// This is what the `ListPane` renders.
     entries: Vec<TaskEntry>,
-    /// Sorted task items only (no headers). `entries` is derived from this by
-    /// [`Self::rebuild_entries`]; kept so collapse toggles can rebuild the
-    /// display list without re-reading the live task data.
+    /// Sorted task items only (no headers).
+    /// `entries` is derived from this by [`Self::rebuild_entries`].
+    /// It is kept so collapse toggles can rebuild the display list without re-reading the live task data.
     items: Vec<TaskEntry>,
     /// Groups the user has collapsed (header shown, items hidden).
     collapsed_groups: std::collections::HashSet<GroupKind>,
@@ -689,6 +747,7 @@ pub struct TasksPane {
     opened_by_auto: bool,
     highlight_cache: HashMap<String, Vec<Span<'static>>>,
     last_theme: ThemeKind,
+    workflow_runs: Vec<crate::views::workflows::WorkflowRunSnapshot>,
 }
 
 impl Default for TasksPane {
@@ -697,13 +756,8 @@ impl Default for TasksPane {
     }
 }
 
-/// Fill overlay cells with spaces so label text doesn't bleed through.
-///
-/// When the label extends into the area we're about to clear, place an
-/// ellipsis `…` at the cell immediately to the left of the clear boundary so
-/// the user sees that the row was truncated rather than just clipped silently.
-/// The ellipsis inherits the style of the cell it lands on so it blends with
-/// the surrounding label text.
+/// Fill overlay cells with spaces so label text doesn't bleed through. The user then sees that the
+/// row was truncated rather than just clipped silently.
 fn clear_overlay_area(buf: &mut Buffer, area: Rect, y: u16, overlay_w: u16) {
     let clamped = overlay_w.min(area.width);
     if clamped == 0 {
@@ -711,10 +765,8 @@ fn clear_overlay_area(buf: &mut Buffer, area: Rect, y: u16, overlay_w: u16) {
     }
     let clear_x = area.x + area.width - clamped;
 
-    // Detect truncation BEFORE clearing: if the cell at `clear_x` contains
-    // non-blank label content, the label is wider than the row minus the
-    // overlay reservation. Capture the style at `clear_x - 1` (the cell that
-    // will host the ellipsis) so the inserted `…` matches the label color.
+    // Detect truncation BEFORE clearing: a non-blank cell at `clear_x` means the label is wider than the row minus the overlay reservation
+    // Capture the style at `clear_x - 1` (the cell that will host the ellipsis) so the inserted `…` matches the label color
     let needs_ellipsis = clear_x > area.x
         && buf
             .cell((clear_x, y))
@@ -736,9 +788,8 @@ fn clear_overlay_area(buf: &mut Buffer, area: Rect, y: u16, overlay_w: u16) {
     }
 }
 
-/// Draw a single scroll indicator glyph centered on row `y`, blanking the rest
-/// of the row so it reads as a dedicated, easy-to-see indicator row — the same
-/// ▲/▼ as the corner indicators, just centered for visibility.
+/// Draw a single scroll indicator glyph centered on row `y`, blanking the rest of the row so it reads as a dedicated indicator row.
+/// The glyphs are the same ▲/▼ as the corner indicators, just centered for visibility.
 fn draw_centered_arrow(buf: &mut Buffer, area: Rect, y: u16, arrow: &str, color: Color) {
     if area.width == 0 {
         return;
@@ -767,8 +818,7 @@ impl TasksPane {
         };
         let mut list_state = ListPaneState::new_with_config(WrapMode::NoWrap, false, config);
         list_state.set_clipboard_provider(Box::new(crate::clipboard::SystemClipboard));
-        // This pane draws the scroll indicators (▲/▼) centered on dedicated
-        // rows, so the generic right-corner indicators are suppressed.
+        // This pane draws the scroll indicators (▲/▼) centered on dedicated rows, so the generic right-corner indicators are suppressed
         let list_style = ListPaneStyle {
             show_corner_indicators: false,
             ..ListPaneStyle::default()
@@ -790,19 +840,18 @@ impl TasksPane {
             opened_by_auto: false,
             highlight_cache: HashMap::new(),
             last_theme: Theme::current_kind(),
+            workflow_runs: Vec::new(),
         }
     }
 
     // -- Data sync -----------------------------------------------------------
 
-    /// Sync entries from bg tasks, subagent sessions, and scheduled tasks.
     pub fn sync(
         &mut self,
         bg_tasks: &std::collections::BTreeMap<String, BgTaskState>,
         subagents: &HashMap<String, SubagentInfo>,
         scheduled: &HashMap<String, ScheduledTaskInfo>,
-        current_cron_task_id: Option<&str>,
-        queued_cron_ids: &std::collections::HashSet<&str>,
+        workflow_runs: &[crate::views::workflows::WorkflowRunSnapshot],
     ) {
         // Detect theme switch and refresh caches.
         let current_theme = Theme::current_kind();
@@ -825,8 +874,10 @@ impl TasksPane {
             }
         }
 
-        // Add subagent items
         for info in subagents.values() {
+            if info.attempt.workflow_run_id.is_some() {
+                continue;
+            }
             if self.show_done || info.is_running() {
                 self.items.push(TaskEntry::from_subagent(info));
             }
@@ -834,29 +885,33 @@ impl TasksPane {
 
         // Add scheduled task items (always "running")
         for info in scheduled.values() {
-            self.items.push(TaskEntry::from_scheduled(
-                info,
-                current_cron_task_id,
-                queued_cron_ids.contains(info.task_id.as_str()),
-            ));
+            let linked = info.last_subagent_id.as_deref().and_then(|sid| {
+                subagents
+                    .values()
+                    .find(|s| s.subagent_id.as_ref() == sid)
+                    .map(|s| (sid.to_string(), s.is_running()))
+            });
+            self.items.push(TaskEntry::from_scheduled(info, linked));
         }
 
-        // Sort: group by type first (subagents → tasks → monitors →
-        // scheduled) so each kind is one contiguous block, then running
-        // before done within each group, then newest-first, then a stable
-        // id tiebreak. Monitors and scheduled/loops render under one shared
-        // "Watchers" header but keep distinct ranks (monitors first).
+        self.workflow_runs = workflow_runs.to_vec();
+        for run in workflow_runs {
+            if self.show_done || !run.is_terminal() {
+                self.items.push(TaskEntry::from_workflow_run(run));
+            }
+        }
+
+        // Sort: group by type first (subagents, tasks, monitors, scheduled) so each kind is one contiguous block
+        // Then running before done within each group, then newest-first, then a stable id tiebreak
+        // Monitors and scheduled/loops render under one shared "Watchers" header but keep distinct ranks (monitors first)
         self.items.sort_by(|a, b| {
-            // 1. Group by type so each kind is one contiguous block:
-            //    subagents → tasks → monitors → scheduled.
+            // 1. Group by type so each kind is one contiguous block: subagents, tasks, monitors, scheduled.
             a.type_order()
                 .cmp(&b.type_order())
                 // 2. Running before done *within* each group.
                 .then_with(|| b.is_running().cmp(&a.is_running()))
-                // 3. Within a (group, run-state): subagents order by agent
-                //    type (alphabetical) then newest-first; tasks/monitors/
-                //    loops order newest-first. Avoids mixing SystemTime and
-                //    Instant across types.
+                // 3. Within a (group, run-state): subagents order by agent type (alphabetical) then newest-first.
+                //    Tasks/monitors/loops order newest-first. The per-variant match avoids mixing SystemTime and Instant across types.
                 .then_with(|| match (a, b) {
                     (
                         TaskEntry::Agent {
@@ -878,19 +933,21 @@ impl TasksPane {
                         TaskEntry::BgTask { start_time: a, .. },
                         TaskEntry::BgTask { start_time: b, .. },
                     ) => b.cmp(a),
+                    (
+                        TaskEntry::Workflow { started_at: a, .. },
+                        TaskEntry::Workflow { started_at: b, .. },
+                    ) => b.cmp(a),
                     _ => std::cmp::Ordering::Equal,
                 })
-                // 4. Stable tiebreak so equal-timestamp rows don't reshuffle
-                //    frame-to-frame.
+                // 4. Stable tiebreak so equal-timestamp rows don't reshuffle frame-to-frame.
                 .then_with(|| a.stable_id().cmp(&b.stable_id()))
         });
 
-        // Auto-expand: forget the collapse state of any group that no longer
-        // has items, so when items later return (e.g. a new subagent spawns
-        // after the group emptied) the group reappears expanded instead of
-        // hidden under a stale collapsed header.
+        // Auto-expand: forget the collapse state of any group that no longer has items
+        // When items later return (e.g. a new subagent spawns after the group emptied), the group reappears expanded.
+        // Otherwise it would hide under a stale collapsed header
         if !self.collapsed_groups.is_empty() {
-            let mut present = [false; 3];
+            let mut present = [false; GROUP_KIND_COUNT];
             for it in &self.items {
                 present[it.group_kind().order() as usize] = true;
             }
@@ -898,30 +955,25 @@ impl TasksPane {
                 .retain(|g| present[g.order() as usize]);
         }
 
-        // Build the display list: group headers + (non-collapsed) items.
+        // Build the display list: group headers and (non-collapsed) items
         self.rebuild_entries();
 
-        // Count running for edge detection. Replay-restored bg tasks are
-        // excluded: on resume they are historical context (cold loads
-        // reconcile them away within the same `session/load`; on warm
-        // reconnects they are ambient, not new activity), so they must not
-        // flash the overlay open on every resume.
-        let running_count = bg_tasks
-            .values()
-            .filter(|t| t.status == BgTaskStatus::Running && !t.restored_from_replay)
-            .count()
-            + subagents.values().filter(|s| s.is_running()).count()
-            + scheduled.len();
+        let counts = Self::status_counts_from(bg_tasks, subagents, scheduled, workflow_runs);
+        // Replay-restored bg tasks are ambient history and must not auto-open on resume.
+        let running_count = counts.running.saturating_sub(
+            bg_tasks
+                .values()
+                .filter(|task| task.status == BgTaskStatus::Running && task.restored_from_replay)
+                .count(),
+        );
 
-        // Auto-show: running went from 0 to N
         if running_count > 0 && self.prev_running_count == 0 {
             self.overlay.show();
             self.opened_by_auto = true;
         }
 
-        // Auto-close: running went from N to 0, auto-shown, not focused
         if running_count == 0
-            && self.prev_running_count > 0
+            && counts.paused_workflows == 0
             && self.overlay.visible
             && !self.overlay.focused
             && self.opened_by_auto
@@ -934,14 +986,13 @@ impl TasksPane {
         self.prev_running_count = running_count;
     }
 
-    /// Rebuild the display `entries` from the sorted `items`: insert a header
-    /// at each group boundary (with the group's item count), and include a
-    /// group's items only when the group is not collapsed. Relies on `items`
-    /// already being sorted so each group is contiguous.
+    /// Rebuild the display `entries` from the sorted `items`.
+    /// Insert a header at each group boundary (with the group's item count), and include a group's items only when the group is not collapsed.
+    /// Relies on `items` already being sorted so each group is contiguous.
     fn rebuild_entries(&mut self) {
         self.entries.clear();
         // Per-group item counts (indexed by `GroupKind::order`).
-        let mut counts: [usize; 3] = [0; 3];
+        let mut counts: [usize; GROUP_KIND_COUNT] = [0; GROUP_KIND_COUNT];
         for it in &self.items {
             counts[it.group_kind().order() as usize] += 1;
         }
@@ -969,10 +1020,9 @@ impl TasksPane {
         self.set_group_collapsed(group, !collapsed);
     }
 
-    /// Explicitly set a group's collapse state (used by ← / →, which collapse
-    /// and expand respectively rather than toggle). When the state changes,
-    /// rebuild the display list and keep the group's header selected so the
-    /// cursor doesn't jump. Returns `true` if the state actually changed.
+    /// Explicitly set a group's collapse state (used by Left / Right, which collapse and expand respectively rather than toggle).
+    /// When the state changes, rebuild the display list and keep the group's header selected so the cursor doesn't jump.
+    /// Returns `true` if the state actually changed.
     pub fn set_group_collapsed(&mut self, group: GroupKind, collapsed: bool) -> bool {
         let changed = if collapsed {
             self.collapsed_groups.insert(group)
@@ -1001,19 +1051,40 @@ impl TasksPane {
         }
     }
 
-    /// Number of running bg tasks + subagents + scheduled tasks.
-    pub fn running_count(
+    pub(crate) fn status_counts(
         &self,
         bg_tasks: &std::collections::BTreeMap<String, BgTaskState>,
         subagents: &HashMap<String, SubagentInfo>,
         scheduled: &HashMap<String, ScheduledTaskInfo>,
-    ) -> usize {
-        bg_tasks
-            .values()
-            .filter(|t| t.status == BgTaskStatus::Running)
-            .count()
-            + subagents.values().filter(|s| s.is_running()).count()
-            + scheduled.len()
+        workflow_runs: &[crate::views::workflows::WorkflowRunSnapshot],
+    ) -> TaskStatusCounts {
+        Self::status_counts_from(bg_tasks, subagents, scheduled, workflow_runs)
+    }
+
+    fn status_counts_from(
+        bg_tasks: &std::collections::BTreeMap<String, BgTaskState>,
+        subagents: &HashMap<String, SubagentInfo>,
+        scheduled: &HashMap<String, ScheduledTaskInfo>,
+        workflow_runs: &[crate::views::workflows::WorkflowRunSnapshot],
+    ) -> TaskStatusCounts {
+        TaskStatusCounts {
+            running: bg_tasks
+                .values()
+                .filter(|task| task.status == BgTaskStatus::Running)
+                .count()
+                + subagents
+                    .values()
+                    .filter(|subagent| {
+                        subagent.is_running() && subagent.attempt.workflow_run_id.is_none()
+                    })
+                    .count()
+                + scheduled.len()
+                + workflow_runs.iter().filter(|run| run.is_active()).count(),
+            paused_workflows: workflow_runs
+                .iter()
+                .filter(|run| !run.is_active() && !run.is_terminal())
+                .count(),
+        }
     }
 
     // -- Visibility ----------------------------------------------------------
@@ -1046,11 +1117,9 @@ impl TasksPane {
         }
         let fraction_cap = (view_height as f32 * MAX_TASKS_FRACTION).floor() as u16;
         let max = MAX_TASKS_HEIGHT.min(fraction_cap).max(1);
-        // Reserve one extra row for the search/filter input bar (or an
-        // accepted matcher's status line) so it gets its own line instead of
-        // displacing the last task/agent entry. `ListPane` carves the bar out
-        // of the bottom of the area it's given, so without this the pane would
-        // show one fewer entry the moment `/` (or `f`) is pressed.
+        // Reserve one extra row for the search/filter input bar (or an accepted matcher's status line).
+        // The bar then gets its own line instead of displacing the last task/agent entry `ListPane` carves
+        // the bar out of the bottom of the area it's given.
         let bar = u16::from(
             self.list_state.input_mode().is_some() || self.list_state.matcher().is_some(),
         );
@@ -1085,6 +1154,10 @@ impl TasksPane {
         self.list_state.handle_key_event(key, &self.entries)
     }
 
+    pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.list_state.handle_paste(text, &self.entries)
+    }
+
     pub fn handle_scroll(&mut self, lines: i32, col: u16, row: u16) {
         let max = match self.list_state.viewport_height() {
             0..=5 => 1,
@@ -1104,7 +1177,6 @@ impl TasksPane {
             .handle_mouse_event(kind, col, row, area, &self.entries)
     }
 
-    /// Get the selected entry (if any).
     pub fn selected_entry(&self) -> Option<&TaskEntry> {
         let sel = self.list_state.selected_index()?;
         self.entries.get(sel)
@@ -1186,20 +1258,14 @@ impl TasksPane {
             return;
         }
 
-        // Decide the reserved indicator rows from the CURRENT scroll offset
-        // (NoWrap ⇒ one row per entry, so the total is the entry count), then
-        // prepare the layout exactly once with the final viewport. Preparing
-        // first with the full `inner` height would clamp the offset to that
-        // larger viewport's max, leaving the offset short of the smaller
-        // viewport's bottom — so ▼ could never turn off at the end.
+        // Then prepare the layout exactly once with the final viewport. The offset would then sit short of
+        // the smaller viewport's bottom, so ▼ could never turn off at the end.
         let total = self.entries.len();
         let scrollable = total > inner.height as usize && inner.height >= 3;
         let scroll = self.list_state.scroll_offset();
 
-        // Reserve a row for a centered ▲ / ▼ indicator ONLY when that indicator
-        // is actually shown — no blank reserved rows. The top row appears when
-        // scrolled down; the bottom row appears when, after the top
-        // reservation, content still extends past the viewport.
+        // Reserve a row for a centered ▲ / ▼ indicator ONLY when that indicator is actually shown; no blank reserved rows
+        // The top row appears when scrolled down; the bottom row appears when, after the top reservation, content still extends past the viewport
         let reserve_top = scrollable && scroll > 0;
         let top = u16::from(reserve_top);
         let rows_without_bottom = inner.height.saturating_sub(top) as usize;
@@ -1215,19 +1281,9 @@ impl TasksPane {
         self.list_state
             .prepare_layout(&self.entries, list_area.width, list_area.height);
 
-        // ListPane draws its scrollbar in the last column of the area it's
-        // given. The overlay (right-aligned kill/view buttons) paints over
-        // that same column, covering the scrollbar. Hand the list an area
-        // extended one column into the right padding so the scrollbar lands
-        // just past the overlay's right edge.
-        //
-        // Only widen when the list will *actually* draw a scrollbar there
-        // (content overflows the viewport). When it won't, ListPane gives the
-        // full area to content — so the extra column would be filled with
-        // label text that bleeds one cell past the overlay's `[✗]` button
-        // (the overlay only clears within `list_area`). Keeping `lp_area ==
-        // list_area` in that case lets the overlay truncate the label cleanly
-        // before the button, with nothing rendered to its right.
+        // ListPane draws its scrollbar in the last column of the area it's given. Only widen when the list
+        // will actually draw a scrollbar there (content overflows the viewport). When it won't, ListPane
+        // gives the full area to content, so the extra column would fill with label text.
         let needs_scrollbar = total > list_area.height as usize;
         let lp_area = if needs_scrollbar && list_area.right() < area.right() {
             Rect {
@@ -1242,9 +1298,8 @@ impl TasksPane {
             .style(self.list_style)
             .render(lp_area, buf, &mut self.list_state);
 
-        // The right-corner indicators (▲/▼) are suppressed for this pane;
-        // instead we draw the same glyphs, in the same color, centered on the
-        // reserved row(s) so they're easier to see.
+        // The right-corner indicators (▲/▼) are suppressed for this pane
+        // Instead we draw the same glyphs, in the same color, centered on the reserved row(s) so they're easier to see
         let arrow_color = self.list_style.indicator_fg;
         if reserve_top {
             draw_centered_arrow(buf, inner, inner.y, "\u{25B2}", arrow_color);
@@ -1259,12 +1314,7 @@ impl TasksPane {
             );
         }
 
-        // Overlay pass — positioned over the list area so the kill/view button
-        // rows line up with the rows the list actually rendered. When the
-        // search/filter input bar is open (or an accepted matcher's status is
-        // shown), `ListPane` reserves the bottom row(s) of `list_area` for it,
-        // so shrink the overlay area to match — otherwise the spinner icons
-        // and kill/view buttons paint over the input bar (e.g. the `⸬` spinner
+        // Otherwise the spinner icons and kill/view buttons paint over the input bar (e.g. the `⸬` spinner
         // corrupting `search:` into `⸬earch:`).
         let bar_height = self.list_state.bottom_bar_height(list_area.height);
         let overlay_area = Rect {
@@ -1303,12 +1353,14 @@ impl TasksPane {
                         child_session_id,
                         ..
                     } => OverlayEntryData::Agent(subagent_id.clone(), child_session_id.clone()),
-                    TaskEntry::Scheduled { task_id, .. } => {
-                        OverlayEntryData::Scheduled(task_id.clone())
-                    }
-                    // Group headers have no kill/view buttons; they still
-                    // occupy a row (vis_row is enumerated before this filter),
-                    // so the y offsets for following items stay correct.
+                    TaskEntry::Scheduled {
+                        task_id,
+                        linked_subagent,
+                        ..
+                    } => OverlayEntryData::Scheduled(task_id.clone(), linked_subagent.clone()),
+                    TaskEntry::Workflow { name, .. } => OverlayEntryData::Workflow(name.clone()),
+                    // Group headers have no kill/view buttons
+                    // They still occupy a row (vis_row is enumerated before this filter), so the y offsets for following items stay correct
                     TaskEntry::Header { .. } => return None,
                 };
                 Some((y, data))
@@ -1329,11 +1381,94 @@ impl TasksPane {
                     };
                     self.render_agent_overlay(area, buf, y, subagent_id, info, &theme);
                 }
-                OverlayEntryData::Scheduled(ref task_id) => {
-                    self.render_scheduled_overlay(area, buf, y, task_id, &theme);
+                OverlayEntryData::Scheduled(ref task_id, ref linked_subagent) => {
+                    self.render_scheduled_overlay(
+                        area,
+                        buf,
+                        y,
+                        task_id,
+                        linked_subagent.as_deref(),
+                        &theme,
+                    );
+                }
+                OverlayEntryData::Workflow(ref name) => {
+                    let Some(run) = self.workflow_runs.iter().find(|r| r.name == *name).cloned()
+                    else {
+                        continue;
+                    };
+                    self.render_workflow_overlay(area, buf, y, &run, &theme);
                 }
             }
         }
+    }
+
+    fn render_workflow_overlay(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        y: u16,
+        run: &crate::views::workflows::WorkflowRunSnapshot,
+        theme: &Theme,
+    ) {
+        let running = run.is_active();
+        let elapsed = format_duration(std::time::Duration::from_millis(run.live_elapsed_ms()));
+        let (icon, icon_style) = if running {
+            let frames = crate::glyphs::dot_spinner_frames();
+            let frame_idx = (self.tick / SPINNER_DIVISOR) as usize % frames.len();
+            (frames[frame_idx], Style::default().fg(theme.accent_running))
+        } else if run.status == "complete" {
+            (
+                crate::glyphs::check_mark(),
+                Style::default().fg(theme.accent_success),
+            )
+        } else if run.is_terminal() {
+            (
+                crate::glyphs::ballot_x(),
+                Style::default().fg(theme.accent_error),
+            )
+        } else {
+            ("⏸", Style::default().fg(theme.warning))
+        };
+        let right_text = format!("{elapsed} ");
+
+        buf.set_span(area.x, y, &Span::styled(icon, icon_style), 2);
+
+        let right_text_w = right_text.width() as u16;
+        let kill_w: u16 = if running { 3 } else { 0 };
+        let overlay_w = kill_w + right_text_w + 1;
+        clear_overlay_area(buf, area, y, overlay_w);
+
+        let mut rx = area.x + area.width;
+        if running {
+            rx = rx.saturating_sub(3);
+            let is_hovered = matches!(
+                &self.hovered_kill,
+                Some(TaskEntryId::Workflow(n)) if n == &run.name
+            );
+            let kill_style = if is_hovered {
+                Style::default().fg(theme.accent_error)
+            } else {
+                Style::default().fg(theme.gray)
+            };
+            buf.set_span(
+                rx,
+                y,
+                &Span::styled(crate::glyphs::ballot_x_button(), kill_style),
+                3,
+            );
+            self.kill_button_rects.push((
+                TaskEntryId::Workflow(run.name.clone()),
+                Rect::new(rx, y, 3, 1),
+            ));
+        }
+
+        rx = rx.saturating_sub(right_text_w);
+        buf.set_span(
+            rx,
+            y,
+            &Span::styled(right_text, Style::default().fg(theme.gray)),
+            right_text_w,
+        );
     }
 
     fn render_bg_task_overlay(
@@ -1390,13 +1525,7 @@ impl TasksPane {
 
         buf.set_span(area.x, y, &Span::styled(icon, icon_style), 2);
 
-        // Stdout line count, shown just to the left of the duration as
-        // a compact `(N)` badge with SI scaling (`(1.2k)`, `(5.4M)`) so
-        // huge outputs don't push the label off-screen. Hidden when
-        // there's no captured output. Styled dim like the time text.
-        // Reads the cached `stdout_line_count` (maintained by
-        // `BgTaskState::set_stdout` / `append_stdout`) so the overlay
-        // doesn't memchr-scan the full buffer per render frame.
+        // The overlay therefore never memchr-scans the full buffer per render frame.
         let badge = format_line_count_badge(task.stdout_line_count, task.truncated);
         let lines_text = if badge.is_empty() {
             String::new()
@@ -1493,7 +1622,7 @@ impl TasksPane {
         info: &SubagentInfo,
         theme: &Theme,
     ) {
-        let (icon, icon_style, right_text, right_style) = if info.pending_kill {
+        let (icon, icon_style, right_text, right_style) = if info.attempt.pending_kill {
             let frames = crate::glyphs::dot_spinner_frames();
             let frame_idx = (self.tick / SPINNER_DIVISOR) as usize % frames.len();
             (
@@ -1512,7 +1641,7 @@ impl TasksPane {
                 format!("{elapsed} "),
                 Style::default().fg(theme.gray),
             )
-        } else if info.status.as_deref() == Some("completed") {
+        } else if info.attempt.status.as_deref() == Some("completed") {
             let elapsed = format_duration(info.display_elapsed());
             (
                 crate::glyphs::check_mark(),
@@ -1535,6 +1664,7 @@ impl TasksPane {
         // Clear overlay area to prevent label text bleeding through.
         let badge = format_context_badge(info);
         let model_text = info
+            .attempt
             .model
             .as_deref()
             .map(str::trim)
@@ -1608,8 +1738,7 @@ impl TasksPane {
         rx = rx.saturating_sub(right_width);
         buf.set_span(rx, y, &Span::styled(right_text, right_style), right_width);
 
-        // Model (right-aligned, just to the left of elapsed). Pre-computed
-        // above for overlay clearing.
+        // Model (right-aligned, just to the left of elapsed). Pre-computed above for overlay clearing.
         if !model_text.is_empty() {
             rx = rx.saturating_sub(model_w);
             let mstyle = Style::default().fg(theme.gray);
@@ -1639,6 +1768,7 @@ impl TasksPane {
         buf: &mut Buffer,
         y: u16,
         task_id: &str,
+        linked_subagent: Option<&str>,
         theme: &Theme,
     ) {
         let frames = crate::glyphs::dot_spinner_frames();
@@ -1650,8 +1780,8 @@ impl TasksPane {
             2,
         );
 
-        // Clear overlay area (kill button + separator = 4 cols).
-        clear_overlay_area(buf, area, y, 4);
+        let overlay_cols = if linked_subagent.is_some() { 7 } else { 4 };
+        clear_overlay_area(buf, area, y, overlay_cols);
 
         let mut rx = area.x + area.width;
 
@@ -1677,6 +1807,29 @@ impl TasksPane {
             Rect::new(rx, y, 3, 1),
         ));
 
+        if linked_subagent.is_some() {
+            rx = rx.saturating_sub(3);
+            let is_view_hovered = matches!(
+                &self.hovered_view,
+                Some(TaskEntryId::Scheduled(tid)) if tid == task_id
+            );
+            let view_style = if is_view_hovered {
+                Style::default().fg(theme.text_primary)
+            } else {
+                Style::default().fg(theme.gray)
+            };
+            buf.set_span(
+                rx,
+                y,
+                &Span::styled(crate::glyphs::enlarge_button(), view_style),
+                3,
+            );
+            self.view_button_rects.push((
+                TaskEntryId::Scheduled(task_id.to_string()),
+                Rect::new(rx, y, 3, 1),
+            ));
+        }
+
         if rx > area.x {
             buf.set_span(rx - 1, y, &Span::raw(" "), 1);
         }
@@ -1684,50 +1837,61 @@ impl TasksPane {
 }
 
 #[cfg(test)]
+#[path = "tasks_pane_status_tests.rs"]
+mod status_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
     use std::time::Instant;
 
     fn make_info() -> SubagentInfo {
+        let now = Instant::now();
         SubagentInfo {
             subagent_id: Arc::from("sa-1"),
             child_session_id: Arc::from("cs-1"),
             description: Arc::from("Find API endpoints"),
             subagent_type: Arc::from("explore"),
-            persona: None,
-            role: None,
-            model: None,
-            context_source: None,
-            resumed_from: None,
-            capability_mode: None,
-            context_normalized: false,
-            parent_prompt_id: None,
-            started_at: Instant::now(),
-            last_progress_at: Instant::now(),
-            finished: false,
-            status: None,
-            error: None,
-            duration_ms: None,
-            tool_calls: None,
-            turns: None,
-            turn_count: None,
-            tool_call_count: None,
-            tokens_used: None,
-            context_window_tokens: None,
-            context_usage_pct: None,
-            tools_used: Vec::new(),
-            error_count: None,
-            activity_label: None,
-            is_background: false,
-            pending_kill: false,
-            kill_requested_at: None,
-            scrollback_entry_id: None,
+            attempt: crate::app::subagent::SubagentAttemptInfo {
+                lifecycle: crate::app::subagent::SubagentLifecycleState::running_legacy_for_test(),
+                persona: None,
+                role: None,
+                model: None,
+                context_source: None,
+                resumed_from: None,
+                capability_mode: None,
+                workflow_run_id: None,
+                context_normalized: false,
+                parent_prompt_id: None,
+                started_at: now,
+                last_progress_at: now,
+                status: None,
+                error: None,
+                duration_ms: None,
+                tool_calls: None,
+                turns: None,
+                turn_count: None,
+                tool_call_count: None,
+                tokens_used: None,
+                context_window_tokens: None,
+                context_usage_pct: None,
+                tools_used: Vec::new(),
+                error_count: None,
+                activity_label: None,
+                is_background: false,
+                pending_kill: false,
+                kill_requested_at: None,
+                scrollback_entry_id: None,
+                terminal_entry_id: None,
+            },
+            completed_attempt_tokens: 0,
+            sealed_attempt_tokens: Default::default(),
             prompt: None,
             child_cwd: None,
             worktree_path: None,
-            child_updates_replayed: false,
+            transcript: Default::default(),
         }
     }
 
@@ -1874,8 +2038,7 @@ mod tests {
 
     #[test]
     fn monitor_task_styled_with_monitor_tag() {
-        // Monitors render a blue "Monitor" tag + neutral description,
-        // mirroring scheduled /loop rows — NOT the bash-highlighted command.
+        // Monitors render a blue "Monitor" tag and neutral description, mirroring scheduled /loop rows, not the bash-highlighted command
         let mut task = make_bg_task("mon1", "python -u counter.py", BgTaskStatus::Running);
         task.is_monitor = true;
         task.description = Some("incrementing event counter every 3s".into());
@@ -1899,8 +2062,7 @@ mod tests {
 
     #[test]
     fn bg_task_no_prefix_when_no_description() {
-        // Bare-command branch (no description) stays prefix-free — the
-        // bash-highlighted command stands alone.
+        // Bare-command branch (no description) stays prefix-free: the bash-highlighted command stands alone
         let task = make_bg_task("t3b", "ls -la", BgTaskStatus::Running);
         let mut cache = HashMap::new();
         let entry = TaskEntry::from_bg_task(&task, &mut cache);
@@ -1969,10 +2131,8 @@ mod tests {
         );
     }
 
-    /// Render `pane` to a fresh buffer of the given size and return the
-    /// concatenated character content for every row. Lets tests do a
-    /// `joined.contains("(N)")`-style assertion without depending on cell
-    /// styling details.
+    /// Render `pane` to a fresh buffer of the given size and return the concatenated character content for every row.
+    /// Lets tests do a `joined.contains("(N)")`-style assertion without depending on cell styling details.
     fn render_pane_to_strings(
         pane: &mut TasksPane,
         bg_tasks: &std::collections::BTreeMap<String, BgTaskState>,
@@ -2006,8 +2166,8 @@ mod tests {
         pane.overlay.show();
 
         let mut task = make_bg_task("t1", "ls", BgTaskStatus::Running);
-        // 42 newline-terminated rows ⇒ `(42)`. Use `set_stdout` so the
-        // cached `stdout_line_count` is populated.
+        // 42 newline-terminated rows render as `(42)`
+        // Use `set_stdout` so the cached `stdout_line_count` is populated
         task.set_stdout((0..42).map(|i| format!("line {i}\n")).collect::<String>());
         assert_eq!(task.stdout.lines().count(), 42);
         assert_eq!(task.stdout_line_count, 42);
@@ -2015,16 +2175,9 @@ mod tests {
         let mut bg_tasks = std::collections::BTreeMap::new();
         bg_tasks.insert("t1".into(), task);
 
-        pane.sync(
-            &bg_tasks,
-            &HashMap::new(),
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &HashMap::new(), &HashMap::new(), &[]);
 
-        // 12+ rows so `desired_height` is non-zero; wide enough that the
-        // overlay isn't clipped.
+        // 12+ rows so `desired_height` is non-zero; wide enough that the overlay isn't clipped
         let lines = render_pane_to_strings(&mut pane, &bg_tasks, 80, 16);
         let joined = lines.join("\n");
         assert!(
@@ -2033,11 +2186,9 @@ mod tests {
         );
     }
 
-    /// Resume regression: bg tasks restored from a `session/load`
-    /// replay are historical context — they must not auto-open the overlay
-    /// (on cold resumes they die again within the same load; the open/close
-    /// flash looked like tasks "loading then failing"). A genuinely new live
-    /// task must still trigger the auto-show edge.
+    /// Resume regression: bg tasks restored from a `session/load` replay are historical context and must not auto-open the overlay.
+    /// On cold resumes they die again within the same load; the open/close flash looked like tasks "loading then failing".
+    /// A genuinely new live task must still trigger the auto-show edge.
     #[test]
     fn restored_running_tasks_do_not_auto_show() {
         let mut pane = TasksPane::new();
@@ -2047,30 +2198,18 @@ mod tests {
         let mut bg_tasks = std::collections::BTreeMap::new();
         bg_tasks.insert("t-restored".to_string(), restored);
 
-        pane.sync(
-            &bg_tasks,
-            &HashMap::new(),
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &HashMap::new(), &HashMap::new(), &[]);
         assert!(
             !pane.is_visible(),
             "replay-restored running tasks must not auto-open the tasks pane"
         );
 
-        // A live (non-restored) task still triggers the 0→N auto-show edge.
+        // A live (non-restored) task still triggers the 0-to-N auto-show edge
         bg_tasks.insert(
             "t-live".to_string(),
             make_bg_task("t-live", "cargo build", BgTaskStatus::Running),
         );
-        pane.sync(
-            &bg_tasks,
-            &HashMap::new(),
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &HashMap::new(), &HashMap::new(), &[]);
         assert!(
             pane.is_visible(),
             "a new live running task must still auto-open the tasks pane"
@@ -2089,13 +2228,7 @@ mod tests {
         let mut bg_tasks = std::collections::BTreeMap::new();
         bg_tasks.insert("t1".into(), task);
 
-        pane.sync(
-            &bg_tasks,
-            &HashMap::new(),
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &HashMap::new(), &HashMap::new(), &[]);
 
         let lines = render_pane_to_strings(&mut pane, &bg_tasks, 80, 16);
         let joined = lines.join("\n");
@@ -2116,13 +2249,7 @@ mod tests {
         let mut bg_tasks = std::collections::BTreeMap::new();
         bg_tasks.insert("t1".into(), task);
 
-        pane.sync(
-            &bg_tasks,
-            &HashMap::new(),
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &HashMap::new(), &HashMap::new(), &[]);
 
         let lines = render_pane_to_strings(&mut pane, &bg_tasks, 80, 16);
         let joined = lines.join("\n");
@@ -2134,16 +2261,12 @@ mod tests {
 
     #[test]
     fn search_bar_not_overwritten_by_task_overlay() {
-        // Regression: while subagents/tasks are running, opening the search
-        // bar (`/`) used to render broken UI — the overlay pass (spinner +
-        // kill/view buttons) painted over the bottom input-bar row that
-        // `ListPane` reserves, corrupting `search:` into `⸬earch:` (the `⸬`
-        // spinner glyph clobbering the leading `s`). The overlay must stop one
-        // row short of the input bar.
+        // Regression: while subagents/tasks are running, opening the search bar (`/`) used to render
+        // broken UI. The overlay must stop one row short of the input bar.
         let mut pane = TasksPane::new();
         pane.overlay.show();
 
-        // Three running tasks ⇒ entries = [Tasks header, t0, t1, t2].
+        // Three running tasks: entries = [Tasks header, t0, t1, t2]
         let mut bg_tasks = std::collections::BTreeMap::new();
         for i in 0..3 {
             bg_tasks.insert(
@@ -2155,13 +2278,7 @@ mod tests {
                 ),
             );
         }
-        pane.sync(
-            &bg_tasks,
-            &HashMap::new(),
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &HashMap::new(), &HashMap::new(), &[]);
 
         // Press `/` to open the search bar.
         assert!(pane.handle_key(&crate::key!('/').to_key_event()));
@@ -2170,9 +2287,8 @@ mod tests {
             "`/` should open the search input bar",
         );
 
-        // Height 4: the header + 3 task rows exactly fill the area, so the
-        // search bar steals the bottom row. Without the fix, the third task's
-        // overlay lands on that same row and clobbers the `search:` prompt.
+        // Height 4: the header plus 3 task rows exactly fill the area, so the search bar steals the bottom row
+        // Without the fix, the third task's overlay lands on that same row and clobbers the `search:` prompt
         let lines = render_pane_to_strings(&mut pane, &bg_tasks, 60, 4);
         let joined = lines.join("\n");
 
@@ -2182,8 +2298,7 @@ mod tests {
              overlay spinner), got:\n{joined}",
         );
 
-        // The row carrying the prompt must start with `search:` (after the
-        // pane's left padding) — not an overlay spinner/kill glyph.
+        // The row carrying the prompt must start with `search:` (after the pane's left padding), not an overlay spinner/kill glyph
         let bar_row = lines
             .iter()
             .find(|l| l.contains("search:"))
@@ -2197,9 +2312,8 @@ mod tests {
 
     #[test]
     fn search_bar_adds_a_line_keeping_last_entry_visible() {
-        // Opening the search bar should grow the pane by exactly one row so the
-        // bar gets its own line — the last task/agent must stay visible rather
-        // than being displaced by the bar.
+        // Opening the search bar should grow the pane by exactly one row so the bar gets its own line
+        // The last task/agent must stay visible rather than being displaced by the bar
         let mut pane = TasksPane::new();
         pane.overlay.show();
 
@@ -2214,13 +2328,7 @@ mod tests {
                 ),
             );
         }
-        pane.sync(
-            &bg_tasks,
-            &HashMap::new(),
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &HashMap::new(), &HashMap::new(), &[]);
 
         // Tall enough that all entries fit without scrolling.
         let view_height = 40u16;
@@ -2235,8 +2343,7 @@ mod tests {
             "opening search should add exactly one row for the bar",
         );
 
-        // Render at the grown height: all three tasks AND the search bar must
-        // be visible together.
+        // Render at the grown height: all three tasks AND the search bar must be visible together
         let lines = render_pane_to_strings(&mut pane, &bg_tasks, 60, h_after);
         let joined = lines.join("\n");
         assert!(joined.contains("sleep 0"), "first task visible:\n{joined}");
@@ -2250,10 +2357,8 @@ mod tests {
 
     #[test]
     fn render_loop_row_truncates_before_kill_button() {
-        // A non-scrollable loop row with a long prompt must truncate before
-        // the `[✗]` kill button — nothing may render to its right. Regression:
-        // the scrollbar-padding column used to be filled with label text when
-        // the list wasn't scrollable, bleeding one cell past `[✗]`.
+        // A non-scrollable loop row with a long prompt must truncate before the `[✗]` kill button; nothing may render to its right
+        // Regression: the scrollbar-padding column used to fill with label text when the list wasn't scrollable, bleeding one cell past `[✗]`
         let mut pane = TasksPane::new();
         pane.overlay.show();
 
@@ -2268,15 +2373,9 @@ mod tests {
             ),
         );
 
-        pane.sync(
-            &BTreeMap::new(),
-            &HashMap::new(),
-            &scheduled,
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&BTreeMap::new(), &HashMap::new(), &scheduled, &[]);
 
-        // One header + one loop row in a tall pane ⇒ not scrollable.
+        // One header and one loop row in a tall pane: not scrollable
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
         let layout = crate::appearance::LayoutConfig::default();
@@ -2290,8 +2389,7 @@ mod tests {
             &scheduled,
         );
 
-        // Locate the `✗` kill glyph; every cell past the closing `]` must be
-        // blank (no scrollbar when not scrollable, no leaked label text).
+        // Locate the `✗` kill glyph; every cell past the closing `]` must be blank (no scrollbar when not scrollable, no leaked label text)
         let mut found = false;
         for y in 0..area.height {
             let row: Vec<String> = (0..area.width)
@@ -2327,16 +2425,9 @@ mod tests {
             );
         }
 
-        pane.sync(
-            &bg_tasks,
-            &HashMap::new(),
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &HashMap::new(), &HashMap::new(), &[]);
 
-        // A short panel forces the list to overflow; at the top of the list a
-        // centered ▼ appears on the reserved bottom row.
+        // A short panel forces the list to overflow; at the top of the list a centered ▼ appears on the reserved bottom row
         let lines = render_pane_to_strings(&mut pane, &bg_tasks, 40, 6);
         let joined = lines.join("\n");
         assert!(
@@ -2358,13 +2449,7 @@ mod tests {
             );
         }
 
-        pane.sync(
-            &bg_tasks,
-            &HashMap::new(),
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &HashMap::new(), &HashMap::new(), &[]);
 
         // Establish the viewport, then scroll to the very bottom.
         let _ = render_pane_to_strings(&mut pane, &bg_tasks, 40, 6);
@@ -2398,13 +2483,7 @@ mod tests {
             make_bg_task("running", "sleep 99", BgTaskStatus::Running),
         );
 
-        pane.sync(
-            &bg_tasks,
-            &HashMap::new(),
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &HashMap::new(), &HashMap::new(), &[]);
 
         assert!(pane.items.len() >= 2);
         assert!(pane.items[0].is_running(), "first entry should be running",);
@@ -2421,17 +2500,11 @@ mod tests {
 
         let mut subagents = HashMap::new();
         let mut info = make_info();
-        info.finished = true;
-        info.status = Some("completed".into());
+        info.set_finished_for_test(true);
+        info.attempt.status = Some("completed".into());
         subagents.insert("cs-1".into(), info);
 
-        pane.sync(
-            &bg_tasks,
-            &subagents,
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &subagents, &HashMap::new(), &[]);
 
         assert_eq!(pane.items.len(), 2);
         assert!(
@@ -2446,8 +2519,7 @@ mod tests {
 
     #[test]
     fn sync_groups_monitors_as_their_own_block() {
-        // Monitors are BgTask entries but get their own contiguous group:
-        // subagents → one-shot tasks → monitors → scheduled.
+        // Monitors are BgTask entries but get their own contiguous group: subagents, one-shot tasks, monitors, scheduled
         let mut pane = TasksPane::new();
         pane.show_done = true;
 
@@ -2460,13 +2532,7 @@ mod tests {
         let mut subagents = HashMap::new();
         subagents.insert("cs-1".into(), make_info()); // running subagent
 
-        pane.sync(
-            &bg_tasks,
-            &subagents,
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &subagents, &HashMap::new(), &[]);
 
         assert_eq!(pane.items.len(), 3);
         assert!(
@@ -2497,8 +2563,7 @@ mod tests {
 
     #[test]
     fn monitors_and_loops_share_one_watchers_section() {
-        // Monitor (BgTask) and loop (Scheduled) tasks render under a single
-        // "Watchers" header, monitors sorted before loops.
+        // Monitor (BgTask) and loop (Scheduled) tasks render under a single "Watchers" header, monitors sorted before loops
         let mut pane = TasksPane::new();
         pane.show_done = true;
 
@@ -2513,13 +2578,7 @@ mod tests {
             make_scheduled_info("l1", "every 1m", "do x", None),
         );
 
-        pane.sync(
-            &bg_tasks,
-            &HashMap::new(),
-            &scheduled,
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &HashMap::new(), &scheduled, &[]);
 
         // items: monitor first, then loop.
         assert_eq!(pane.items.len(), 2);
@@ -2567,13 +2626,7 @@ mod tests {
             make_bg_task("running", "sleep 99", BgTaskStatus::Running),
         );
 
-        pane.sync(
-            &bg_tasks,
-            &HashMap::new(),
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &HashMap::new(), &HashMap::new(), &[]);
 
         assert_eq!(pane.items.len(), 1, "only running tasks shown by default");
         assert!(pane.items[0].is_running());
@@ -2587,16 +2640,9 @@ mod tests {
         let mut subagents = HashMap::new();
         subagents.insert("cs-1".into(), make_info()); // running subagent
 
-        pane.sync(
-            &bg_tasks,
-            &subagents,
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&bg_tasks, &subagents, &HashMap::new(), &[]);
 
-        // Display list interleaves a header before each group's items:
-        // [Header(Subagents), Agent, Header(Tasks), BgTask].
+        // Display list interleaves a header before each group's items: [Header(Subagents), Agent, Header(Tasks), BgTask]
         assert_eq!(pane.entries.len(), 4);
         assert!(matches!(
             &pane.entries[0],
@@ -2635,15 +2681,14 @@ mod tests {
             &std::collections::BTreeMap::new(),
             &subagents,
             &HashMap::new(),
-            None,
-            &HashSet::new(),
+            &[],
         );
 
-        // Expanded: header + item.
+        // Expanded: header and item
         assert_eq!(pane.entries.len(), 2);
         assert!(matches!(&pane.entries[1], TaskEntry::Agent { .. }));
 
-        // Collapse → only the header remains.
+        // Collapse: only the header remains
         pane.toggle_group(GroupKind::Subagents);
         assert_eq!(pane.entries.len(), 1);
         assert!(matches!(
@@ -2654,7 +2699,7 @@ mod tests {
             }
         ));
 
-        // Expand → item returns.
+        // Expand: the item returns
         pane.toggle_group(GroupKind::Subagents);
         assert_eq!(pane.entries.len(), 2);
         assert!(matches!(&pane.entries[1], TaskEntry::Agent { .. }));
@@ -2662,8 +2707,8 @@ mod tests {
 
     #[test]
     fn arrow_keys_expand_and_collapse_group() {
-        // ← collapses, → expands (vs Enter / click which toggle). The arrow
-        // handler calls `set_group_collapsed`; exercise it directly.
+        // Left collapses, Right expands (vs Enter / click which toggle)
+        // The arrow handler calls `set_group_collapsed`; exercise it directly
         let mut pane = TasksPane::new();
         let mut subagents = HashMap::new();
         subagents.insert("cs-1".into(), make_info());
@@ -2671,32 +2716,30 @@ mod tests {
             &std::collections::BTreeMap::new(),
             &subagents,
             &HashMap::new(),
-            None,
-            &HashSet::new(),
+            &[],
         );
         assert_eq!(pane.entries.len(), 2);
 
-        // ← collapses the expanded group.
+        // Left collapses the expanded group
         assert!(pane.set_group_collapsed(GroupKind::Subagents, true));
         assert_eq!(pane.entries.len(), 1);
-        // ← again: already collapsed, no change.
+        // Left again: already collapsed, no change
         assert!(!pane.set_group_collapsed(GroupKind::Subagents, true));
         assert_eq!(pane.entries.len(), 1);
 
-        // → expands it again.
+        // Right expands it again
         assert!(pane.set_group_collapsed(GroupKind::Subagents, false));
         assert_eq!(pane.entries.len(), 2);
         assert!(matches!(&pane.entries[1], TaskEntry::Agent { .. }));
-        // → again: already expanded, no change.
+        // Right again: already expanded, no change
         assert!(!pane.set_group_collapsed(GroupKind::Subagents, false));
         assert_eq!(pane.entries.len(), 2);
     }
 
     #[test]
     fn emptied_group_forgets_collapse_state() {
-        // Collapse a group, let it empty out, then repopulate it: the new
-        // items must be visible (group auto-expands) rather than hidden under
-        // a stale collapsed header.
+        // Collapse a group, let it empty out, then repopulate it
+        // The new items must be visible (group auto-expands) rather than hidden under a stale collapsed header
         let mut pane = TasksPane::new();
         let mut subagents = HashMap::new();
         subagents.insert("cs-1".into(), make_info());
@@ -2704,24 +2747,22 @@ mod tests {
             &std::collections::BTreeMap::new(),
             &subagents,
             &HashMap::new(),
-            None,
-            &HashSet::new(),
+            &[],
         );
 
         pane.toggle_group(GroupKind::Subagents);
         assert!(pane.collapsed_groups.contains(&GroupKind::Subagents));
 
-        // Group empties (no subagents) → collapse state is forgotten.
+        // Group empties (no subagents), so the collapse state is forgotten
         pane.sync(
             &std::collections::BTreeMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            None,
-            &HashSet::new(),
+            &[],
         );
         assert!(!pane.collapsed_groups.contains(&GroupKind::Subagents));
 
-        // A new subagent arrives → shown expanded (header + item), not hidden.
+        // A new subagent arrives: shown expanded (header and item), not hidden
         let mut next = make_info();
         next.child_session_id = "cs-2".into();
         next.subagent_id = "sa-2".into();
@@ -2731,8 +2772,7 @@ mod tests {
             &std::collections::BTreeMap::new(),
             &subagents2,
             &HashMap::new(),
-            None,
-            &HashSet::new(),
+            &[],
         );
         assert_eq!(pane.entries.len(), 2);
         assert!(matches!(&pane.entries[1], TaskEntry::Agent { .. }));
@@ -2742,8 +2782,7 @@ mod tests {
     fn subagents_ordered_by_agent_type() {
         let mut pane = TasksPane::new();
         let mut subagents = HashMap::new();
-        // Two running subagents of different types; both running so the
-        // running-first key ties and the type order decides.
+        // Two running subagents of different types; both running so the running-first key ties and the type order decides
         let mut plan = make_info();
         plan.child_session_id = "cs-plan".into();
         plan.subagent_type = "plan".into();
@@ -2757,8 +2796,7 @@ mod tests {
             &std::collections::BTreeMap::new(),
             &subagents,
             &HashMap::new(),
-            None,
-            &HashSet::new(),
+            &[],
         );
 
         // Ordered by agent type alphabetically: Explore before Plan.
@@ -2790,8 +2828,8 @@ mod tests {
     #[test]
     fn entry_label_includes_meta() {
         let mut info = make_info();
-        info.persona = Some("researcher".into());
-        info.model = Some("grok-3".into());
+        info.attempt.persona = Some("researcher".into());
+        info.attempt.model = Some("grok-3".into());
         let entry = TaskEntry::from_subagent(&info);
         let label = match &entry {
             TaskEntry::Agent { label, .. } => label.as_str(),
@@ -2821,14 +2859,14 @@ mod tests {
     #[test]
     fn subagent_activity_suffix_renders_while_running_only() {
         let mut info = make_info();
-        info.activity_label = Some("Running: cargo build".into());
+        info.attempt.activity_label = Some("Running: cargo build".into());
         let entry = TaskEntry::from_subagent(&info);
         let (label, styled) = match &entry {
             TaskEntry::Agent { label, styled, .. } => (label, styled),
             _ => panic!("expected Agent variant"),
         };
         let suffix = styled.spans.last().unwrap();
-        assert_eq!(suffix.content.as_ref(), " \u{2014} Running: cargo build");
+        assert_eq!(suffix.content.as_ref(), " \u{00b7} Running: cargo build");
         assert_eq!(suffix.style.fg, Some(Theme::current().gray));
         assert!(
             !label.contains("cargo build"),
@@ -2836,7 +2874,7 @@ mod tests {
         );
 
         // Finished rows drop the suffix even if a stale label lingers.
-        info.finished = true;
+        info.set_finished_for_test(true);
         let entry = TaskEntry::from_subagent(&info);
         let styled = match &entry {
             TaskEntry::Agent { styled, .. } => styled,
@@ -2856,7 +2894,7 @@ mod tests {
         let long_desc = "d".repeat(60);
         let mut info = make_info();
         info.description = Arc::from(long_desc.as_str());
-        info.activity_label = Some("Thinking".into());
+        info.attempt.activity_label = Some("Thinking".into());
         let entry = TaskEntry::from_subagent(&info);
         let (label, styled) = match &entry {
             TaskEntry::Agent { label, styled, .. } => (label, styled),
@@ -2873,7 +2911,7 @@ mod tests {
         );
 
         // Without an activity suffix the description renders uncapped.
-        info.activity_label = None;
+        info.attempt.activity_label = None;
         let entry = TaskEntry::from_subagent(&info);
         let styled = match &entry {
             TaskEntry::Agent { styled, .. } => styled,
@@ -2895,6 +2933,7 @@ mod tests {
             created_at: std::time::Instant::now(),
             next_fire_at: next.map(|s| s.to_string()),
             tag: "loop".into(),
+            last_subagent_id: None,
         }
     }
 
@@ -2902,19 +2941,12 @@ mod tests {
     fn scheduled_label_shows_next_in_countdown() {
         let mut pane = TasksPane::new();
         let mut scheduled = HashMap::new();
-        // future next
         let next = (chrono::Utc::now() + chrono::Duration::seconds(125)).to_rfc3339();
         scheduled.insert(
             "t1".into(),
             make_scheduled_info("t1", "every 1m", "do x", Some(&next)),
         );
-        pane.sync(
-            &BTreeMap::new(),
-            &HashMap::new(),
-            &scheduled,
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&BTreeMap::new(), &HashMap::new(), &scheduled, &[]);
         let label = match &pane.items[0] {
             TaskEntry::Scheduled { label, .. } => label,
             _ => panic!("expected Scheduled"),
@@ -2925,28 +2957,35 @@ mod tests {
         );
     }
 
+    /// A fire runs in a detached subagent, so the row reads (running) while that
+    /// subagent is alive — there is no in-session cron turn to match against.
     #[test]
-    fn scheduled_label_shows_running_now_on_cron_match() {
+    fn scheduled_label_shows_running_while_its_subagent_runs() {
         let mut pane = TasksPane::new();
         let mut scheduled = HashMap::new();
-        scheduled.insert(
-            "cron1".into(),
-            make_scheduled_info("cron1", "every 5m", "loop", None),
-        );
+        let mut info = make_scheduled_info("cron1", "every 5m", "loop", None);
+        info.last_subagent_id = Some("sa-1".to_string());
+        scheduled.insert("cron1".into(), info);
+        let mut subagents = HashMap::new();
+        subagents.insert("sa-1".to_string(), make_info());
+
         pane.sync(
             &std::collections::BTreeMap::new(),
-            &HashMap::new(),
+            &subagents,
             &scheduled,
-            Some("cron1"),
-            &HashSet::new(),
+            &[],
         );
-        let label = match &pane.items[0] {
-            TaskEntry::Scheduled { label, .. } => label,
-            _ => panic!("expected Scheduled"),
-        };
+        let label = pane
+            .items
+            .iter()
+            .find_map(|item| match item {
+                TaskEntry::Scheduled { label, .. } => Some(label),
+                _ => None,
+            })
+            .expect("scheduled row");
         assert!(
             label.contains("(running)"),
-            "expected (running) when cron matches: {label}"
+            "expected (running) while the fire's subagent runs: {label}"
         );
     }
 
@@ -2958,13 +2997,7 @@ mod tests {
             "provisional-abc".into(),
             make_scheduled_info("provisional-abc", "every 10s", "soon", None),
         );
-        pane.sync(
-            &BTreeMap::new(),
-            &HashMap::new(),
-            &scheduled,
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&BTreeMap::new(), &HashMap::new(), &scheduled, &[]);
         let label = match &pane.items[0] {
             TaskEntry::Scheduled { label, .. } => label,
             _ => panic!("expected Scheduled"),
@@ -2972,27 +3005,6 @@ mod tests {
         assert!(
             label.contains("(starting)"),
             "expected (starting) for provisional: {label}"
-        );
-    }
-
-    #[test]
-    fn scheduled_queued_shows_queued() {
-        let mut pane = TasksPane::new();
-        let mut scheduled = HashMap::new();
-        scheduled.insert(
-            "q1".into(),
-            make_scheduled_info("q1", "every 5m", "check", None),
-        );
-        let mut queued = HashSet::new();
-        queued.insert("q1");
-        pane.sync(&BTreeMap::new(), &HashMap::new(), &scheduled, None, &queued);
-        let label = match &pane.items[0] {
-            TaskEntry::Scheduled { label, .. } => label,
-            _ => panic!("expected Scheduled"),
-        };
-        assert!(
-            label.contains("(queued)"),
-            "expected (queued) when task is in pending_prompts: {label}"
         );
     }
 
@@ -3005,13 +3017,7 @@ mod tests {
             "due".into(),
             make_scheduled_info("due", "every 1h", "past", Some(&past)),
         );
-        pane.sync(
-            &BTreeMap::new(),
-            &HashMap::new(),
-            &scheduled,
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&BTreeMap::new(), &HashMap::new(), &scheduled, &[]);
         let label = match &pane.items[0] {
             TaskEntry::Scheduled { label, .. } => label,
             _ => panic!("expected Scheduled"),
@@ -3031,13 +3037,7 @@ mod tests {
             "uni".into(),
             make_scheduled_info("uni", "every 1s", &unicode_prompt, None),
         );
-        pane.sync(
-            &BTreeMap::new(),
-            &HashMap::new(),
-            &scheduled,
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&BTreeMap::new(), &HashMap::new(), &scheduled, &[]);
         let entry = &pane.items[0];
         let label = match entry {
             TaskEntry::Scheduled { label, .. } => label,
@@ -3058,13 +3058,7 @@ mod tests {
             "bad".into(),
             make_scheduled_info("bad", "every 30s", "fallback", Some("not-a-date")),
         );
-        pane.sync(
-            &BTreeMap::new(),
-            &HashMap::new(),
-            &scheduled,
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&BTreeMap::new(), &HashMap::new(), &scheduled, &[]);
         let label = match &pane.items[0] {
             TaskEntry::Scheduled { label, .. } => label,
             _ => panic!("expected Scheduled"),
@@ -3087,13 +3081,7 @@ mod tests {
             "unk".into(),
             make_scheduled_info("unk", "unknown schedule", "x", None),
         );
-        pane.sync(
-            &BTreeMap::new(),
-            &HashMap::new(),
-            &scheduled,
-            None,
-            &HashSet::new(),
-        );
+        pane.sync(&BTreeMap::new(), &HashMap::new(), &scheduled, &[]);
         let label = match &pane.items[0] {
             TaskEntry::Scheduled { label, .. } => label,
             _ => panic!("expected Scheduled"),
@@ -3102,5 +3090,141 @@ mod tests {
             !label.contains("(next") && !label.contains("(running") && !label.contains("(queued"),
             "unknown schedule should have no status suffix: {label}"
         );
+    }
+
+    fn make_workflow_run(name: &str, status: &str) -> crate::views::workflows::WorkflowRunSnapshot {
+        crate::views::workflows::WorkflowRunSnapshot {
+            run_id: format!("wf_{name}"),
+            name: name.to_string(),
+            objective: "obj".to_string(),
+            status: status.to_string(),
+            management_available: true,
+            builtin: false,
+            phases: Vec::new(),
+            current_phase: Some("Scan".to_string()),
+            agents: Vec::new(),
+            agent_budget: None,
+            agents_used: 0,
+            agents_reserved: 0,
+            agents_remaining: None,
+            agent_usage_incomplete: false,
+            active_agents: 0,
+            elapsed_ms: 5_000,
+            received_at: Instant::now(),
+            pause_message: None,
+            result_summary: None,
+        }
+    }
+
+    #[test]
+    fn workflows_section_lists_runs() {
+        let mut pane = TasksPane::new();
+        let runs = vec![
+            make_workflow_run("pii-purge", "active"),
+            make_workflow_run("old-scan", "complete"),
+        ];
+        pane.sync(&BTreeMap::new(), &HashMap::new(), &HashMap::new(), &runs);
+
+        let labels: Vec<&str> = pane.entries.iter().map(|e| e.search_text()).collect();
+        assert!(
+            labels.contains(&"Workflows"),
+            "missing Workflows header: {labels:?}"
+        );
+        assert!(labels.iter().any(|l| l.contains("pii-purge")), "{labels:?}");
+        assert!(
+            !labels.iter().any(|l| l.contains("old-scan")),
+            "settled run hidden while show_done is off: {labels:?}"
+        );
+
+        let row = labels
+            .iter()
+            .find(|l| l.contains("pii-purge"))
+            .unwrap()
+            .to_string();
+        assert!(row.starts_with("Workflow "), "{row}");
+        assert!(row.contains("Scan"), "live phase suffix missing: {row}");
+    }
+
+    #[test]
+    fn workflow_children_are_excluded_and_run_counts_once() {
+        let mut pane = TasksPane::new();
+        let mut child = make_info();
+        child.attempt.workflow_run_id = Some(Arc::from("wf_deep-research"));
+        let mut subagents = HashMap::new();
+        subagents.insert("cs-1".to_string(), child);
+        let runs = vec![make_workflow_run("deep-research", "active")];
+        pane.sync(&BTreeMap::new(), &subagents, &HashMap::new(), &runs);
+        assert!(
+            pane.items
+                .iter()
+                .all(|e| !matches!(e, TaskEntry::Agent { .. }))
+        );
+        assert_eq!(
+            pane.status_counts(&BTreeMap::new(), &subagents, &HashMap::new(), &runs),
+            TaskStatusCounts {
+                running: 1,
+                paused_workflows: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn workflow_suffix_counts_only_running_roster_rows() {
+        let mut run = make_workflow_run("deep-research", "active");
+        run.agents = vec![
+            crate::views::workflows::WorkflowAgentRowView {
+                agent_id: "a1".into(),
+                label: "one".into(),
+                phase: None,
+                model: None,
+                state: "running".into(),
+                tokens_used: 0,
+                duration_ms: 0,
+            },
+            crate::views::workflows::WorkflowAgentRowView {
+                agent_id: "a2".into(),
+                label: "two".into(),
+                phase: None,
+                model: None,
+                state: "done".into(),
+                tokens_used: 0,
+                duration_ms: 0,
+            },
+        ];
+        let entry = TaskEntry::from_workflow_run(&run);
+        assert!(entry.search_text().contains("1 agent"));
+        assert!(!entry.search_text().contains("2 agents"));
+    }
+
+    #[test]
+    fn workflow_row_stoppable_tracks_can_stop_not_is_active() {
+        fn stoppable_of(run: &crate::views::workflows::WorkflowRunSnapshot) -> bool {
+            match TaskEntry::from_workflow_run(run) {
+                TaskEntry::Workflow { stoppable, .. } => stoppable,
+                _ => panic!("expected a workflow entry"),
+            }
+        }
+
+        for status in ["active", "paused", "budget_limited"] {
+            let run = make_workflow_run("wf", status);
+            assert!(run.can_stop(), "{status} run should be stoppable");
+            assert!(stoppable_of(&run), "{status} row must be marked stoppable");
+        }
+
+        for status in ["complete", "failed", "cancelled", "interrupted"] {
+            let run = make_workflow_run("wf", status);
+            assert!(!run.can_stop(), "{status} run should not be stoppable");
+            assert!(!stoppable_of(&run), "{status} row must not be stoppable");
+        }
+
+        match TaskEntry::from_workflow_run(&make_workflow_run("wf", "paused")) {
+            TaskEntry::Workflow {
+                running, stoppable, ..
+            } => {
+                assert!(!running, "paused is not is_active()");
+                assert!(stoppable, "but paused IS can_stop()");
+            }
+            _ => panic!("expected a workflow entry"),
+        }
     }
 }

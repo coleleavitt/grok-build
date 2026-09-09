@@ -1,44 +1,26 @@
-//! `/effort` — set reasoning effort on the current model without re-picking it.
+//! `/effort`: set reasoning effort on the current model without re-picking it.
 //!
-//! Thin wrapper over `Action::SwitchModel` with the session's current model
-//! id and the chosen effort (same wire path as `/model <name> <effort>`).
+//! Thin wrapper over `Action::SwitchModel` with the session's current model id and the chosen effort (same wire path as `/model <name> <effort>`).
 
 use crate::app::actions::Action;
-use crate::slash::command::{AppCtx, ArgItem, CommandExecCtx, CommandResult, SlashCommand};
+use crate::slash::command::{
+    AppCtx, ArgItem, CommandExecCtx, CommandResult, SlashCommand, slash_meta,
+};
 use crate::slash::commands::effort_levels::build_effort_arg_items;
 
 /// Set reasoning effort for the active model.
 pub struct EffortCommand;
 
 impl SlashCommand for EffortCommand {
-    fn name(&self) -> &str {
-        "effort"
-    }
-
-    fn description(&self) -> &str {
-        "Set reasoning effort for the current model"
-    }
-
-    fn session_scoped(&self) -> bool {
-        true
-    }
-
-    fn usage(&self) -> &str {
-        // Levels are model-specific; empty-args and UnknownToken errors list
-        // the active model's offered option ids instead of a hardcoded set.
-        "/effort <level>"
-    }
-
-    fn takes_args(&self) -> bool {
-        true
-    }
-
-    fn args_required(&self) -> bool {
-        true
-    }
-
-    fn arg_placeholder(&self) -> Option<&str> {
-        Some("<level>")
+    slash_meta! {
+        name: "effort",
+        description: "Set reasoning effort for the current model",
+        // Levels are model-specific; empty-args and UnknownToken errors list the active model's offered option ids instead of a hardcoded set.
+        usage: "/effort <level>",
+        takes_args: true,
+        args_required: true,
+        session_scoped: true,
+        arg_placeholder: "<level>",
     }
 
     fn suggest_args(&self, ctx: &AppCtx, _args_query: &str) -> Option<Vec<ArgItem>> {
@@ -135,6 +117,8 @@ mod tests {
             session_id: None,
             bundle_state: &EMPTY_BUNDLE,
             screen_mode: crate::app::ScreenMode::Inline,
+            billing_surface_visible: true,
+            usage_command_visible: true,
             pager_state: crate::settings::PagerLocalSnapshot {
                 multiline_mode: false,
                 yolo_mode: false,
@@ -155,7 +139,7 @@ mod tests {
         match result {
             CommandResult::Error(msg) => {
                 assert!(msg.contains("Usage: /effort"));
-                // Legacy menu option ids only — not none/minimal.
+                // Legacy menu option ids only, not none/minimal
                 assert!(msg.contains("xhigh|high|medium|low"), "msg={msg}");
                 assert!(msg.contains("current: medium"));
                 assert!(!msg.contains("none"));
@@ -204,8 +188,7 @@ mod tests {
 
     #[test]
     fn none_and_minimal_rejected_when_model_menu_omits_them() {
-        // Legacy fallback menu is low..xhigh — `none`/`minimal` used to pass
-        // through and 400 on grok-4.5; reject at the TUI instead.
+        // The legacy fallback menu is low..xhigh; `none`/`minimal` used to pass through and 400 on grok-4.5, so reject at the TUI instead
         let mut state = ModelState::default();
         let (id, info) = model_with_reasoning("reasoning-x", "Reasoning X");
         state.available.insert(id.clone(), info);
@@ -219,8 +202,7 @@ mod tests {
                         msg.contains(&format!("unknown effort level '{token}'")),
                         "expected Error for {token}, got {msg}"
                     );
-                    // Must not re-advertise the rejected token as a valid choice
-                    // (aside from quoting it in "unknown effort level '…'").
+                    // The error must not re-advertise the rejected token as a valid choice (aside from quoting it in "unknown effort level '…'")
                     let after_prefix = msg
                         .split_once("; ")
                         .map(|(_, rest)| rest)
@@ -321,7 +303,13 @@ mod tests {
             models: &empty,
             cwd: std::path::Path::new("."),
             has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
+            saved_workflows: &[],
+            workflow_runs: &[],
             screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
         };
         assert!(cmd.suggest_args(&ctx, "").is_none());
 
@@ -333,7 +321,13 @@ mod tests {
             models: &plain,
             cwd: std::path::Path::new("."),
             has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
+            saved_workflows: &[],
+            workflow_runs: &[],
             screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
         };
         assert!(cmd.suggest_args(&ctx, "").is_none());
     }
@@ -351,7 +345,13 @@ mod tests {
             models: &state,
             cwd: std::path::Path::new("."),
             has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
+            saved_workflows: &[],
+            workflow_runs: &[],
             screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
         };
         let items = cmd.suggest_args(&ctx, "").unwrap();
         assert_eq!(items.len(), EFFORT_LEVELS.len());

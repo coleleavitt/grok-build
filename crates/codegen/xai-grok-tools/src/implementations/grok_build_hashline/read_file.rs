@@ -18,12 +18,9 @@ use super::anchor::split_lines;
 use super::config::HashlineSchemeParams;
 use super::scheme::AnchorScheme;
 
-/// Format file content lines with anchor annotations.
-///
-/// Each line is formatted as `LINE:ANCHOR→CONTENT`.
-/// `ANCHOR` is the scheme-generated anchor for that line.
-///
-/// Returns `(hashline_content, raw_output)`.
+/// Format file content lines with anchor annotations. Each line is formatted as
+/// `LINE:ANCHOR→CONTENT`. `ANCHOR` is the scheme-generated anchor for that line. Returns
+/// `(hashline_content, raw_output)`.
 pub(crate) fn format_hashline_content(
     file_content: &str,
     offset: Option<usize>,
@@ -84,18 +81,16 @@ Anchors are valid only for the file state at read time — after any edit,
 use the fresh anchors returned by ${{ tools.by_kind.edit }} or re-read the file.${%- endif %}
 
 Usage:
-- The file_path parameter must be an absolute path, not a relative path
+- The ${{ params.read.target_file }} parameter accepts either a relative path in the workspace or an absolute path
 - By default reads up to {max_lines_read} lines from the beginning
-- Optionally specify offset and limit for large files
-- Can read images (PNG, JPG, etc.) and PDF files (each page rendered as an image; use `pages` parameter for PDFs with more than 10 pages, max 20 per call)
+- Optionally specify ${{ params.read.offset }} and ${{ params.read.limit }} for large files
+- Can read images (PNG, JPG, etc.) and PDF files (each page rendered as an image; use ${{ params.read.pages }} for PDFs with more than 10 pages, max 20 per call)
 - You can call multiple tools in a single response
 - If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents."#;
 
-/// `hashline_read` tool — reads files with anchor-annotated line numbers.
-///
-/// Delegates to `run_read_file()` for file I/O, path resolution, image
-/// handling, and file-read tracking. Post-processes text file results to
-/// replace standard line formatting with scheme-aware anchors.
+/// `hashline_read` tool — reads files with anchor-annotated line numbers. Delegates to
+/// `run_read_file()` for file I/O, path resolution, image handling, and file-read tracking.
+/// Post-processes text file results to replace standard line formatting with scheme-aware anchors.
 #[derive(Debug, Default)]
 pub struct HashlineReadTool;
 
@@ -153,7 +148,7 @@ impl xai_tool_runtime::Tool for HashlineReadTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "hashline_read",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -178,17 +173,25 @@ impl xai_tool_runtime::Tool for HashlineReadTool {
         use crate::types::tool_metadata::shared_resources;
         let resources = shared_resources(&ctx)?;
 
-        // Delegate to run_read_file with the ORIGINAL offset/limit so that
-        // windowed-read semantics are preserved: raw_output reflects the
-        // requested window, token limits apply to the window, file-read
-        // tracking records the window, and reminders observe the window.
+        // Delegate to run_read_file with the ORIGINAL offset/limit so that windowed-read semantics
+        // are preserved: raw_output reflects the requested window, token limits apply to the
+        // window, file-read tracking records the window, and reminders observe the window.
         let cwd_override = ctx
             .extensions
             .get::<xai_tool_runtime::Cwd>()
             .map(|c| c.0.clone());
         // `None`: the hashline tool does not stream, so it needs no
         // text-path streamability signal (see `run_read_file`).
-        let result = run_read_file(input, cwd_override, None, resources.clone(), None).await?;
+        let invoking = crate::types::tool_metadata::invoking_param_names(&ctx);
+        let result = run_read_file(
+            input,
+            cwd_override,
+            None,
+            resources.clone(),
+            None,
+            &invoking,
+        )
+        .await?;
 
         match result {
             ReadFileOutput::FileContent(mut fc) => {
@@ -374,6 +377,34 @@ mod tests {
         assert!(ToolMetadata::description_template(&hashline).contains("tools.by_kind.edit"));
     }
 
+    #[test]
+    fn description_template_tracks_renamed_offset_limit() {
+        use crate::types::template_renderer::TemplateRenderer;
+        use crate::types::tool::ToolKind;
+        use crate::types::tool_metadata::ToolMetadata;
+        use std::collections::HashMap;
+
+        let tools = HashMap::from([
+            (ToolKind::Read, "hashline_read".to_string()),
+            (ToolKind::Edit, "hashline_edit".to_string()),
+        ]);
+        let params = HashMap::from([(
+            ToolKind::Read,
+            HashMap::from([
+                ("target_file".to_string(), "target_file".to_string()),
+                ("offset".to_string(), "start_line".to_string()),
+                ("limit".to_string(), "max_lines".to_string()),
+            ]),
+        )]);
+        let rendered = TemplateRenderer::new(tools, params)
+            .render(ToolMetadata::description_template(&HashlineReadTool))
+            .unwrap();
+        assert!(
+            rendered.contains("start_line") && rendered.contains("max_lines"),
+            "renamed offset/limit must appear:\n{rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn read_basic_file() {
         let tmp = TempDir::new().unwrap();
@@ -452,10 +483,9 @@ mod tests {
         }
     }
 
-    /// `run_read_file`'s tool-layer base64 capture must be dropped after
-    /// hashline reformats `fc.content` (which keeps original URIs verbatim);
-    /// otherwise session-layer extraction would also fire and we'd
-    /// double-inject the same image as two vision tokens.
+    /// `run_read_file`'s tool-layer base64 capture must be dropped after hashline reformats
+    /// `fc.content` (which keeps original URIs verbatim); otherwise session-layer extraction would
+    /// also fire and we'd double-inject the same image as two vision tokens.
     #[tokio::test]
     async fn extracted_images_cleared_after_hashline_overwrite() {
         let tmp = TempDir::new().unwrap();
@@ -484,6 +514,42 @@ mod tests {
             ReadFileOutput::FileContent(fc) => assert!(fc.extracted_images.is_empty()),
             other => panic!("Expected FileContent, got {:?}", other),
         }
+    }
+
+    /// Memory v2 stale-read protection depends on every ordinary read tool
+    /// recording the bytes it observed; hashline_read inherits this from
+    /// `run_read_file` and must keep doing so.
+    #[tokio::test]
+    async fn read_records_memory_v2_snapshot() {
+        use crate::implementations::grok_build_hashline::memory_v2_test_support::FakeMemoryV2Access;
+        use crate::types::memory_v2::MemoryV2AccessResource;
+
+        let tmp = TempDir::new().unwrap();
+        let access = Arc::new(FakeMemoryV2Access::new(&tmp.path().join("memory")));
+        let topic = tmp.path().join("memory/topics/facts.md");
+        std::fs::write(&topic, "one\ntwo\n").unwrap();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(MemoryV2AccessResource(access.clone()));
+
+        let result = xai_tool_runtime::Tool::run(
+            &HashlineReadTool,
+            test_ctx(resources.into_shared()),
+            ReadFileInput {
+                path: "memory/topics/facts.md".to_string(),
+                offset: None,
+                limit: None,
+                pages: None,
+                format: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result, ReadFileOutput::FileContent(_)),
+            "expected FileContent, got {result:?}"
+        );
+        assert_eq!(access.recorded_reads(), vec![topic]);
     }
 
     #[tokio::test]
@@ -536,11 +602,9 @@ mod tests {
         }
     }
 
-    /// Regression test: exact line numbers and content for offset+limit reads.
-    ///
-    /// Verifies that windowed reads produce the correct original line numbers
-    /// and the correct content — not a re-sliced version of an already-sliced
-    /// window.
+    /// Regression test: exact line numbers and content for offset+limit reads. Verifies that
+    /// windowed reads produce the correct original line numbers and the correct content — not a
+    /// re-sliced version of an already-sliced window.
     #[tokio::test]
     async fn read_offset_limit_exact_content() {
         let tmp = TempDir::new().unwrap();

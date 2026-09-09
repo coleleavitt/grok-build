@@ -24,6 +24,8 @@ use crate::implementations::grok_build::image_gen::ImageGenInput;
 use crate::implementations::grok_build::list_dir::ListDirInput;
 use crate::implementations::grok_build::read_file::ReadFileInput;
 use crate::implementations::grok_build::search_replace::SearchReplaceInput;
+use crate::implementations::grok_build::send_feedback::SendFeedbackInput;
+use crate::implementations::grok_build::send_subagent_message::SendSubagentMessageInput;
 use crate::implementations::grok_build::todo::TodoWriteInput;
 use crate::implementations::grok_build::update_goal::UpdateGoalInput;
 use crate::implementations::grok_build::video_gen::{ImageToVideoInput, ReferenceToVideoInput};
@@ -46,15 +48,9 @@ pub struct MCPToolInput {
     pub tool_name: String,
     pub tool_input: serde_json::Value,
 }
-/// Typed tool input — one variant per built-in tool, plus `Dynamic` for
-/// MCP/runtime-registered tools.
-///
-/// Each variant wraps the tool's existing input struct. The new `Tool` trait
-/// will use `TryFrom<ToolInput>` to extract the typed input.
-///
-/// `derive_more::TryInto` generates `TryFrom<ToolInput> for T` for each
-/// inner type, so e.g. `ReadFileInput::try_from(input)` extracts the `ReadFileInput`
-/// variant or returns an error.
+/// Typed tool input — one variant per built-in tool, plus `Dynamic` for MCP/runtime-registered
+/// tools. Each variant wraps the tool's existing input struct. The new `Tool` trait will use
+/// `TryFrom<ToolInput>` to extract the typed input.
 #[derive(Debug, Clone, Serialize, Deserialize, derive_more::TryInto, derive_more::From)]
 #[serde(tag = "variant")]
 pub enum ToolInput {
@@ -89,21 +85,23 @@ pub enum ToolInput {
     EnterPlanMode(EnterPlanModeInput),
     ExitPlanMode(ExitPlanModeInput),
     AskUserQuestion(AskUserQuestionInput),
+    #[serde(alias = "SendAgentMessage")]
+    SendSubagentMessage(SendSubagentMessageInput),
+    SendFeedback(SendFeedbackInput),
     Lsp(LspToolInput),
     Monitor(crate::implementations::grok_build::monitor::types::MonitorInput),
     SchedulerCreate(crate::implementations::grok_build::scheduler::create::SchedulerCreateInput),
     SchedulerDelete(crate::implementations::grok_build::scheduler::delete::SchedulerDeleteInput),
     SchedulerList(crate::implementations::grok_build::scheduler::list::SchedulerListInput),
     UpdateGoal(UpdateGoalInput),
+    Workflow(crate::implementations::grok_build::workflow::WorkflowToolInput),
     /// Dynamic input for runtime-registered tools (MCP, etc.)
     Dynamic(serde_json::Value),
 }
 impl ToolInput {
-    /// The real target tool for *meta-dispatch* tools whose wire `function.name`
-    /// is only the wrapper (`use_tool`), or `None` for
-    /// ordinary tools (already named by `function.name`). Single source of truth
-    /// for hook matching / telemetry; callers fall back to `function.name` on
-    /// `None`. Add any new dispatcher here.
+    /// The real target tool for *meta-dispatch* tools whose wire `function.name` is only the wrapper (`use_tool`), or
+    /// `None` for ordinary tools (already named by `function.name`). Single source of truth for hook matching / telemetry;
+    /// callers fall back to `function.name` on `None`. Add any new dispatcher here.
     pub fn dispatch_target_name(&self) -> Option<String> {
         match self {
             ToolInput::UseTool(input) => Some(input.tool_name.clone()),
@@ -114,6 +112,20 @@ impl ToolInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_send_agent_message_input_envelope_deserializes() {
+        let input: ToolInput = serde_json::from_value(serde_json::json!({
+            "variant": "SendAgentMessage",
+            "subagent_id": "sub-1",
+            "text": "follow up",
+        }))
+        .expect("legacy input envelope must remain replayable");
+        let ToolInput::SendSubagentMessage(input) = input else {
+            panic!("expected renamed input variant");
+        };
+        assert_eq!(input.subagent_id, "sub-1");
+        assert_eq!(input.text, "follow up");
+    }
     #[test]
     fn try_into_input_succeeds_for_matching_variant() {
         let input = ToolInput::ListDir(ListDirInput {
@@ -173,9 +185,9 @@ mod tests {
             before_context: None,
             after_context: None,
             context: None,
-            case_insensitive: None,
+            case_insensitive: false,
             head_limit: None,
-            multiline: None,
+            multiline: false,
             r#type: None,
         })
         .try_into();
@@ -194,7 +206,7 @@ mod tests {
     }
     #[test]
     fn dynamic_input_holds_arbitrary_json() {
-        let input = ToolInput::Dynamic(serde_json::json!({ "custom" : "data" }));
+        let input = ToolInput::Dynamic(serde_json::json!({"custom": "data"}));
         match input {
             ToolInput::Dynamic(v) => {
                 assert_eq!(v["custom"], "data");

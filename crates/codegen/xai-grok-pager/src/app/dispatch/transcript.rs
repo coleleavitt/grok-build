@@ -1,7 +1,6 @@
 //! Transcript export, block copying, viewer/modal, and input-log dump dispatchers.
 
 use super::ctx::with_active_agent;
-use super::session::lifecycle::skip_picker_and_create_session;
 use crate::app::actions::Effect;
 use crate::app::agent::AgentId;
 use crate::app::app_view::{ActiveView, AppView};
@@ -13,7 +12,6 @@ use xai_grok_telemetry::session_ctx::log_event;
 /// Copy the selected block's content to the system clipboard.
 ///
 /// Respects the block's raw/pretty mode for markdown content.
-/// Shows a toast notification on theExtensionsTab
 pub(super) fn dispatch_copy_block_content(app: &mut AppView) {
     with_active_agent(app, |agent| {
         let Some(idx) = agent.scrollback.selected() else {
@@ -26,7 +24,7 @@ pub(super) fn dispatch_copy_block_content(app: &mut AppView) {
             return;
         };
 
-        // BgTask blocks: copy stdout from central store
+        // BgTask blocks: copy stdout from the shared `bg_tasks` store
         let text = if let RenderBlock::BgTask(block) = &entry.block {
             let stdout = agent
                 .session
@@ -51,16 +49,23 @@ pub(super) fn dispatch_copy_block_content(app: &mut AppView) {
     });
 }
 
-/// Copy the Nth most recent assistant message to the clipboard.
-pub(super) fn dispatch_copy_assistant_message(app: &mut AppView, n: usize) {
+/// Copy the Nth most recent assistant message to the clipboard, or to `file_path`.
+pub(super) fn dispatch_copy_assistant_message(
+    app: &mut AppView,
+    n: usize,
+    file_path: Option<std::path::PathBuf>,
+) {
+    // Session-wide so a later fullscreen child (or the parent after a child) stays quiet.
+    app.export_copy_slash_used = true;
     with_active_agent(app, |agent| {
+        agent.note_export_copy_slash_used();
         // Collect agent messages in reverse order (most recent first).
         let mut agent_messages: Vec<String> = Vec::new();
         for i in (0..agent.scrollback.len()).rev() {
             if let Some(entry) = agent.scrollback.entry(i)
                 && let RenderBlock::AgentMessage(msg) = &entry.block
             {
-                agent_messages.push(msg.copy_text(false));
+                agent_messages.push(msg.copy_text(true));
             }
         }
 
@@ -93,22 +98,62 @@ pub(super) fn dispatch_copy_assistant_message(app: &mut AppView, n: usize) {
         }
 
         let stats = crate::clipboard::clipboard_stats_suffix(text);
-        agent
-            .scrollback
-            .push_block(RenderBlock::system(format!("Copied to clipboard{stats}")));
-        agent.copy_to_clipboard(text);
+
+        if let Some(p) = file_path {
+            match crate::clipboard::write_text_to_copy_file(text, &p) {
+                Ok(path) => {
+                    agent.scrollback.push_block(RenderBlock::system(format!(
+                        "Copied to {}{stats}",
+                        path.display()
+                    )));
+                }
+                Err(e) => {
+                    agent
+                        .scrollback
+                        .push_block(RenderBlock::system(format!("Failed to write file: {e}")));
+                }
+            }
+            return;
+        }
+
+        let delivery = crate::clipboard::copy_text_or_file(text);
+        match &delivery {
+            crate::clipboard::CopyDelivery::Clipboard { file, .. } => {
+                let block_msg = match file {
+                    Some(path) => format!(
+                        "Copied to clipboard (also saved to {}){stats}",
+                        crate::clipboard::display_copy_path(path)
+                    ),
+                    None => format!("Copied to clipboard{stats}"),
+                };
+                agent.scrollback.push_block(RenderBlock::system(block_msg));
+            }
+            crate::clipboard::CopyDelivery::File { path } => {
+                agent.scrollback.push_block(RenderBlock::system(format!(
+                    "Clipboard unreachable: wrote {}{stats}",
+                    crate::clipboard::display_copy_path(path)
+                )));
+            }
+            crate::clipboard::CopyDelivery::Failed { .. } => {
+                agent
+                    .scrollback
+                    .push_block(RenderBlock::system(format!("Copy failed{stats}")));
+            }
+        }
+        agent.show_toast_ticks(delivery.toast_message().as_ref(), delivery.toast_ticks());
     });
 }
 
 /// Dispatch for the `/export` command.
-/// Collects the active (sub)agent's scrollback, renders a clean Markdown transcript,
-/// and either writes it to the (expanded) file or copies it to the clipboard using the
-/// full route (native + tmux + OSC 52) with appropriate feedback.
+/// Collects the active (sub)agent's scrollback and renders a clean Markdown transcript.
+/// The transcript is written to the (tilde-expanded) file, or copied to the clipboard through the full route (native, tmux, OSC 52).
 pub(super) fn dispatch_export_conversation(
     app: &mut AppView,
     file_path: Option<std::path::PathBuf>,
 ) {
+    app.export_copy_slash_used = true;
     with_active_agent(app, |agent| {
+        agent.note_export_copy_slash_used();
         let blocks: Vec<_> = (0..agent.scrollback.len())
             .filter_map(|i| agent.scrollback.entry(i).map(|e| &e.block))
             .collect();
@@ -123,7 +168,7 @@ pub(super) fn dispatch_export_conversation(
         }
 
         if let Some(p) = file_path {
-            // All fs logic (tilde, mkdir, write) lives here (single owner, thin command layer).
+            // All fs logic (tilde, mkdir, write) lives here so the slash-command layer stays thin
             let expanded =
                 std::path::PathBuf::from(shellexpand::tilde(&p.to_string_lossy()).as_ref());
             if let Some(parent) = expanded.parent()
@@ -142,41 +187,43 @@ pub(super) fn dispatch_export_conversation(
                     )));
                 }
                 Err(e) => {
-                    // Do not blindly re-emit a user-supplied path in the error message
-                    // (it may contain secrets or PII); the generic failure is sufficient.
+                    // Do not re-emit a user-supplied path in the error message (it may contain secrets or PII)
+                    // The generic failure is sufficient
                     agent
                         .scrollback
                         .push_block(RenderBlock::system(format!("Failed to write file: {}", e)));
                 }
             }
         } else {
-            // Clipboard path: stats block (like assistant copy) + route-aware toast
-            // (like block content copy / selection). Good UX for a potentially large transcript.
+            // Clipboard path: a stats block (like assistant copy) and a route-aware toast (like block-content copy and selection)
+            // The scrollback line reflects where the copy actually landed, the same pattern as /copy N
+            // It never claims clipboard success when the delivery fell back to the backup file
             let stats = crate::clipboard::clipboard_stats_suffix(&md);
-            agent.scrollback.push_block(RenderBlock::system(format!(
-                "Conversation copied to clipboard{stats}"
-            )));
-            agent.copy_to_clipboard(&md);
+            let delivery = agent.copy_to_clipboard(&md);
+            let block_msg = match &delivery {
+                crate::clipboard::CopyDelivery::Clipboard { file, .. } => match file {
+                    Some(path) => format!(
+                        "Conversation copied to clipboard (also saved to {}){stats}",
+                        crate::clipboard::display_copy_path(path)
+                    ),
+                    None => format!("Conversation copied to clipboard{stats}"),
+                },
+                crate::clipboard::CopyDelivery::File { path } => format!(
+                    "Clipboard unreachable: conversation written to {}{stats}",
+                    crate::clipboard::display_copy_path(path)
+                ),
+                crate::clipboard::CopyDelivery::Failed { .. } => {
+                    format!("Conversation copy failed{stats}")
+                }
+            };
+            agent.scrollback.push_block(RenderBlock::system(block_msg));
         }
     });
 }
 
 /// Open the full transcript in `$PAGER`.
-///
-/// **Minimal mode** renders a full-fidelity ANSI transcript — every block
-/// fully expanded (reasoning in full, tool output uncapped, diff colors kept)
-/// — a full layout + syntax-highlight + ANSI-serialization pass over the whole
-/// session. Rendering that inline froze the event loop for seconds on long
-/// sessions ("laggy /transcript"), and the block model is `!Send` (syntect's
-/// resumable highlighter state lives inside markdown blocks), so it can't be
-/// shipped to a worker either. Instead this only ARMS the request; the minimal
-/// render loop builds the transcript **incrementally, a time-budgeted slice
-/// per frame** (`full_view::pump_transcript`, the same time-sliced amortization
-/// pattern other TUIs use for heavy transcript work), then arms `pending_pager_path`
-/// for the event loop's suspend-into-`$PAGER`.
-///
-/// **Other modes** keep the compact markdown export (string concatenation, no
-/// layout or highlighting — cheap enough to stay synchronous).
+/// The block model is also `!Send` (syntect's resumable highlighter state lives inside markdown blocks), so the work can't move to a worker either.
+/// So this only records the request; the minimal render loop builds the transcript in time-budgeted slices per frame (`full_view::pump_transcript`).
 pub(crate) fn dispatch_open_transcript_pager(app: &mut AppView) {
     if app.screen_mode.is_minimal() {
         crate::minimal_api::request_minimal_transcript(app);
@@ -232,7 +279,7 @@ pub(super) fn dispatch_open_block_viewer(app: &mut AppView) {
             return;
         };
 
-        // Block has images/media but terminal can't render pixels — toast and bail.
+        // Block has images/media but the terminal can't render pixels: toast and bail
         let has_media =
             !entry.block.image_references().is_empty() || entry.block.inline_media().is_some();
         if has_media && !crate::terminal::image::detect_graphics_protocol().supports_images() {
@@ -309,8 +356,8 @@ pub(super) fn dispatch_open_block_viewer(app: &mut AppView) {
             _ => None,
         };
 
-        if viewer.is_some() {
-            agent.block_viewer = viewer;
+        if let Some(pane) = viewer {
+            agent.install_block_viewer(pane);
             return;
         }
 
@@ -328,24 +375,20 @@ pub(super) fn dispatch_open_block_viewer(app: &mut AppView) {
     });
 }
 
-/// Fetch-set that populates every Extensions-modal tab. Shared by the manual
-/// open path, the post-CTA-install auth handoff, and the deferred-fetch
-/// session-ready handlers so they can't drift and leave a tab stuck on its
-/// initial `Loading` state.
+/// The fetches that populate every Extensions-modal tab.
+/// Three callers share it: opening the modal manually, the auth flow after a CTA install, and the session-ready handler that runs a deferred fetch.
+/// Sharing keeps them from drifting and leaving a tab stuck on its initial `Loading` state.
 pub(super) fn extensions_modal_tab_fetches(
+    modal: &mut crate::views::extensions_modal::ExtensionsModalState,
     agent_id: AgentId,
     session_id: acp::SessionId,
 ) -> Vec<Effect> {
-    vec![
+    let mut effects = vec![
         Effect::FetchHooksList {
             agent_id,
             session_id: session_id.clone(),
         },
         Effect::FetchPluginsList {
-            agent_id,
-            session_id: session_id.clone(),
-        },
-        Effect::FetchMarketplaceList {
             agent_id,
             session_id: session_id.clone(),
         },
@@ -356,9 +399,72 @@ pub(super) fn extensions_modal_tab_fetches(
         },
         Effect::FetchSkillsList {
             agent_id,
-            session_id,
+            session_id: session_id.clone(),
         },
-    ]
+        Effect::FetchWorkflowsList {
+            agent_id,
+            session_id: session_id.clone(),
+        },
+    ];
+    push_marketplace_fetch(modal, &mut effects, agent_id, session_id);
+    effects
+}
+
+/// Push a marketplace list fetch, coalescing overlapping requests.
+/// While one is in flight, further requests fold into a single queued refetch that fires when the current response lands.
+/// The other tab fetches are cheap local reads and don't need this.
+pub(super) fn push_marketplace_fetch(
+    modal: &mut crate::views::extensions_modal::ExtensionsModalState,
+    effects: &mut Vec<Effect>,
+    agent_id: AgentId,
+    session_id: acp::SessionId,
+) {
+    if modal.marketplace_fetch_inflight {
+        modal.marketplace_refetch_queued = true;
+        return;
+    }
+    modal.marketplace_fetch_inflight = true;
+    effects.push(Effect::FetchMarketplaceList {
+        agent_id,
+        session_id,
+    });
+}
+
+/// Slash-command name for an extensions modal tab, used by the toast shown when the modal is opened off the agent view.
+fn extensions_tab_slash_name(tab: crate::views::extensions_modal::ExtensionsTab) -> &'static str {
+    use crate::views::extensions_modal::ExtensionsTab;
+    match tab {
+        ExtensionsTab::Hooks => "hooks",
+        ExtensionsTab::Plugins => "plugins",
+        ExtensionsTab::Marketplace => "marketplace",
+        ExtensionsTab::Skills => "skills",
+        ExtensionsTab::Workflows => "workflows",
+        ExtensionsTab::McpServers => "mcps",
+    }
+}
+
+/// Slash-command name for the config-agents modal tab.
+fn config_agents_slash_name(tab: Option<crate::views::agents_modal::AgentsTab>) -> &'static str {
+    use crate::views::agents_modal::AgentsTab;
+    match tab {
+        Some(AgentsTab::Personas) => "personas",
+        Some(AgentsTab::Agents) | None => "config-agents",
+    }
+}
+
+/// Toast shown when a modal that needs a session is opened off the agent view.
+fn toast_session_only_slash(app: &mut AppView, name: &str) {
+    let msg = format!("/{name} only works in a session. Open an agent first.");
+    match app.active_view {
+        ActiveView::AgentDashboard => {
+            if let Some(d) = app.dashboard.as_mut() {
+                d.set_error_toast(&msg);
+            }
+        }
+        ActiveView::Welcome | ActiveView::Agent(_) => {
+            app.show_toast(&msg);
+        }
+    }
 }
 
 /// Open the hooks/plugins modal on the active agent view and fetch list data.
@@ -370,6 +476,7 @@ pub(super) fn dispatch_open_extensions_modal(
     use crate::views::extensions_modal::ExtensionsModalState;
 
     let ActiveView::Agent(id) = app.active_view else {
+        toast_session_only_slash(app, extensions_tab_slash_name(tab));
         return vec![];
     };
     let Some(agent) = app.agents.get_mut(&id) else {
@@ -387,13 +494,15 @@ pub(super) fn dispatch_open_extensions_modal(
     });
 
     let Some(session_id) = agent.session.session_id.clone() else {
-        // Tabs default to Loading; the fetch fires on SessionCreated. With a
-        // picker-deferred session nothing else would create one, so do it now.
+        // Tabs default to Loading; the fetch fires on SessionCreated.
         agent.pending_extensions_fetch = true;
-        return skip_picker_and_create_session(app, id);
+        return vec![];
     };
     agent.pending_extensions_fetch = false;
-    extensions_modal_tab_fetches(id, session_id)
+    let Some(modal) = agent.extensions_modal.as_mut() else {
+        return vec![];
+    };
+    extensions_modal_tab_fetches(modal, id, session_id)
 }
 
 /// Open the agents modal, showing all agent definitions.
@@ -404,6 +513,7 @@ pub(super) fn dispatch_open_config_agents_modal(
     use crate::views::agents_modal::{AgentsModalState, load_agent_toggle};
 
     let ActiveView::Agent(id) = app.active_view else {
+        toast_session_only_slash(app, config_agents_slash_name(initial_tab));
         return vec![];
     };
     let bundle = app.bundle_state.clone();
@@ -425,12 +535,16 @@ pub(super) fn dispatch_open_config_agents_modal(
         .and_then(model_agent_type_from_info);
     let session_id = agent.session.session_id.clone();
     let active_agent = agent.session_agent_name.clone();
+    // One-shot plugin discovery (same gating as `/mcp doctor` and `inspect`) so plugin-provided agents are listed alongside native ones
+    let plugin_registry = xai_grok_shell::util::config::load_cli_plugin_registry(&cwd);
+    let plugin_registry = (!plugin_registry.is_empty()).then_some(plugin_registry);
     let mut modal = AgentsModalState::new(
         &cwd,
         &toggle,
         &bundle,
         model_agent_type.as_deref(),
         active_agent,
+        plugin_registry,
     );
     if let Some(tab) = initial_tab {
         modal.active_tab = tab;
@@ -477,7 +591,7 @@ pub(super) fn dispatch_copy_block_meta(app: &mut AppView) {
 }
 
 /// Dump the input flight recorder to a JSON file for debugging.
-/// See `input_log.rs` module docs for lifecycle/removal instructions.
+/// See the `input_log.rs` module docs for how long this stays and how to remove it.
 pub(super) fn dispatch_dump_input_log(app: &mut AppView) -> Vec<Effect> {
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
@@ -559,12 +673,8 @@ pub(super) fn handle_hooks_list_loaded(
     {
         modal.hooks_data = match result {
             Ok(response) => {
-                // Default all groups to collapsed.
-                let mut seen = std::collections::HashSet::new();
-                for hook in &response.hooks {
-                    seen.insert(hook.source_dir.clone());
-                }
-                modal.hooks_collapsed_groups = seen;
+                // Seed once: re-collapsing on every refetch folded the user's expanded groups
+                modal.seed_hook_groups_once(&response.hooks);
                 TabDataState::Loaded(response)
             }
             Err(e) => TabDataState::Error(e),
@@ -589,9 +699,8 @@ pub(super) fn handle_plugins_list_loaded(
             }
             Err(e) => TabDataState::Error(e),
         };
-        // Clear pending_action so the UI unblocks as soon as the
-        // plugins list arrives. Marketplace can continue loading
-        // independently via its own TabDataState::Loading.
+        // Clear pending_action so the UI unblocks as soon as the plugins list arrives
+        // Marketplace can continue loading independently via its own TabDataState::Loading
         modal.pending_action = None;
         modal.pending_entry_index = None;
     }
@@ -658,32 +767,25 @@ pub(super) fn handle_marketplace_list_loaded(
     result: Result<xai_hooks_plugins_types::MarketplaceListResponse, String>,
 ) -> Vec<Effect> {
     use crate::views::extensions_modal::TabDataState;
-    if let Some(agent) = app.agents.get_mut(&agent_id)
-        && let Some(ref mut modal) = agent.extensions_modal
-    {
+    let mut effects = Vec::new();
+    if let Some(agent) = app.agents.get_mut(&agent_id) {
+        let session_id = agent.session.session_id.clone();
+        let Some(ref mut modal) = agent.extensions_modal else {
+            return effects;
+        };
+        modal.marketplace_fetch_inflight = false;
+        if std::mem::take(&mut modal.marketplace_refetch_queued)
+            && let Some(session_id) = session_id
+        {
+            push_marketplace_fetch(modal, &mut effects, agent_id, session_id);
+        }
         modal.marketplace_data = match result {
             Ok(mut response) => {
                 response.sanitize();
                 // Only default to collapsed on first load (when state is Loading).
-                // On reloads (after install/uninstall/refresh), preserve the user's
-                // expand/collapse choices.
+                // On reloads (after install/uninstall/refresh), preserve the user's expand/collapse choices
                 let is_first_load = matches!(modal.marketplace_data, TabDataState::Loading);
                 if is_first_load {
-                    // All sources start collapsed, so mark every plugin
-                    // index as collapsed using the same index math as
-                    // the renderer / navigation helpers.
-                    let mut idx = 0usize;
-                    for source in &response.sources {
-                        idx += 1; // header
-                        for _ in &source.plugins {
-                            modal.marketplace_collapsed.insert(idx);
-                            idx += 1;
-                        }
-                        // Empty / error sources still occupy at least 1 slot.
-                        if source.plugins.is_empty() {
-                            idx += 1;
-                        }
-                    }
                     modal.marketplace_collapsed_sources = (0..response.sources.len()).collect();
                 }
                 TabDataState::Loaded(response)
@@ -693,7 +795,7 @@ pub(super) fn handle_marketplace_list_loaded(
         modal.pending_action = None;
         modal.pending_entry_index = None;
     }
-    vec![]
+    effects
 }
 
 pub(super) fn handle_skills_toggle_done(
@@ -709,11 +811,8 @@ pub(super) fn handle_skills_toggle_done(
         modal.pending_entry_index = None;
         match result {
             Ok(skills) => {
-                let len = skills.len();
+                modal.seed_skills_groups_once(&skills);
                 modal.skills_data = TabDataState::Loaded(skills);
-                if len > 0 && modal.picker_state.selected >= len {
-                    modal.picker_state.selected = len.saturating_sub(1);
-                }
             }
             Err(e) => {
                 modal.modal_message = Some(crate::views::extensions_modal::ModalMessage::Error(e));
@@ -721,7 +820,6 @@ pub(super) fn handle_skills_toggle_done(
         }
     }
     // The toggle effect already called x.ai/skills/refresh-baseline
-    // which triggers the session to reload skills and push an
-    // AvailableCommandsUpdate notification with the updated list.
+    // That triggers the session to reload skills and push an AvailableCommandsUpdate notification with the updated list
     vec![]
 }
